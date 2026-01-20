@@ -1,12 +1,9 @@
-# app.py
 import os
 import sys
 import json
 import time
-import shutil
 import logging
 import threading
-import sqlite3
 import uuid
 import requests
 from pathlib import Path
@@ -19,11 +16,11 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "sb_secret_Ci0yyib3FCJW3GMivhX3XA_D2vHm
 SUPABASE_HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
+    "Prefer": "return=minimal"
 }
 
-DB_PATH = "leaks.db"
-LOGS_FILE = Path("logs.json")
+LOGS_FILE = Path("activity.log")  # prosty plik tekstowy
 ADMIN_PASSWORD = "wyciek12"
 
 app = Flask(__name__)
@@ -37,140 +34,153 @@ logging.basicConfig(
 logger = logging.getLogger("ColdSearch")
 
 
-# === INICJALIZACJA BAZY I LOGÓW ===
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS leaks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source TEXT,
-            data TEXT
-        )
-    ''')
-    cursor.execute('CREATE INDEX IF NOT EXISTS idx_data ON leaks(data)')
-    conn.commit()
-    conn.close()
+# === PROSTE LOGI AKTYWNOŚCI ===
+def log_activity(message):
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    line = f"[{timestamp}] {message}\n"
+    with LOGS_FILE.open("a", encoding="utf-8") as f:
+        f.write(line)
+    logger.info(message)
 
-if not LOGS_FILE.exists():
-    LOGS_FILE.write_text("[]", encoding="utf-8")
-
-init_db()
-
-
-def load_logs():
+def load_activity_logs():
+    if not LOGS_FILE.exists():
+        return []
     try:
-        return json.loads(LOGS_FILE.read_text(encoding="utf-8"))
+        lines = LOGS_FILE.read_text(encoding="utf-8").strip().split("\n")
+        return [line for line in lines if line.strip()]
     except Exception:
         return []
 
-def save_log(event_type, key=None, ip=None, query=None):
-    logs = load_logs()
-    entry = {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "event": event_type,
-        "key": key,
-        "ip": ip,
-        "query": query
-    }
-    logs.append(entry)
-    LOGS_FILE.write_text(json.dumps(logs, indent=2, ensure_ascii=False), encoding="utf-8")
 
-
-# === IMPORT Z FOLDERU LEAKS ===
-def import_leaks_to_sqlite():
+# === IMPORT DO SUPABASE ===
+def import_leaks_to_supabase():
+    log_activity("🚀 Rozpoczęto import danych z leaks/leaks/")
     try:
-        logger.info("📥 Importuję dane z folderu 'leaks/'...")
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
+        leaks_dir = Path("leaks") / "leaks"
+        if not leaks_dir.exists():
+            msg = "⚠️ Folder 'leaks/leaks/' nie istnieje – pomijam import."
+            log_activity(msg)
+            return
+
         total = 0
-        for file_path in Path("leaks").rglob("*"):
+        batch = []
+        BATCH_SIZE = 1000
+
+        for file_path in leaks_dir.rglob("*"):
             if not file_path.is_file():
                 continue
             if file_path.suffix.lower() not in {".txt", ".csv", ".log"}:
                 continue
-            rel_path = file_path.relative_to("leaks").as_posix()
+            rel_path = file_path.relative_to(leaks_dir.parent).as_posix()  # leaks/leaks/plik.txt → leaks/plik.txt
             try:
                 content = file_path.read_text(encoding="utf-8")
             except UnicodeDecodeError:
                 content = file_path.read_text(encoding="latin-1")
             lines = [line.strip() for line in content.splitlines() if line.strip()]
-            batch = [(rel_path, line) for line in lines]
-            if batch:
-                cursor.executemany("INSERT INTO leaks (source, data) VALUES (?, ?)", batch)
-                total += len(batch)
-        conn.commit()
-        conn.close()
-        logger.info(f"✅ Zaimportowano {total} wpisów.")
+            for line in lines:
+                batch.append({"source": rel_path, "data": line})
+                if len(batch) >= BATCH_SIZE:
+                    _send_batch_to_supabase(batch)
+                    total += len(batch)
+                    batch = []
+                    time.sleep(0.1)
+
+        if batch:
+            _send_batch_to_supabase(batch)
+            total += len(batch)
+
+        msg = f"✅ Zakończono import – dodano {total} wpisów do Supabase."
+        log_activity(msg)
     except Exception as e:
-        logger.error(f"❌ Błąd importu: {e}")
+        msg = f"❌ Błąd podczas importu: {str(e)}"
+        log_activity(msg)
 
 
-# === LICENCJE Z SUPABASE ===
+def _send_batch_to_supabase(batch):
+    url = f"{SUPABASE_URL}/rest/v1/leaks"
+    response = requests.post(url, headers=SUPABASE_HEADERS, json=batch)
+    if response.status_code not in (200, 201):
+        raise Exception(f"Supabase error: {response.status_code} – {response.text}")
+
+
+# === LICENCJE ===
 class LicenseManager:
-def validate(self, key, ip):
-    try:
-        url = f"{SUPABASE_URL}/rest/v1/licenses"
-        r = requests.get(url, headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
-        data = r.json()
-        if not data:  # ←←← TO BYŁO USZKODZONE
-            return {"success": False, "message": "Nieprawidłowy klucz"}
-        lic = data[0]
-        if not lic["active"]:
-            return {"success": False, "message": "Klucz został zablokowany"}
-        if not lic["ip"]:
-            requests.patch(url, headers=SUPABASE_HEADERS, json={"ip": ip})
-            return {"success": True, "message": "IP przypisane"}
-        if lic["ip"] != ip:
-            return {"success": False, "message": "Klucz przypisany do innego adresu IP"}
-        return {"success": True, "message": "OK"}
-    except Exception as e:
-        logger.error(f"Błąd walidacji: {e}")
-        return {"success": False, "message": "Błąd serwera"}
+    def validate(self, key, ip):
+        try:
+            url = f"{SUPABASE_URL}/rest/v1/licenses"
+            r = requests.get(url, headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
+            data = r.json()
+            if not 
+                return {"success": False, "message": "Nieprawidłowy klucz"}
+            lic = data[0]
+            if not lic["active"]:
+                return {"success": False, "message": "Klucz został zablokowany"}
+            if not lic["ip"]:
+                requests.patch(
+                    f"{url}?key=eq.{key}",
+                    headers=SUPABASE_HEADERS,
+                    json={"ip": ip}
+                )
+                return {"success": True, "message": "IP przypisane"}
+            if lic["ip"] != ip:
+                return {"success": False, "message": "Klucz przypisany do innego adresu IP"}
+            return {"success": True, "message": "OK"}
+        except Exception as e:
+            logger.error(f"Błąd walidacji: {e}")
+            return {"success": False, "message": "Błąd serwera"}
 
     def generate(self, days):
         new_key = str(uuid.uuid4()).replace("-", "").upper()
         exp = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat() if days > 0 else None
-        requests.post(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, json={"key": new_key, "active": True, "expiry": exp})
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/licenses",
+            headers=SUPABASE_HEADERS,
+            json={"key": new_key, "active": True, "expiry": exp}
+        )
         return new_key
+
 
 lic_mgr = LicenseManager()
 
 
-# === BEZPIECZNE ODPOWIEDZI Z SQLITE ===
-def safe_db_query(query, params=()):
-    for _ in range(3):
-        try:
-            conn = sqlite3.connect(DB_PATH, timeout=10)
-            cursor = conn.cursor()
-            cursor.execute(query, params)
-            result = cursor.fetchall()
-            conn.close()
-            return result
-        except sqlite3.OperationalError:
-            time.sleep(0.5)
-    return []
+# === FUNKCJE POMOCNICZE ===
+def count_leaks():
+    url = f"{SUPABASE_URL}/rest/v1/leaks"
+    r = requests.head(url, headers=SUPABASE_HEADERS)
+    if r.status_code == 200:
+        return int(r.headers.get("content-range", "0-0/0").split("/")[-1])
+    return 0
 
-def get_leaks_count():
-    result = safe_db_query("SELECT COUNT(*) FROM leaks")
-    return result[0][0] if result else 0
+def search_leaks(query, limit=150):
+    url = f"{SUPABASE_URL}/rest/v1/leaks"
+    params = {
+        "data": f"ilike.%{query}%",
+        "select": "source,data",
+        "limit": limit
+    }
+    r = requests.get(url, headers=SUPABASE_HEADERS, params=params)
+    return r.json() if r.status_code == 200 else []
 
 def get_active_users(hours=24):
-    logs = load_logs()
+    # Liczymy unikalne IP z logów aktywności (uproszczone)
+    logs = load_activity_logs()
     cutoff = datetime.utcnow() - timedelta(hours=hours)
     ips = set()
-    for log in logs:
-        try:
-            ts = datetime.fromisoformat(log["timestamp"].replace("Z", "+00:00"))
-            if ts >= cutoff and log["event"] == "auth":
-                ips.add(log["ip"])
-        except:
-            continue
+    for line in logs:
+        if "auth success" in line or "IP przypisane" in line:
+            # Wyszukaj IP w linii (np. "... from 192.168.1.1")
+            parts = line.split()
+            if "from" in parts:
+                try:
+                    ip = parts[parts.index("from") + 1]
+                    if ip.replace(".", "").isdigit():
+                        ips.add(ip)
+                except:
+                    pass
     return len(ips)
 
 
-# === PANEL ADMINA — PEŁNA WERSJA ===
-
+# === PANEL ADMINA ===
 ADMIN_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="pl">
@@ -233,14 +243,6 @@ ADMIN_TEMPLATE = """
             font-weight: bold;
             color: var(--primary);
         }
-        .chart-container {
-            background: var(--card-bg);
-            padding: 20px;
-            border-radius: 14px;
-            margin-bottom: 24px;
-            box-shadow: 0 6px 16px rgba(0,0,0,0.4);
-            height: 250px;
-        }
         .form-group {
             background: var(--card-bg);
             padding: 22px;
@@ -272,47 +274,6 @@ ADMIN_TEMPLATE = """
         }
         button:hover { opacity: 0.92; }
         .btn-danger { background: linear-gradient(90deg, var(--danger), #b91c1c); }
-        .license-item {
-            background: #25253a;
-            padding: 16px;
-            border-radius: 12px;
-            margin: 12px 0;
-            border-left: 4px solid var(--success);
-        }
-        .license-item.revoked { border-left-color: var(--warning); }
-        .license-key {
-            font-family: monospace;
-            font-weight: bold;
-            word-break: break-all;
-            margin-bottom: 10px;
-            font-size: 1.1em;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 16px;
-        }
-        th, td {
-            padding: 13px;
-            text-align: left;
-            border-bottom: 1px solid var(--border);
-        }
-        th {
-            color: var(--primary);
-            font-weight: 600;
-        }
-        tr:hover {
-            background: rgba(67, 97, 238, 0.12);
-        }
-        .status-active { color: var(--success); }
-        .status-revoked { color: var(--warning); }
-        .logout-link {
-            display: inline-block;
-            margin-top: 18px;
-            color: var(--danger);
-            text-decoration: none;
-            font-weight: bold;
-        }
         .alert {
             padding: 12px;
             border-radius: 8px;
@@ -323,6 +284,29 @@ ADMIN_TEMPLATE = """
         .alert-success {
             background: rgba(74, 222, 128, 0.15);
             border-left-color: var(--success);
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 16px;
+        }
+        th, td {
+            padding: 10px;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+        }
+        th {
+            color: var(--primary);
+        }
+        tr:hover {
+            background: rgba(67, 97, 238, 0.12);
+        }
+        .logout-link {
+            display: inline-block;
+            margin-top: 18px;
+            color: var(--danger);
+            text-decoration: none;
+            font-weight: bold;
         }
     </style>
 </head>
@@ -368,16 +352,11 @@ ADMIN_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- Wykres -->
-            <div class="chart-container">
-                <canvas id="statsChart"></canvas>
-            </div>
-
-            <!-- Import folderu -->
+            <!-- Import -->
             <div class="form-group">
-                <h2>📁 Zaimportuj dane z folderu leaks/</h2>
+                <h2>📁 Import z leaks/leaks/</h2>
                 <form method="POST" action="/admin/import_leaks">
-                    <button type="submit">Importuj do SQLite</button>
+                    <button type="submit">Rozpocznij import</button>
                 </form>
             </div>
 
@@ -386,127 +365,47 @@ ADMIN_TEMPLATE = """
                 <h2>➕ Wygeneruj nowy klucz</h2>
                 <form method="POST" action="/admin/generate">
                     <label for="days">Ważność (dni):</label>
-                    <input type="number" id="days" name="days" min="0" value="7" placeholder="0 = bezterminowy" required>
-                    <button type="submit">Generuj klucz</button>
+                    <input type="number" id="days" name="days" min="0" value="7" required>
+                    <button type="submit">Generuj</button>
                 </form>
                 {% if new_key %}
                     <div class="alert alert-success">
-                        <strong>✅ Nowy klucz:</strong><br>
-                        <span style="font-family:monospace; font-size:18px;">{{ new_key }}</span>
+                        ✅ Utworzono nowy klucz: <strong>{{ new_key }}</strong>
                     </div>
+                    {% set _ = log_activity("🔑 Utworzono nowy klucz: " + new_key) %}
                 {% endif %}
             </div>
 
-            <!-- Licencje -->
+            <!-- Logi aktywności -->
             <div class="form-group">
-                <h2>📋 Lista licencji ({{ licenses|length }})</h2>
-                {% for key, data in licenses.items() %}
-                    <div class="license-item {% if not data.active %}revoked{% endif %}">
-                        <div class="license-key">{{ key }}</div>
-                        <div>
-                            <strong>Status:</strong> 
-                            {% if not data.active %}
-                                <span class="status-revoked">Zablokowana</span>
-                            {% elif data.ip %}
-                                <span class="status-active">Aktywna</span>
-                            {% else %}
-                                <span class="status-active">Nieaktywowana</span>
-                            {% endif %}
-                        </div>
-                        <div><strong>IP:</strong> {{ data.ip or "—" }}</div>
-                        <div><strong>Aktywowana:</strong> {{ data.activated or "—" }}</div>
-                    </div>
-                {% endfor %}
-            </div>
-
-            <!-- Logi -->
-            <div class="form-group">
-                <h2>📜 Ostatnie logi</h2>
+                <h2>📜 Logi aktywności (ostatnie 50)</h2>
                 <table>
-                    <thead>
-                        <tr>
-                            <th>Czas (UTC)</th>
-                            <th>Typ</th>
-                            <th>IP</th>
-                            <th>Klucz</th>
-                            <th>Zapytanie</th>
-                        </tr>
-                    </thead>
+                    <thead><tr><th>Czas i zdarzenie</th></tr></thead>
                     <tbody>
-                        {% for log in logs[-50:] | reverse %}
-                        <tr>
-                            <td>{{ log.timestamp[:19] }}</td>
-                            <td>{{ log.event }}</td>
-                            <td>{{ log.ip }}</td>
-                            <td>{{ log.key or "—" }}</td>
-                            <td>{{ log.query or "—" }}</td>
-                        </tr>
+                        {% for line in logs[-50:] | reverse %}
+                        <tr><td><code>{{ line }}</code></td></tr>
                         {% endfor %}
                     </tbody>
                 </table>
             </div>
         {% endif %}
     </div>
-
-    {% if authenticated %}
-    <script>
-        const ctx = document.getElementById('statsChart').getContext('2d');
-        new Chart(ctx, {
-            type: 'bar',
-             {
-                labels: ['Aktywni (24h)', 'Wpisy', 'Licencji', 'Aktywne'],
-                datasets: [{
-                    label: 'Statystyki',
-                     [{{ active_24h }}, {{ db_count }}, {{ licenses|length }}, {{ active_keys }}],
-                    backgroundColor: [
-                        'rgba(76, 201, 240, 0.7)',
-                        'rgba(67, 97, 238, 0.6)',
-                        'rgba(67, 97, 238, 0.6)',
-                        'rgba(74, 222, 128, 0.6)'
-                    ],
-                    borderColor: [
-                        'rgba(76, 201, 240, 1)',
-                        'rgba(67, 97, 238, 1)',
-                        'rgba(67, 97, 238, 1)',
-                        'rgba(74, 222, 128, 1)'
-                    ],
-                    borderWidth: 1
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                scales: {
-                    y: {
-                        beginAtZero: true,
-                        ticks: { color: '#e6e6ff' },
-                        grid: { color: 'rgba(255,255,255,0.1)' }
-                    },
-                    x: {
-                        ticks: { color: '#e6e6ff' },
-                        grid: { color: 'rgba(255,255,255,0.1)' }
-                    }
-                },
-                plugins: {
-                    legend: { labels: { color: '#e6e6ff' } }
-                }
-            }
-        });
-    </script>
-    {% endif %}
 </body>
 </html>
 """
 
 
 def render_admin(error=False, new_key=None):
-    logs = load_logs()
-    db_count = get_leaks_count()
+    if new_key:
+        log_activity(f"🔑 Utworzono nowy klucz: {new_key}")
+
+    logs = load_activity_logs()
+    db_count = count_leaks()
     active_24h = get_active_users(24)
-    
+
     licenses = {}
     try:
-        r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"select": "*"})
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS)
         if r.status_code == 200:
             records = r.json()
             licenses = {rec["key"]: rec for rec in records}
@@ -527,8 +426,7 @@ def render_admin(error=False, new_key=None):
     )
 
 
-# === ENDPOINTY PANELU ===
-
+# === ENDPOINTY ===
 @app.route("/admin")
 def admin_index():
     return render_admin()
@@ -550,20 +448,19 @@ def admin_generate():
     if not session.get("logged_in"):
         return redirect("/admin")
     days = int(request.form.get("days", 7))
-    key = lic_mgr.generate(days if days > 0 else None)
+    key = lic_mgr.generate(days)
     return render_admin(new_key=key)
 
 @app.route("/admin/import_leaks", methods=["POST"])
 def admin_import_leaks():
     if not session.get("logged_in"):
         return redirect("/admin")
-    thread = threading.Thread(target=import_leaks_to_sqlite)
+    thread = threading.Thread(target=import_leaks_to_supabase)
     thread.start()
     return render_admin()
 
 
-# === ENDPOINTY PUBLICZNE ===
-
+# === PUBLICZNE API ===
 @app.route("/")
 def index():
     return jsonify({"status": "online", "name": "Cold Search Premium API"})
@@ -572,8 +469,8 @@ def index():
 def api_status():
     return jsonify({
         "active_users_24h": get_active_users(24),
-        "total_entries": get_leaks_count(),
-        "database": "SQLite (leaks table)"
+        "total_entries": count_leaks(),
+        "database": "Supabase (leaks table)"
     })
 
 @app.route("/auth", methods=["POST"])
@@ -584,7 +481,10 @@ def auth():
     if not key or not ip:
         return jsonify({"success": False, "message": "Brak klucza lub IP"}), 400
     result = lic_mgr.validate(key, ip)
-    save_log("auth", key=key, ip=ip)
+    if result["success"]:
+        log_activity(f"✅ Auth success for key {key} from {ip}")
+    else:
+        log_activity(f"❌ Auth failed for key {key} from {ip}: {result['message']}")
     return jsonify(result)
 
 @app.route("/search", methods=["POST"])
@@ -598,14 +498,14 @@ def search():
 
     auth = lic_mgr.validate(key, ip)
     if not auth["success"]:
-        save_log("search_denied", key=key, ip=ip, query=query)
+        log_activity(f"🔍 Odmowa wyszukiwania – klucz {key} z {ip}")
         return jsonify(auth), 403
 
-    save_log("search", key=key, ip=ip, query=query)
+    log_activity(f"🔍 Wyszukiwanie '{query}' przez {key} z {ip}")
     results = []
-    rows = safe_db_query("SELECT source, data FROM leaks WHERE data LIKE ? LIMIT 150", (f"%{query}%",))
+    rows = search_leaks(query, limit=150)
     for row in rows:
-        results.append({"file": row[0], "content": row[1]})
+        results.append({"file": row["source"], "content": row["data"]})
 
     return jsonify({
         "success": True,
