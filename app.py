@@ -10,9 +10,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 
 import requests
-import rarfile
 import zipfile
-from flask import Flask, request, jsonify, render_template_string, redirect
+from flask import Flask, request, jsonify, render_template_string, redirect, url_for
 
 from license_manager import LicenseManager
 
@@ -71,15 +70,13 @@ def get_active_users(hours=24):
     return len(active_ips)
 
 def download_and_extract_from_url(url):
-    """Pobiera i rozpakowuje archiwum z podanego URL."""
+    """Pobiera i rozpakowuje archiwum ZIP z podanego URL."""
     try:
         logger.info(f"📥 Rozpoczynam pobieranie z: {url}")
         response = requests.get(url, stream=True, timeout=120)
         response.raise_for_status()
         
-        ext = ".zip" if url.endswith(".zip") else ".rar"
-        archive_path = Path(f"temp_download{ext}")
-        
+        archive_path = Path("temp_download.zip")
         with open(archive_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
@@ -88,12 +85,8 @@ def download_and_extract_from_url(url):
             shutil.rmtree(LEAKS_DIR)
         LEAKS_DIR.mkdir()
         
-        if ext == ".zip":
-            with zipfile.ZipFile(archive_path) as zf:
-                zf.extractall(LEAKS_DIR)
-        else:
-            with rarfile.RarFile(archive_path) as rf:
-                rf.extractall(LEAKS_DIR)
+        with zipfile.ZipFile(archive_path) as zf:
+            zf.extractall(LEAKS_DIR)
         
         archive_path.unlink()
         file_count = len(list(LEAKS_DIR.rglob("*")))
@@ -108,20 +101,21 @@ def download_and_extract_from_url(url):
 def index():
     return jsonify({
         "name": "Cold Search Premium API",
-        "version": "3.0",
+        "version": "3.1",
         "status": "online"
     })
 
 @app.route("/api/status", methods=["GET"])
 def api_status():
-    """Endpoint dla bota Discord — zwraca liczbę aktywnych użytkowników."""
     active_24h = get_active_users(24)
     active_1h = get_active_users(1)
+    total = len(license_manager.licenses)
+    active_keys = sum(1 for v in license_manager.licenses.values() if v["active"])
     return jsonify({
         "active_users_1h": active_1h,
         "active_users_24h": active_24h,
-        "total_licenses": len(license_manager.licenses),
-        "active_licenses": sum(1 for v in license_manager.licenses.values() if v["active"])
+        "total_licenses": total,
+        "active_licenses": active_keys
     })
 
 @app.route("/auth", methods=["POST"])
@@ -185,7 +179,7 @@ def search():
     })
 
 
-# === PANEL ADMINA ===
+# === PANEL ADMINA — BEZPIECZNY (POST-REDIRECT-GET) ===
 
 ADMIN_TEMPLATE = """
 <!DOCTYPE html>
@@ -213,7 +207,7 @@ ADMIN_TEMPLATE = """
             padding: 20px;
         }
         .container {
-            max-width: 1100px;
+            max-width: 1200px;
             margin: 0 auto;
         }
         header {
@@ -230,19 +224,23 @@ ADMIN_TEMPLATE = """
             color: transparent;
             margin-bottom: 10px;
         }
-        .stats {
-            display: flex;
-            gap: 15px;
-            justify-content: center;
-            flex-wrap: wrap;
-            margin-top: 15px;
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
         }
-        .stat-box {
+        .stat-card {
             background: rgba(67, 97, 238, 0.15);
-            padding: 12px 20px;
-            border-radius: 10px;
-            font-weight: bold;
+            padding: 16px;
+            border-radius: 12px;
+            text-align: center;
             border: 1px solid var(--primary);
+        }
+        .stat-value {
+            font-size: 2rem;
+            font-weight: bold;
+            color: var(--primary);
         }
         .form-group {
             background: var(--card-bg);
@@ -254,12 +252,9 @@ ADMIN_TEMPLATE = """
         h2 {
             margin-bottom: 16px;
             color: var(--primary);
-            display: flex;
-            align-items: center;
-            gap: 10px;
             font-size: 1.4rem;
         }
-        input, button, select {
+        input, button {
             width: 100%;
             padding: 13px;
             margin: 8px 0;
@@ -321,12 +316,16 @@ ADMIN_TEMPLATE = """
             text-decoration: none;
             font-weight: bold;
         }
-        .message {
+        .alert {
             padding: 12px;
             border-radius: 8px;
             margin: 15px 0;
             background: rgba(76, 201, 240, 0.15);
             border-left: 4px solid var(--primary);
+        }
+        .alert-success {
+            background: rgba(74, 222, 128, 0.15);
+            border-left-color: var(--success);
         }
     </style>
 </head>
@@ -336,14 +335,14 @@ ADMIN_TEMPLATE = """
             <h1>🔐 Cold Search Premium — Admin Panel</h1>
             {% if authenticated %}
                 <p>Zalogowany jako administrator</p>
-                <a href="/admin" class="logout-link">→ Wyloguj się (odśwież stronę)</a>
+                <a href="/admin/logout" class="logout-link">→ Wyloguj się</a>
             {% endif %}
         </header>
 
         {% if not authenticated %}
             <div class="form-group">
                 <h2>🔒 Logowanie</h2>
-                <form method="POST" action="/admin">
+                <form method="POST" action="/admin/login">
                     <input type="password" name="password" placeholder="Hasło panelu" required>
                     <button type="submit">Zaloguj się</button>
                 </form>
@@ -352,38 +351,46 @@ ADMIN_TEMPLATE = """
                 {% endif %}
             </div>
         {% else %}
-            <div class="stats">
-                <div class="stat-box">Aktywni (24h): {{ active_24h }}</div>
-                <div class="stat-box">Aktywni (1h): {{ active_1h }}</div>
-                <div class="stat-box">Licencji: {{ licenses|length }}</div>
+            <!-- Statystyki -->
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div>Aktywni (24h)</div>
+                    <div class="stat-value">{{ active_24h }}</div>
+                </div>
+                <div class="stat-card">
+                    <div>Aktywni (1h)</div>
+                    <div class="stat-value">{{ active_1h }}</div>
+                </div>
+                <div class="stat-card">
+                    <div>Licencji</div>
+                    <div class="stat-value">{{ licenses|length }}</div>
+                </div>
+                <div class="stat-card">
+                    <div>Aktywne</div>
+                    <div class="stat-value">{{ active_keys }}</div>
+                </div>
             </div>
 
-            <!-- Ładowanie danych z URL -->
+            <!-- Ładowanie danych -->
             <div class="form-group">
-                <h2>📥 Załaduj dane z URL</h2>
+                <h2>📥 Załaduj dane z URL (.zip)</h2>
                 <form method="POST" action="/admin/load_data">
-                    <input type="hidden" name="password" value="{{ password }}">
-                    <input type="url" name="url" placeholder="https://store1.gofile.io/.../leaks.rar" required>
-                    <button type="submit">Pobierz i rozpakuj dane</button>
+                    <input type="url" name="url" placeholder="https://dropbox.com/.../leaks.zip?dl=1" required>
+                    <button type="submit">Pobierz i rozpakuj</button>
                 </form>
-                {% if message %}
-                    <div class="message">{{ message }}</div>
-                {% endif %}
             </div>
 
             <!-- Generowanie klucza -->
             <div class="form-group">
                 <h2>➕ Wygeneruj nowy klucz</h2>
                 <form method="POST" action="/admin/generate">
-                    <input type="hidden" name="password" value="{{ password }}">
                     <label for="days">Ważność (dni):</label>
-                    <input type="number" id="days" name="days" min="0" value="7" placeholder="Liczba dni (0 = bezterminowy)" required>
-                    <small style="color:#aaa;">Wpisz 0 dla klucza bezterminowego</small><br><br>
-                    <button type="submit">Generuj klucz premium</button>
+                    <input type="number" id="days" name="days" min="0" value="7" placeholder="0 = bezterminowy" required>
+                    <button type="submit">Generuj klucz</button>
                 </form>
                 {% if new_key %}
-                    <div style="background:#162e22; padding:16px; border-radius:10px; margin-top:16px; color:var(--success);">
-                        <strong>Nowy klucz:</strong><br>
+                    <div class="alert alert-success">
+                        <strong>✅ Nowy klucz:</strong><br>
                         <span style="font-family:monospace; font-size:18px;">{{ new_key }}</span><br>
                         {% if expiry != "Bezterminowa" %}
                             <small>Ważny do: {{ expiry }}</small>
@@ -396,9 +403,8 @@ ADMIN_TEMPLATE = """
             <div class="form-group">
                 <h2>🗑️ Zablokuj klucz</h2>
                 <form method="POST" action="/admin/revoke">
-                    <input type="hidden" name="password" value="{{ password }}">
                     <input type="text" name="key" placeholder="Klucz do zablokowania..." required>
-                    <button type="submit" class="btn-danger">Zablokuj klucz</button>
+                    <button type="submit" class="btn-danger">Zablokuj</button>
                 </form>
             </div>
 
@@ -459,35 +465,49 @@ ADMIN_TEMPLATE = """
 """
 
 
-@app.route("/admin", methods=["GET", "POST"])
-def admin_panel():
-    password = request.form.get("password") if request.method == "POST" else request.args.get("password")
+def render_admin_panel(error=False, new_key=None, expiry=None):
+    logs = load_logs()
+    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    active_24h = get_active_users(24)
+    active_1h = get_active_users(1)
+    active_keys = sum(1 for v in license_manager.licenses.values() if v["active"])
+    return render_template_string(
+        ADMIN_TEMPLATE,
+        authenticated=True,
+        licenses=license_manager.licenses,
+        logs=logs,
+        new_key=new_key,
+        expiry=expiry,
+        now=now,
+        active_24h=active_24h,
+        active_1h=active_1h,
+        active_keys=active_keys
+    )
+
+
+@app.route("/admin")
+def admin_index():
+    password = request.args.get("password")
     if password == ADMIN_PASSWORD:
-        logs = load_logs()
-        now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        active_24h = get_active_users(24)
-        active_1h = get_active_users(1)
-        return render_template_string(
-            ADMIN_TEMPLATE,
-            authenticated=True,
-            password=ADMIN_PASSWORD,
-            licenses=license_manager.licenses,
-            logs=logs,
-            new_key=None,
-            now=now,
-            active_24h=active_24h,
-            active_1h=active_1h
-        )
+        return render_admin_panel()
     else:
-        return render_template_string(
-            ADMIN_TEMPLATE,
-            authenticated=False,
-            error=(request.method == "POST")
-        )
+        return render_template_string(ADMIN_TEMPLATE, authenticated=False, error=False)
+
+@app.route("/admin/login", methods=["POST"])
+def admin_login():
+    password = request.form.get("password")
+    if password == ADMIN_PASSWORD:
+        return redirect(url_for('admin_index') + "?password=" + ADMIN_PASSWORD)
+    else:
+        return render_template_string(ADMIN_TEMPLATE, authenticated=False, error=True)
+
+@app.route("/admin/logout")
+def admin_logout():
+    return redirect("/admin")
 
 @app.route("/admin/generate", methods=["POST"])
 def admin_generate():
-    password = request.form.get("password")
+    password = request.args.get("password")
     if password != ADMIN_PASSWORD:
         return redirect("/admin")
     days_str = request.form.get("days", "7")
@@ -498,59 +518,28 @@ def admin_generate():
         days = 7
     key = license_manager.generate_key(valid_days=days if days > 0 else None)
     expiry = license_manager.licenses[key].get("expiry", "Bezterminowa")
-    logs = load_logs()
-    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    active_24h = get_active_users(24)
-    active_1h = get_active_users(1)
-    return render_template_string(
-        ADMIN_TEMPLATE,
-        authenticated=True,
-        password=ADMIN_PASSWORD,
-        licenses=license_manager.licenses,
-        logs=logs,
-        new_key=key,
-        expiry=expiry,
-        now=now,
-        active_24h=active_24h,
-        active_1h=active_1h
-    )
+    return redirect(url_for('admin_index') + "?password=" + ADMIN_PASSWORD + "&new_key=" + key + "&expiry=" + expiry)
 
 @app.route("/admin/revoke", methods=["POST"])
 def admin_revoke():
-    password = request.form.get("password")
+    password = request.args.get("password")
     if password != ADMIN_PASSWORD:
         return redirect("/admin")
     key = request.form.get("key")
     if key:
         license_manager.revoke_key(key)
-    return redirect("/admin")
+    return redirect(url_for('admin_index') + "?password=" + ADMIN_PASSWORD)
 
 @app.route("/admin/load_data", methods=["POST"])
 def admin_load_data():
-    password = request.form.get("password")
+    password = request.args.get("password")
     if password != ADMIN_PASSWORD:
         return redirect("/admin")
     url = request.form.get("url")
-    if not url:
-        return redirect("/admin")
-    thread = threading.Thread(target=download_and_extract_from_url, args=(url,))
-    thread.start()
-    logs = load_logs()
-    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    active_24h = get_active_users(24)
-    active_1h = get_active_users(1)
-    return render_template_string(
-        ADMIN_TEMPLATE,
-        authenticated=True,
-        password=ADMIN_PASSWORD,
-        licenses=license_manager.licenses,
-        logs=logs,
-        new_key=None,
-        now=now,
-        active_24h=active_24h,
-        active_1h=active_1h,
-        message="Rozpoczęto pobieranie danych. Sprawdź logi serwera."
-    )
+    if url:
+        thread = threading.Thread(target=download_and_extract_from_url, args=(url,))
+        thread.start()
+    return redirect(url_for('admin_index') + "?password=" + ADMIN_PASSWORD)
 
 
 if __name__ == "__main__":
