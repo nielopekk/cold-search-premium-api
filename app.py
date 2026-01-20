@@ -19,6 +19,14 @@ license_manager = LicenseManager()
 ADMIN_PASSWORD = "wyciek12"
 
 
+def get_client_ip():
+    """Pobiera prawdziwe IP klienta (obsługuje proxy Render)."""
+    if request.headers.getlist("X-Forwarded-For"):
+        ip = request.headers.get("X-Forwarded-For").split(",")[0].strip()
+        return ip
+    return request.remote_addr
+
+
 def load_logs():
     try:
         return json.loads(LOGS_FILE.read_text(encoding="utf-8"))
@@ -31,7 +39,7 @@ def save_log(event_type, key=None, ip=None, query=None):
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "event": event_type,
         "key": key,
-        "ip": ip or request.remote_addr,
+        "ip": ip or get_client_ip(),
         "query": query
     }
     logs.append(entry)
@@ -42,7 +50,7 @@ def save_log(event_type, key=None, ip=None, query=None):
 def index():
     return jsonify({
         "name": "Cold Search Premium API",
-        "version": "2.0",
+        "version": "2.1",
         "status": "online"
     })
 
@@ -54,7 +62,7 @@ def auth():
     if not key:
         return jsonify({"success": False, "message": "Brak klucza"}), 400
 
-    client_ip = request.remote_addr
+    client_ip = get_client_ip()
     result = license_manager.validate_license(key, client_ip)
     save_log("auth", key=key, ip=client_ip)
     return jsonify(result)
@@ -68,7 +76,7 @@ def search():
     if not key or not query:
         return jsonify({"success": False, "message": "Brak danych"}), 400
 
-    client_ip = request.remote_addr
+    client_ip = get_client_ip()
     auth = license_manager.validate_license(key, client_ip)
     if not auth["success"]:
         save_log("search_denied", key=key, ip=client_ip, query=query)
@@ -118,7 +126,7 @@ def search():
     })
 
 
-# === NOWOCZESNY PANEL ADMINA ===
+# === PANEL ADMINA ===
 
 ADMIN_TEMPLATE = """
 <!DOCTYPE html>
@@ -147,7 +155,7 @@ ADMIN_TEMPLATE = """
             padding: 20px;
         }
         .container {
-            max-width: 1200px;
+            max-width: 1000px;
             margin: 0 auto;
         }
         header {
@@ -164,20 +172,7 @@ ADMIN_TEMPLATE = """
             color: transparent;
             margin-bottom: 8px;
         }
-        .stats {
-            display: flex;
-            gap: 20px;
-            justify-content: center;
-            margin-top: 15px;
-            flex-wrap: wrap;
-        }
-        .stat-box {
-            background: var(--card-bg);
-            padding: 12px 20px;
-            border-radius: 10px;
-            font-weight: bold;
-        }
-        .form-group, .card {
+        .form-group {
             background: var(--card-bg);
             padding: 20px;
             border-radius: 12px;
@@ -187,11 +182,8 @@ ADMIN_TEMPLATE = """
         h2 {
             margin-bottom: 15px;
             color: var(--primary);
-            display: flex;
-            align-items: center;
-            gap: 10px;
         }
-        input, select, button {
+        input, button {
             width: 100%;
             padding: 12px;
             margin: 8px 0;
@@ -250,31 +242,12 @@ ADMIN_TEMPLATE = """
             color: var(--danger);
             text-decoration: none;
         }
-        @media (max-width: 768px) {
-            .stats { flex-direction: column; align-items: center; }
-            table, thead, tbody, th, td, tr {
-                display: block;
-            }
-            td {
-                text-align: right;
-                padding-left: 50% !important;
-                position: relative;
-            }
-            td:before {
-                content: attr(data-label) ": ";
-                position: absolute;
-                left: 10px;
-                width: 45%;
-                font-weight: bold;
-                color: var(--primary);
-            }
-        }
     </style>
 </head>
 <body>
     <div class="container">
         <header>
-            <h1>🔐 Cold Search Premium — Admin Panel</h1>
+            <h1>Cold Search Premium — Admin Panel</h1>
             {% if authenticated %}
                 <p>Zalogowany jako administrator</p>
                 <a href="/admin" class="logout-link">→ Wyloguj się (odśwież stronę)</a>
@@ -289,32 +262,23 @@ ADMIN_TEMPLATE = """
                     <button type="submit">Zaloguj się</button>
                 </form>
                 {% if error %}
-                    <p style="color: var(--danger); margin-top: 10px;">❌ Nieprawidłowe hasło.</p>
+                    <p style="color: var(--danger); margin-top: 10px;">Nieprawidłowe hasło.</p>
                 {% endif %}
             </div>
         {% else %}
-            <div class="stats">
-                <div class="stat-box">Licencji: {{ licenses|length }}</div>
-                <div class="stat-box">Aktywnych: {{ active_count }}</div>
-                <div class="stat-box">Wygasłych: {{ expired_count }}</div>
-            </div>
-
             <!-- Generowanie klucza -->
             <div class="form-group">
                 <h2>➕ Wygeneruj nowy klucz</h2>
                 <form method="POST" action="/admin/generate">
                     <input type="hidden" name="password" value="{{ password }}">
-                    <select name="days" required>
-                        <option value="1">Ważność: 1 dzień</option>
-                        <option value="7" selected>Ważność: 7 dni</option>
-                        <option value="30">Ważność: 30 dni</option>
-                        <option value="0">Bezterminowy</option>
-                    </select>
+                    <label for="days">Ważność (dni):</label>
+                    <input type="number" id="days" name="days" min="0" value="7" placeholder="Liczba dni (0 = bezterminowy)" required>
+                    <small style="color:#aaa;">Wpisz 0 dla klucza bezterminowego</small><br><br>
                     <button type="submit">Generuj klucz premium</button>
                 </form>
                 {% if new_key %}
                     <div style="background:#162e22; padding:15px; border-radius:8px; margin-top:15px; color:var(--success);">
-                        <strong>✅ Nowy klucz:</strong><br>
+                        <strong>Nowy klucz:</strong><br>
                         <span style="font-family:monospace; font-size:18px;">{{ new_key }}</span><br>
                         {% if expiry != "Bezterminowa" %}
                             <small>Ważny do: {{ expiry }}</small>
@@ -328,7 +292,7 @@ ADMIN_TEMPLATE = """
                 <h2>🗑️ Zablokuj klucz</h2>
                 <form method="POST" action="/admin/revoke">
                     <input type="hidden" name="password" value="{{ password }}">
-                    <input type="text" name="key" placeholder="Wklej klucz do zablokowania..." required>
+                    <input type="text" name="key" placeholder="Klucz do zablokowania..." required>
                     <button type="submit" style="background:var(--danger);">Zablokuj klucz</button>
                 </form>
             </div>
@@ -359,7 +323,7 @@ ADMIN_TEMPLATE = """
 
             <!-- Logi -->
             <div class="form-group">
-                <h2>📜 Ostatnie logi ({{ logs|length }})</h2>
+                <h2>📜 Ostatnie logi</h2>
                 <table>
                     <thead>
                         <tr>
@@ -371,13 +335,13 @@ ADMIN_TEMPLATE = """
                         </tr>
                     </thead>
                     <tbody>
-                        {% for log in logs[-100:] | reverse %}
+                        {% for log in logs[-50:] | reverse %}
                         <tr>
-                            <td data-label="Czas">{{ log.timestamp[:19] }}</td>
-                            <td data-label="Typ">{{ log.event }}</td>
-                            <td data-label="IP">{{ log.ip }}</td>
-                            <td data-label="Klucz">{{ log.key or "—" }}</td>
-                            <td data-label="Zapytanie">{{ log.query or "—" }}</td>
+                            <td>{{ log.timestamp[:19] }}</td>
+                            <td>{{ log.event }}</td>
+                            <td>{{ log.ip }}</td>
+                            <td>{{ log.key or "—" }}</td>
+                            <td>{{ log.query or "—" }}</td>
                         </tr>
                         {% endfor %}
                     </tbody>
@@ -397,17 +361,6 @@ def admin_panel():
     if password == ADMIN_PASSWORD:
         logs = load_logs()
         now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        
-        active_count = 0
-        expired_count = 0
-        for data in license_manager.licenses.values():
-            if not data["active"]:
-                continue
-            if data.get("expiry") and data["expiry"] < now:
-                expired_count += 1
-            else:
-                active_count += 1
-
         return render_template_string(
             ADMIN_TEMPLATE,
             authenticated=True,
@@ -415,9 +368,7 @@ def admin_panel():
             licenses=license_manager.licenses,
             logs=logs,
             new_key=None,
-            now=now,
-            active_count=active_count,
-            expired_count=expired_count
+            now=now
         )
     else:
         return render_template_string(
@@ -436,6 +387,8 @@ def admin_generate():
     days_str = request.form.get("days", "7")
     try:
         days = int(days_str)
+        if days < 0:
+            days = 0
     except ValueError:
         days = 7
 
@@ -444,9 +397,6 @@ def admin_generate():
     
     logs = load_logs()
     now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    
-    active_count = sum(1 for d in license_manager.licenses.values() if d["active"] and (not d.get("expiry") or d["expiry"] >= now))
-    expired_count = sum(1 for d in license_manager.licenses.values() if d["active"] and d.get("expiry") and d["expiry"] < now)
 
     return render_template_string(
         ADMIN_TEMPLATE,
@@ -456,9 +406,7 @@ def admin_generate():
         logs=logs,
         new_key=key,
         expiry=expiry,
-        now=now,
-        active_count=active_count,
-        expired_count=expired_count
+        now=now
     )
 
 
