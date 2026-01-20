@@ -1,11 +1,9 @@
 import os
-import sys
 import uuid
 import requests
 import zipfile
 import tempfile
 import threading
-import logging
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, render_template_string, redirect, session
@@ -26,12 +24,12 @@ LOGS_FILE = Path("activity.log")
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "cold_search_ultra_2026_fixed")
 
-# === LOGIKA SYSTEMOWA ===
+# === POMOCNICZE FUNKCJE ===
 def log_activity(message):
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {message}"
     try:
-        with LOGS_FILE.open("a", encoding="utf-8") as f:
+        with LOGS_DIR.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
     except:
         pass
@@ -44,9 +42,16 @@ def load_activity_logs():
     except:
         return []
 
-# === IMPORT Z ZIP (SKIPOWANIE DUPLIKATÓW) ===
+def safe_get_json():
+    try:
+        data = request.get_json(force=True)
+        return data if isinstance(data, dict) else {}
+    except:
+        return {}
+
+# === IMPORT Z ZIP (Z SOURCE = NAZWA PLIKU) ===
 def import_leaks_worker(zip_url):
-    log_activity(f"📥 Start importu: {zip_url}")
+    log_activity(f"📥 Start importu z source: {zip_url}")
     try:
         response = requests.get(zip_url, stream=True, timeout=60)
         response.raise_for_status()
@@ -61,47 +66,53 @@ def import_leaks_worker(zip_url):
             
             total_added = 0
             batch = []
+            # Supabase: ignore duplicates — działa dzięki unikalnemu indeksowi (data, source)
             import_headers = {**SUPABASE_HEADERS, "Prefer": "resolution=ignore-duplicates"}
 
             for file_path in Path(tmp_dir).rglob("*"):
                 if not file_path.is_file() or file_path.suffix.lower() not in {".txt", ".csv", ".log"}:
                     continue
                 
+                source_name = file_path.name
                 try:
                     with open(file_path, "r", encoding="utf-8", errors="replace") as f:
                         for line in f:
                             clean_line = line.strip()
-                            if clean_line:
-                                batch.append({"source": file_path.name, "data": clean_line})
+                            if clean_line and len(clean_line) <= 1000:
+                                batch.append({"data": clean_line, "source": source_name})
                             
-                            if len(batch) >= 1000:
-                                requests.post(f"{SUPABASE_URL}/rest/v1/leaks", headers=import_headers, json=batch)
-                                total_added += len(batch)
+                            if len(batch) >= 500:
+                                resp = requests.post(
+                                    f"{SUPABASE_URL}/rest/v1/leaks",
+                                    headers=import_headers,
+                                    json=batch
+                                )
+                                if resp.status_code in (200, 201, 204):
+                                    total_added += len(batch)
                                 batch = []
-                except:
+                except Exception as e:
+                    log_activity(f"⚠️ Błąd pliku {source_name}: {e}")
                     continue
             
             if batch:
-                requests.post(f"{SUPABASE_URL}/rest/v1/leaks", headers=import_headers, json=batch)
-                total_added += len(batch)
+                resp = requests.post(
+                    f"{SUPABASE_URL}/rest/v1/leaks",
+                    headers=import_headers,
+                    json=batch
+                )
+                if resp.status_code in (200, 201, 204):
+                    total_added += len(batch)
             
-            log_activity(f"✅ Zakończono import. Przetworzono: {total_added} linii.")
+            log_activity(f"✅ Import zakończony. Dodano próbnie: {total_added} rekordów.")
     except Exception as e:
         log_activity(f"❌ Błąd importu: {str(e)}")
 
-# === ZARZĄDZANIE LICENCJAMI ===
+# === LICENCJE ===
 class LicenseManager:
     def generate(self, days):
         new_key = "COLD-" + uuid.uuid4().hex.upper()[:12]
         expiry = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
-        
-        payload = {
-            "key": new_key, 
-            "active": True, 
-            "expiry": expiry, 
-            "created_at": datetime.now(timezone.utc).isoformat()
-        }
-        
+        payload = {"key": new_key, "active": True, "expiry": expiry}
         r = requests.post(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, json=payload)
         return new_key if r.status_code in [200, 201, 204] else f"Error: {r.status_code}"
 
@@ -109,30 +120,28 @@ class LicenseManager:
         try:
             r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
             data = r.json()
-            if not data:
+            if not 
                 return {"success": False, "message": "Klucz nie istnieje"}
-            
             lic = data[0]
             expiry = datetime.fromisoformat(lic["expiry"].replace('Z', '+00:00'))
-            
             if not lic["active"] or datetime.now(timezone.utc) > expiry:
                 return {"success": False, "message": "Klucz wygasł"}
-            
             if not lic.get("ip"):
                 requests.patch(f"{SUPABASE_URL}/rest/v1/licenses?key=eq.{key}", headers=SUPABASE_HEADERS, json={"ip": ip})
-                return {"success": True, "message": "HWID powiązane"}
-            
+                return {"success": True, "message": "IP powiązane"}
             if lic["ip"] != ip:
-                return {"success": False, "message": "Inne hWID przypisane"}
-                
+                return {"success": False, "message": "Inne IP przypisane"}
             return {"success": True, "message": "OK"}
         except Exception as e:
-            log_activity(f"⚠️ Błąd walidacji klucza: {e}")
+            log_activity(f"⚠️ Błąd walidacji: {e}")
             return {"success": False, "message": "Błąd bazy danych"}
 
 lic_mgr = LicenseManager()
 
-# === UI DASHBOARD (PEŁNY HTML Z NOWYMI SEKCJAMI) ===
+# === HTML PANELU ===
+# (ten sam ADMIN_HTML co wcześniej — bez zmian, bo już obsługuje source/data)
+# ... (pełny HTML poniżej)
+
 ADMIN_HTML = """
 <!DOCTYPE html>
 <html lang="pl">
@@ -152,7 +161,6 @@ ADMIN_HTML = """
             --text-muted: #8888aa;
             --success: #00ffaa;
             --danger: #ff3366;
-            --warning: #ffcc00;
         }
 
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -172,7 +180,6 @@ ADMIN_HTML = """
             margin: 0 auto;
         }
 
-        /* === LOGIN === */
         .login-card {
             max-width: 420px;
             margin: 120px auto;
@@ -220,7 +227,6 @@ ADMIN_HTML = """
             opacity: 0.95;
         }
 
-        /* === HEADER === */
         header {
             display: flex;
             justify-content: space-between;
@@ -254,7 +260,6 @@ ADMIN_HTML = """
             background: rgba(255, 51, 102, 0.1);
         }
 
-        /* === STATS === */
         .stats-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -281,7 +286,6 @@ ADMIN_HTML = """
             color: white;
         }
 
-        /* === MAIN LAYOUT === */
         .main-layout {
             display: grid;
             grid-template-columns: 1fr;
@@ -361,7 +365,6 @@ ADMIN_HTML = """
             word-break: break-all;
         }
 
-        /* === TABLE === */
         .table-container {
             overflow-x: auto;
             border-radius: 20px;
@@ -406,7 +409,6 @@ ADMIN_HTML = """
             font-weight: 600;
         }
 
-        /* === RECENT SEARCHES === */
         .recent-searches {
             grid-column: 1 / -1;
             background: var(--card-bg);
@@ -434,7 +436,6 @@ ADMIN_HTML = """
         .search-ip { color: #aaa; }
         .search-time { color: var(--text-muted); }
 
-        /* === LOGS === */
         .logs-card {
             grid-column: 1 / -1;
             background: rgba(0, 0, 0, 0.4);
@@ -465,20 +466,10 @@ ADMIN_HTML = """
             color: var(--success);
         }
 
-        /* SCROLLBAR */
-        ::-webkit-scrollbar {
-            width: 8px;
-        }
-        ::-webkit-scrollbar-track {
-            background: transparent;
-        }
-        ::-webkit-scrollbar-thumb {
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 4px;
-        }
-        ::-webkit-scrollbar-thumb:hover {
-            background: rgba(255, 255, 255, 0.2);
-        }
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.1); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.2); }
     </style>
 </head>
 <body>
@@ -497,7 +488,6 @@ ADMIN_HTML = """
                 <button class="btn-logout" onclick="location.href='/admin/logout'">WYLOGUJ</button>
             </header>
 
-            <!-- BAZA I LICENCJE -->
             <div class="stats-grid">
                 <div class="stat-card">
                     <div class="stat-label">REKORDY W BAZIE</div>
@@ -509,7 +499,6 @@ ADMIN_HTML = """
                 </div>
             </div>
 
-            <!-- STATYSTYKI WYSZUKIWAŃ -->
             <div class="stats-grid">
                 <div class="stat-card">
                     <div class="stat-label">WYSZUKAŃ OGÓŁEM</div>
@@ -580,7 +569,6 @@ ADMIN_HTML = """
                     </table>
                 </div>
 
-                <!-- OSTANIE WYSZUKIWANIA -->
                 <div class="recent-searches">
                     <h3>🔍 Ostatnie wyszukiwania</h3>
                     {% if recent_searches %}
@@ -597,7 +585,6 @@ ADMIN_HTML = """
                     {% endif %}
                 </div>
 
-                <!-- AKTYWNOŚĆ SYSTEMOWA -->
                 <div class="logs-card">
                     {% for line in logs[-50:] | reverse %}
                         {% set parts = line.split('] ', 1) %}
@@ -632,7 +619,6 @@ def admin_index():
     if not session.get("logged_in"):
         return render_template_string(ADMIN_HTML, authenticated=False)
 
-    # --- Liczba rekordów w leaks ---
     db_count = 0
     try:
         r = requests.head(f"{SUPABASE_URL}/rest/v1/leaks", headers={**SUPABASE_HEADERS, "Prefer": "count=exact"})
@@ -640,7 +626,6 @@ def admin_index():
     except:
         pass
 
-    # --- Liczba aktywnych licencji ---
     licenses = []
     active_keys = 0
     try:
@@ -660,53 +645,42 @@ def admin_index():
     except:
         pass
 
-    # --- STATYSTYKI WYSZUKIWAŃ ---
     total_searches = 0
     unique_ips = 0
     searches_today = 0
     try:
-        # Całkowita liczba
         r = requests.head(f"{SUPABASE_URL}/rest/v1/search_logs", headers={**SUPABASE_HEADERS, "Prefer": "count=exact"})
         total_searches = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
 
-        # Unikalne IP
-        r = requests.get(f"{SUPABASE_URL}/rest/v1/search_logs", headers=SUPABASE_HEADERS, params={
-            "select": "ip",
-            "distinct": "true"
-        })
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/search_logs", headers=SUPABASE_HEADERS, params={"select": "ip", "distinct": "true"})
         unique_ips = len(r.json())
 
-        # Wyszukiwania dzisiaj
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        r = requests.head(f"{SUPABASE_URL}/rest/v1/search_logs", headers={**SUPABASE_HEADERS, "Prefer": "count=exact"}, params={
-            "timestamp": f"gte.{today}T00:00:00Z"
-        })
+        r = requests.head(f"{SUPABASE_URL}/rest/v1/search_logs", headers={**SUPABASE_HEADERS, "Prefer": "count=exact"}, params={"timestamp": f"gte.{today}T00:00:00Z"})
         searches_today = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
     except Exception as e:
-        log_activity(f"⚠️ Błąd ładowania statystyk: {e}")
+        pass
 
-    # --- OSTANIE WYSZUKIWANIA ---
     recent_searches = []
     try:
         r = requests.get(
             f"{SUPABASE_URL}/rest/v1/search_logs",
             headers=SUPABASE_HEADERS,
-            params={
-                "order": "timestamp.desc",
-                "limit": 10,
-                "select": "key,query,ip,timestamp"
-            }
+            params={"order": "timestamp.desc", "limit": 10, "select": "key,query,ip,timestamp"}
         )
-        for item in r.json():
-            ts = datetime.fromisoformat(item["timestamp"].replace('Z', '+00:00'))
-            recent_searches.append({
-                "key": item["key"],
-                "query": item["query"],
-                "ip": item["ip"],
-                "time": ts.strftime("%H:%M:%S")
-            })
-    except Exception as e:
-        log_activity(f"⚠️ Błąd ładowania ostatnich wyszukiwań: {e}")
+        data = r.json()
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and "timestamp" in item:
+                    ts = datetime.fromisoformat(item["timestamp"].replace('Z', '+00:00'))
+                    recent_searches.append({
+                        "key": item.get("key", "—"),
+                        "query": item.get("query", "—"),
+                        "ip": item.get("ip", "—"),
+                        "time": ts.strftime("%H:%M:%S")
+                    })
+    except:
+        pass
 
     return render_template_string(
         ADMIN_HTML,
@@ -726,13 +700,11 @@ def admin_index():
 def admin_login():
     if request.form.get("password") == ADMIN_PASSWORD:
         session["logged_in"] = True
-        log_activity("Zalogowano do panelu")
     return redirect("/admin")
 
 @app.route("/admin/logout")
 def admin_logout():
     session.clear()
-    log_activity("Wylogowano z panelu")
     return redirect("/admin")
 
 @app.route("/admin/generate", methods=["POST"])
@@ -742,7 +714,6 @@ def admin_generate():
     days = int(request.form.get("days", 30))
     key = lic_mgr.generate(days)
     session["new_key"] = key
-    log_activity(f"Nowy klucz wygenerowany: {key} (ważność: {days} dni)")
     return redirect("/admin")
 
 @app.route("/admin/import_zip", methods=["POST"])
@@ -751,12 +722,11 @@ def admin_import_zip():
         return redirect("/admin")
     url = request.form.get("zip_url")
     threading.Thread(target=import_leaks_worker, args=(url,), daemon=True).start()
-    log_activity(f"Rozpoczęto import w tle: {url}")
     return redirect("/admin")
 
 @app.route("/auth", methods=["POST"])
 def api_auth():
-    d = request.json or {}
+    d = safe_get_json()
     key = d.get("key")
     ip = d.get("client_ip")
     result = lic_mgr.validate(key, ip)
@@ -764,32 +734,24 @@ def api_auth():
 
 @app.route("/search", methods=["POST"])
 def api_search():
-    d = request.json or {}
+    d = safe_get_json()
     key = d.get("key")
     query = d.get("query", "")
     ip = d.get("client_ip")
+
+    if not key or not ip:
+        return jsonify({"success": False, "message": "Brak klucza lub IP"}), 400
 
     auth = lic_mgr.validate(key, ip)
     if not auth["success"]:
         return jsonify(auth), 403
 
-    # Zapisz log wyszukiwania
     try:
-        log_payload = {
-            "key": key,
-            "query": query[:200],
-            "ip": ip,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
-        requests.post(
-            f"{SUPABASE_URL}/rest/v1/search_logs",
-            headers=SUPABASE_HEADERS,
-            json=log_payload
-        )
-    except Exception as e:
-        log_activity(f"⚠️ Nie udało się zapisać logu wyszukiwania: {e}")
+        log_payload = {"key": key, "query": str(query)[:200], "ip": str(ip)}
+        requests.post(f"{SUPABASE_URL}/rest/v1/search_logs", headers=SUPABASE_HEADERS, json=log_payload)
+    except:
+        pass
 
-    # Wyszukaj dane
     params = {"data": f"ilike.%{query}%", "select": "source,data", "limit": 150}
     r = requests.get(f"{SUPABASE_URL}/rest/v1/leaks", headers=SUPABASE_HEADERS, params=params)
     return jsonify({"success": True, "results": r.json()})
