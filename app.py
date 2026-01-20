@@ -19,14 +19,6 @@ license_manager = LicenseManager()
 ADMIN_PASSWORD = "wyciek12"
 
 
-def get_client_ip():
-    """Pobiera prawdziwe IP klienta (obsługuje proxy Render)."""
-    if request.headers.getlist("X-Forwarded-For"):
-        ip = request.headers.get("X-Forwarded-For").split(",")[0].strip()
-        return ip
-    return request.remote_addr
-
-
 def load_logs():
     try:
         return json.loads(LOGS_FILE.read_text(encoding="utf-8"))
@@ -39,7 +31,7 @@ def save_log(event_type, key=None, ip=None, query=None):
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "event": event_type,
         "key": key,
-        "ip": ip or get_client_ip(),
+        "ip": ip,
         "query": query
     }
     logs.append(entry)
@@ -50,7 +42,7 @@ def save_log(event_type, key=None, ip=None, query=None):
 def index():
     return jsonify({
         "name": "Cold Search Premium API",
-        "version": "2.1",
+        "version": "2.2",
         "status": "online"
     })
 
@@ -59,10 +51,11 @@ def index():
 def auth():
     data = request.json
     key = data.get("key")
-    if not key:
-        return jsonify({"success": False, "message": "Brak klucza"}), 400
+    client_ip = data.get("client_ip")  # ← IP przysłane przez klienta
 
-    client_ip = get_client_ip()
+    if not key or not client_ip:
+        return jsonify({"success": False, "message": "Brak klucza lub adresu IP"}), 400
+
     result = license_manager.validate_license(key, client_ip)
     save_log("auth", key=key, ip=client_ip)
     return jsonify(result)
@@ -73,10 +66,11 @@ def search():
     data = request.json
     key = data.get("key")
     query = data.get("query")
-    if not key or not query:
+    client_ip = data.get("client_ip")
+
+    if not key or not query or not client_ip:
         return jsonify({"success": False, "message": "Brak danych"}), 400
 
-    client_ip = get_client_ip()
     auth = license_manager.validate_license(key, client_ip)
     if not auth["success"]:
         save_log("search_denied", key=key, ip=client_ip, query=query)
