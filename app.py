@@ -1,18 +1,16 @@
 import os
 import sys
-import json
-import time
-import logging
-import threading
 import uuid
 import requests
 import zipfile
 import tempfile
+import threading
+import logging
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, render_template_string, redirect, session
 
-# === KONFIGURACJA SYSTEMU ===
+# === KONFIGURACJA ===
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://wcshypmsurncfufbojvp.supabase.co")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "sb_secret_Ci0yyib3FCJW3GMivhX3XA_D2vHmhpP")
 SUPABASE_HEADERS = {
@@ -26,9 +24,9 @@ ADMIN_PASSWORD = "wyciek12"
 LOGS_FILE = Path("activity.log")
 
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "cold_search_2026_ultra_secret_key")
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "cold_search_ultra_2026_fixed")
 
-# === LOGI I FUNKCJE POMOCNICZE ===
+# === LOGIKA SYSTEMOWA ===
 def log_activity(message):
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {message}"
@@ -43,195 +41,196 @@ def load_activity_logs():
         return LOGS_FILE.read_text(encoding="utf-8").strip().split("\n")
     except: return []
 
-def get_time_left(expiry_str):
+# === IMPORT Z ZIP (SKIPOWANIE DUPLIKATÓW) ===
+def import_leaks_worker(zip_url):
+    log_activity(f"📥 Start importu: {zip_url}")
     try:
-        expiry = datetime.fromisoformat(expiry_str.replace('Z', '+00:00'))
-        now = datetime.now(timezone.utc)
-        if now > expiry: return "WYGASŁO"
-        diff = expiry - now
-        if diff.days > 0: return f"{diff.days}d {diff.seconds // 3600}h"
-        return f"{diff.seconds // 3600}h {(diff.seconds // 60) % 60}m"
-    except: return "---"
+        response = requests.get(zip_url, stream=True, timeout=60)
+        response.raise_for_status()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            zip_path = Path(tmp_dir) / "data.zip"
+            with open(zip_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192): f.write(chunk)
+            
+            with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                zip_ref.extractall(tmp_dir)
+            
+            total_added = 0
+            batch = []
+            # Nagłówek do skipowania duplikatów w Supabase
+            import_headers = {**SUPABASE_HEADERS, "Prefer": "resolution=ignore-duplicates"}
 
-# === LOGIKA BAZY DANYCH I LICENCJI ===
+            for file_path in Path(tmp_dir).rglob("*"):
+                if not file_path.is_file() or file_path.suffix.lower() not in {".txt", ".csv", ".log"}:
+                    continue
+                
+                try:
+                    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                        for line in f:
+                            clean_line = line.strip()
+                            if clean_line:
+                                batch.append({"source": file_path.name, "data": clean_line})
+                            
+                            if len(batch) >= 1000:
+                                requests.post(f"{SUPABASE_URL}/rest/v1/leaks", headers=import_headers, json=batch)
+                                total_added += len(batch)
+                                batch = []
+                except: continue
+            
+            if batch:
+                requests.post(f"{SUPABASE_URL}/rest/v1/leaks", headers=import_headers, json=batch)
+                total_added += len(batch)
+            
+            log_activity(f"✅ Zakończono import. Przetworzono: {total_added} linii.")
+    except Exception as e:
+        log_activity(f"❌ Błąd importu: {str(e)}")
+
+# === ZARZĄDZANIE LICENCJAMI ===
 class LicenseManager:
+    def generate(self, days):
+        # NAPRAWIONO: uuid.uuid4().hex zamiast str().hex
+        new_key = "COLD-" + uuid.uuid4().hex.upper()[:12]
+        expiry = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+        
+        payload = {
+            "key": new_key, 
+            "active": True, 
+            "expiry": expiry, 
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+        r = requests.post(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, json=payload)
+        return new_key if r.status_code in [200, 201, 204] else f"Error: {r.status_code}"
+
     def validate(self, key, ip):
         try:
             r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
             data = r.json()
-            if not data: return {"success": False, "message": "Błędny klucz"}
+            if not data: return {"success": False, "message": "Klucz nie istnieje"}
+            
             lic = data[0]
             expiry = datetime.fromisoformat(lic["expiry"].replace('Z', '+00:00'))
-            if not lic.get("active") or datetime.now(timezone.utc) > expiry:
-                return {"success": False, "message": "Klucz wygasł lub jest nieaktywny"}
+            
+            if not lic["active"] or datetime.now(timezone.utc) > expiry:
+                return {"success": False, "message": "Klucz wygasł"}
+            
             if not lic.get("ip"):
                 requests.patch(f"{SUPABASE_URL}/rest/v1/licenses?key=eq.{key}", headers=SUPABASE_HEADERS, json={"ip": ip})
                 return {"success": True, "message": "IP powiązane"}
-            if lic["ip"] != ip: return {"success": False, "message": "Klucz przypisany do innego IP"}
+            
+            if lic["ip"] != ip:
+                return {"success": False, "message": "Inne IP przypisane"}
+                
             return {"success": True, "message": "OK"}
-        except: return {"success": False, "message": "Błąd serwera bazy"}
-
-    def generate(self, days):
-        new_key = "COLD-" + str(uuid.uuid4()).hex.upper()[:12]
-        expiry = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
-        requests.post(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, 
-                      json={"key": new_key, "active": True, "expiry": expiry, "created_at": datetime.now(timezone.utc).isoformat()})
-        return new_key
+        except:
+            return {"success": False, "message": "Błąd bazy danych"}
 
 lic_mgr = LicenseManager()
 
-# === TEMPLATE UI (HTML + CSS) ===
+# === UI DASHBOARD (CSS + HTML) ===
 ADMIN_HTML = """
 <!DOCTYPE html>
 <html lang="pl">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Cold Search | Premium Dashboard</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono&display=swap" rel="stylesheet">
     <style>
-        :root {
-            --primary: #00f2ff; --secondary: #bc13fe; --bg: #050508;
-            --card-bg: rgba(15, 15, 25, 0.75); --border: rgba(255, 255, 255, 0.1);
-            --text: #e0e0e0; --success: #00ff88; --danger: #ff0055;
-        }
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            background-color: var(--bg);
-            background-image: radial-gradient(circle at 10% 20%, rgba(0, 242, 255, 0.05) 0%, transparent 40%),
-                              radial-gradient(circle at 90% 80%, rgba(188, 19, 254, 0.05) 0%, transparent 40%);
-            color: var(--text); font-family: 'Inter', sans-serif; min-height: 100vh;
-        }
+        :root { --p: #00f2ff; --s: #bc13fe; --bg: #050508; --c: rgba(20, 20, 30, 0.8); --b: rgba(255,255,255,0.1); }
+        * { margin:0; padding:0; box-sizing:border-box; }
+        body { background: var(--bg); color:#e0e0e0; font-family:'Inter',sans-serif; min-height:100vh; background-image: radial-gradient(circle at 2% 2%, #101025 0%, transparent 50%); }
         .container { max-width: 1400px; margin: 0 auto; padding: 40px 20px; }
         
-        header {
-            display: flex; justify-content: space-between; align-items: center;
-            margin-bottom: 30px; padding: 25px; background: var(--card-bg);
-            backdrop-filter: blur(15px); border-radius: 24px; border: 1px solid var(--border);
-        }
-        .logo { font-size: 1.6rem; font-weight: 800; background: linear-gradient(90deg, var(--primary), var(--secondary));
-                -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; margin-bottom: 30px; }
-        .stat-card {
-            background: var(--card-bg); backdrop-filter: blur(10px); padding: 30px;
-            border-radius: 24px; border: 1px solid var(--border); transition: 0.3s;
-        }
-        .stat-card:hover { transform: translateY(-5px); border-color: var(--primary); }
-        .stat-label { font-size: 0.7rem; color: #888; text-transform: uppercase; letter-spacing: 1.5px; }
-        .stat-value { font-size: 2.2rem; font-weight: 700; color: #fff; font-family: 'JetBrains Mono'; margin-top: 10px; }
-
-        .layout { display: grid; grid-template-columns: 400px 1fr; gap: 30px; }
-        @media (max-width: 1100px) { .layout { grid-template-columns: 1fr; } }
-
-        .card { background: var(--card-bg); backdrop-filter: blur(10px); padding: 30px; border-radius: 24px; border: 1px solid var(--border); }
-        h3 { font-size: 0.9rem; margin-bottom: 25px; color: var(--primary); text-transform: uppercase; letter-spacing: 1px; display: flex; align-items: center; gap: 10px; }
-
-        input { width: 100%; background: rgba(0,0,0,0.4); border: 1px solid var(--border); padding: 15px; color: #fff; 
-                border-radius: 12px; margin-bottom: 15px; font-family: 'JetBrains Mono'; transition: 0.3s; }
-        input:focus { border-color: var(--primary); outline: none; }
+        header { display:flex; justify-content:space-between; align-items:center; background:var(--c); backdrop-filter:blur(10px); padding:20px 30px; border-radius:20px; border:1px solid var(--b); margin-bottom:30px; }
+        .logo { font-size:1.5rem; font-weight:800; background:linear-gradient(90deg, var(--p), var(--s)); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
         
-        button { width: 100%; padding: 16px; border: none; border-radius: 12px; font-weight: 800; cursor: pointer;
-                 background: linear-gradient(135deg, var(--primary), var(--secondary)); color: #000; transition: 0.3s; }
-        button:hover { filter: brightness(1.1); transform: scale(0.98); }
-
-        .table-wrap { background: var(--card-bg); border-radius: 24px; border: 1px solid var(--border); overflow: hidden; }
-        table { width: 100%; border-collapse: collapse; }
-        th { padding: 20px; text-align: left; color: #555; font-size: 0.7rem; text-transform: uppercase; border-bottom: 1px solid var(--border); }
-        td { padding: 18px 20px; font-size: 0.85rem; border-bottom: 1px solid var(--border); font-family: 'JetBrains Mono'; }
-        tr:hover td { background: rgba(255,255,255,0.03); }
-
-        .status { padding: 5px 12px; border-radius: 8px; font-size: 0.7rem; font-weight: 800; }
-        .status-active { background: rgba(0, 255, 136, 0.1); color: var(--success); }
-        .status-expired { background: rgba(255, 0, 85, 0.1); color: var(--danger); }
-
-        .logs-box { grid-column: 1 / -1; background: #000; border-radius: 24px; padding: 25px; height: 300px;
-                    overflow-y: auto; font-family: 'JetBrains Mono'; font-size: 11px; border: 1px solid var(--border); }
-        .log-line { margin-bottom: 6px; color: #444; }
-        .log-line b { color: var(--primary); }
+        .stats { display:grid; grid-template-columns:repeat(auto-fit, minmax(250px, 1fr)); gap:20px; margin-bottom:30px; }
+        .stat-card { background:var(--c); padding:25px; border-radius:20px; border:1px solid var(--b); border-left:4px solid var(--p); }
+        .stat-val { font-size:2rem; font-weight:700; font-family:'JetBrains Mono'; color:#fff; display:block; margin-top:5px; }
         
-        .logout-btn { background: transparent; border: 1px solid var(--danger); color: var(--danger); width: auto; padding: 10px 20px; }
-        .logout-btn:hover { background: var(--danger); color: #fff; }
+        .layout { display:grid; grid-template-columns: 380px 1fr; gap:25px; }
+        .card { background:var(--c); padding:30px; border-radius:24px; border:1px solid var(--b); }
+        
+        input { width:100%; background:rgba(0,0,0,0.5); border:1px solid var(--b); padding:14px; color:#fff; border-radius:12px; margin-bottom:15px; font-family:'JetBrains Mono'; }
+        button { width:100%; padding:15px; border:none; border-radius:12px; font-weight:800; cursor:pointer; background:linear-gradient(135deg, var(--p), var(--s)); color:#000; transition:0.3s; }
+        button:hover { transform:scale(0.98); opacity:0.9; }
+
+        table { width:100%; border-collapse:collapse; background:var(--c); border-radius:20px; overflow:hidden; border:1px solid var(--b); }
+        th { padding:15px; text-align:left; color:#555; font-size:0.7rem; text-transform:uppercase; border-bottom:1px solid var(--b); }
+        td { padding:15px; border-bottom:1px solid var(--b); font-family:'JetBrains Mono'; font-size:0.85rem; }
+        .status-active { color: #00ff88; background:rgba(0,255,136,0.1); padding:4px 8px; border-radius:6px; }
+
+        .logs { grid-column:1/-1; background:#000; border-radius:20px; padding:20px; height:250px; overflow-y:auto; border:1px solid var(--b); font-family:'JetBrains Mono'; font-size:11px; color:#666; }
+        .log-line b { color: var(--p); }
+        .btn-logout { background:transparent; border:1px solid #ff0055; color:#ff0055; width:auto; padding:8px 15px; }
     </style>
 </head>
 <body>
     <div class="container">
         {% if not authenticated %}
-            <div style="max-width:450px; margin: 150px auto;" class="card">
-                <h2 style="text-align:center; margin-bottom:30px; letter-spacing:-1px;">SECURE ACCESS</h2>
+            <div style="max-width:400px; margin:150px auto;" class="card">
+                <h2 style="text-align:center; margin-bottom:20px;">SECURE LOGIN</h2>
                 <form method="POST" action="/admin/login">
-                    <input type="password" name="password" placeholder="Master Password" required autofocus>
-                    <button type="submit">AUTHORIZE SYSTEM</button>
+                    <input type="password" name="password" placeholder="Hasło" required autofocus>
+                    <button type="submit">ZALOGUJ</button>
                 </form>
             </div>
         {% else %}
             <header>
                 <div class="logo">COLD SEARCH PREMIUM</div>
-                <a href="/admin/logout"><button class="logout-btn">TERMINATE SESSION</button></a>
+                <a href="/admin/logout"><button class="btn-logout">LOGOUT</button></a>
             </header>
 
-            <div class="stats-grid">
+            <div class="stats">
                 <div class="stat-card">
-                    <div class="stat-label">Baza Rekordów</div>
-                    <div class="stat-value">{{ "{:,}".format(db_count).replace(",", " ") }}</div>
+                    <small style="color:#888">REKORDY W BAZIE</small>
+                    <span class="stat-val">{{ "{:,}".format(db_count).replace(",", " ") }}</span>
                 </div>
-                <div class="stat-card">
-                    <div class="stat-label">Aktywne Licencje</div>
-                    <div class="stat-value" style="color:var(--primary)">{{ active_keys }}</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">Wszystkie Klucze</div>
-                    <div class="stat-value">{{ licenses|length }}</div>
+                <div class="stat-card" style="border-left-color: var(--s)">
+                    <small style="color:#888">AKTYWNE KLUCZE</small>
+                    <span class="stat-val">{{ active_keys }}</span>
                 </div>
             </div>
 
             <div class="layout">
                 <div class="card">
-                    <h3>➕ Generuj Licencję</h3>
+                    <h3>➕ NOWA LICENCJA</h3>
                     <form method="POST" action="/admin/generate">
-                        <label style="font-size:0.65rem; color:#666; display:block; margin-bottom:10px;">DNI WAŻNOŚCI</label>
-                        <input type="number" name="days" value="30" min="1">
-                        <button type="submit">UTWÓRZ NOWY KLUCZ</button>
+                        <input type="number" name="days" value="30" placeholder="Dni">
+                        <button type="submit">GENERUJ</button>
                     </form>
                     {% if new_key %}
-                        <div style="margin-top:20px; padding:15px; border:1px dashed var(--primary); border-radius:12px; background:rgba(0,242,255,0.05);">
-                            <small style="color:var(--primary)">OSTATNI KLUCZ:</small><br>
-                            <code style="font-size:1rem; color:#fff;">{{ new_key }}</code>
-                        </div>
+                    <div style="margin-top:15px; padding:10px; border:1px dashed var(--p); border-radius:10px; text-align:center;">
+                        <code style="color:var(--p)">{{ new_key }}</code>
+                    </div>
                     {% endif %}
+                    
+                    <h3 style="margin-top:30px;">📥 IMPORT BAZY</h3>
+                    <form method="POST" action="/admin/import_zip">
+                        <input type="url" name="zip_url" placeholder="URL do .zip" required>
+                        <button type="submit" style="background:var(--s); color:#fff;">START IMPORT</button>
+                    </form>
                 </div>
 
-                <div class="table-wrap">
+                <div style="overflow-x:auto;">
                     <table>
                         <thead>
-                            <tr>
-                                <th>Klucz Licencyjny</th>
-                                <th>Status</th>
-                                <th>Przypisane IP</th>
-                                <th>Wygasa za</th>
-                            </tr>
+                            <tr><th>Klucz</th><th>Status</th><th>IP</th><th>Pozostało</th></tr>
                         </thead>
                         <tbody>
-                            {% for lic in licenses | reverse %}
+                            {% for lic in licenses %}
                             <tr>
-                                <td style="color:var(--primary)">{{ lic.key }}</td>
-                                <td>
-                                    {% if lic.is_active %}
-                                        <span class="status status-active">ACTIVE</span>
-                                    {% else %}
-                                        <span class="status status-expired">EXPIRED</span>
-                                    {% endif %}
-                                </td>
-                                <td><span style="color:#777">{{ lic.ip if lic.ip else '---' }}</span></td>
-                                <td style="font-size:0.8rem;">{{ lic.time_left }}</td>
+                                <td style="color:var(--p)">{{ lic.key }}</td>
+                                <td><span class="status-active">{{ 'OK' if lic.is_active else 'EXP' }}</span></td>
+                                <td>{{ lic.ip if lic.ip else '---' }}</td>
+                                <td>{{ lic.time_left }}</td>
                             </tr>
                             {% endfor %}
                         </tbody>
                     </table>
                 </div>
 
-                <div class="logs-box">
-                    <div style="color:var(--primary); margin-bottom:15px; font-size:0.75rem; font-weight:800;">[ SYSTEM CORE LOGS ]</div>
+                <div class="logs">
                     {% for line in logs[-50:] | reverse %}
                         <div class="log-line"><b>></b> {{ line }}</div>
                     {% endfor %}
@@ -243,7 +242,7 @@ ADMIN_HTML = """
 </html>
 """
 
-# === ROUTING FLASK ===
+# === ROUTING ===
 @app.route("/admin")
 def admin_index():
     if not session.get("logged_in"): return render_template_string(ADMIN_HTML, authenticated=False)
@@ -258,16 +257,12 @@ def admin_index():
     active_keys = 0
     try:
         r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"order": "created_at.desc"})
-        raw_lics = r.json()
         now = datetime.now(timezone.utc)
-        for l in raw_lics:
-            expiry = datetime.fromisoformat(l["expiry"].replace('Z', '+00:00'))
-            is_active = l["active"] and now < expiry
-            if is_active: active_keys += 1
-            licenses.append({
-                "key": l["key"], "ip": l.get("ip"), "is_active": is_active,
-                "time_left": get_time_left(l["expiry"])
-            })
+        for l in r.json():
+            exp = datetime.fromisoformat(l["expiry"].replace('Z', '+00:00'))
+            active = l["active"] and now < exp
+            if active: active_keys += 1
+            licenses.append({"key": l["key"], "ip": l.get("ip"), "is_active": active, "time_left": "Aktualny"})
     except: pass
 
     return render_template_string(ADMIN_HTML, authenticated=True, db_count=db_count, 
@@ -278,7 +273,7 @@ def admin_index():
 def admin_login():
     if request.form.get("password") == ADMIN_PASSWORD:
         session["logged_in"] = True
-        log_activity("Admin authorized")
+        log_activity("Zalogowano do panelu")
     return redirect("/admin")
 
 @app.route("/admin/logout")
@@ -291,10 +286,16 @@ def admin_generate():
     if not session.get("logged_in"): return redirect("/admin")
     key = lic_mgr.generate(int(request.form.get("days", 30)))
     session["new_key"] = key
-    log_activity(f"Generated key: {key}")
+    log_activity(f"Nowy klucz: {key}")
     return redirect("/admin")
 
-# --- API DLA KLIENTA ---
+@app.route("/admin/import_zip", methods=["POST"])
+def admin_import_zip():
+    if not session.get("logged_in"): return redirect("/admin")
+    url = request.form.get("zip_url")
+    threading.Thread(target=import_leaks_worker, args=(url,)).start()
+    return redirect("/admin")
+
 @app.route("/auth", methods=["POST"])
 def api_auth():
     d = request.json or {}
@@ -306,9 +307,7 @@ def api_search():
     auth = lic_mgr.validate(d.get("key"), d.get("client_ip"))
     if not auth["success"]: return jsonify(auth), 403
     
-    q = d.get("query", "")
-    log_activity(f"Search: {q} by {d.get('key')}")
-    params = {"data": f"ilike.%{q}%", "select": "source,data", "limit": 150}
+    params = {"data": f"ilike.%{d.get('query')}%", "select": "source,data", "limit": 150}
     r = requests.get(f"{SUPABASE_URL}/rest/v1/leaks", headers=SUPABASE_HEADERS, params=params)
     return jsonify({"success": True, "results": r.json()})
 
