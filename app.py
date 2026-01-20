@@ -6,27 +6,27 @@ import time
 import shutil
 import logging
 import threading
-from pathlib import Path
-from datetime import datetime, timedelta
-
-import requests
+import sqlite3
 import zipfile
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for, session
+import uuid
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from flask import Flask, request, jsonify, render_template_string, redirect, session
 
 # === KONFIGURACJA ===
-SUPABASE_URL = "https://wcshypmsurncfufbojvp.supabase.co"
-SUPABASE_KEY = "sb_secret_Ci0yyib3FCJW3GMivhX3XA_D2vHmhpP"
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://wcshypmsurncfufbojvp.supabase.co")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "sb_secret_Ci0yyib3FCJW3GMivhX3XA_D2vHmhpP")
 SUPABASE_HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
     "Content-Type": "application/json"
 }
 
-LEAKS_DIR = Path("leaks")
-LOGS_FILE = Path("logs.json")
-LEAKS_DIR.mkdir(exist_ok=True)
-if not LOGS_FILE.exists():
-    LOGS_FILE.write_text("[]", encoding="utf-8")
+DB_PATH = "leaks.db"
+ADMIN_PASSWORD = "wyciek12"
+
+app = Flask(__name__)
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "cold_search_premium_secret_2026")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,213 +35,87 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ColdSearch")
 
-ADMIN_PASSWORD = "wyciek12"
-app = Flask(__name__)
-app.secret_key = "wyciek12"  # Zmień w produkcji!
 
-
-def ensure_supabase_table():
-    """Automatycznie tworzy tabelę 'licenses' jeśli nie istnieje."""
-    if not SUPABASE_KEY:
-        logger.warning("Brak klucza Supabase — pomijam tworzenie tabeli.")
-        return
-
-    try:
-        response = requests.get(
-            f"{SUPABASE_URL}/rest/v1/licenses",
-            headers=SUPABASE_HEADERS,
-            params={"select": "id", "limit": "1"}
+# === INICJALIZACJA BAZY SQLITE ===
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS leaks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT,
+            data TEXT
         )
-        if response.status_code == 200:
-            logger.info("✅ Tabela 'licenses' już istnieje.")
-            return
+    ''')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_data ON leaks(data)')
+    conn.commit()
+    conn.close()
 
-        # Alternatywa: ręczne utworzenie przez SQL w Supabase Studio
-        logger.warning("⚠️ Tabela 'licenses' nie istnieje. Utwórz ją ręcznie w Supabase Studio.")
-    except Exception as e:
-        logger.error(f"❌ Błąd podczas sprawdzania tabeli: {e}")
+init_db()
 
 
-def load_logs():
+# === IMPORT ZIP DO SQLITE ===
+def import_zip_to_sql(url):
     try:
-        return json.loads(LOGS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-
-def save_log(event_type, key=None, ip=None, query=None):
-    logs = load_logs()
-    entry = {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "event": event_type,
-        "key": key,
-        "ip": ip,
-        "query": query
-    }
-    logs.append(entry)
-    LOGS_FILE.write_text(json.dumps(logs, indent=2, ensure_ascii=False), encoding="utf-8")
-
-def get_active_users(hours=24):
-    logs = load_logs()
-    cutoff = datetime.utcnow() - timedelta(hours=hours)
-    active_ips = set()
-    for log in logs:
-        try:
-            log_time = datetime.fromisoformat(log["timestamp"].replace("Z", "+00:00"))
-            if log_time >= cutoff and log["event"] == "auth":
-                active_ips.add(log["ip"])
-        except:
-            continue
-    return len(active_ips)
-
-def download_and_extract_from_url(url):
-    try:
-        logger.info(f"📥 Rozpoczynam pobieranie z: {url}")
-        response = requests.get(url, stream=True, timeout=120)
-        response.raise_for_status()
-        
-        archive_path = Path("temp_download.zip")
-        with open(archive_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
+        logger.info(f"📥 Pobieranie bazy z: {url}")
+        r = requests.get(url, stream=True)
+        zip_path = "temp_leaks.zip"
+        with open(zip_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
                 f.write(chunk)
+
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
         
-        if LEAKS_DIR.exists():
-            shutil.rmtree(LEAKS_DIR)
-        LEAKS_DIR.mkdir()
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            for filename in z.namelist():
+                if filename.endswith(('.txt', '.log', '.csv')):
+                    logger.info(f"⚙️ Importowanie: {filename}")
+                    with z.open(filename) as f:
+                        lines = f.read().decode('utf-8', errors='ignore').splitlines()
+                        batch = [(filename, line.strip()) for line in lines if line.strip()]
+                        cursor.executemany("INSERT INTO leaks (source, data) VALUES (?, ?)", batch)
         
-        with zipfile.ZipFile(archive_path) as zf:
-            zf.extractall(LEAKS_DIR)
-        
-        archive_path.unlink()
-        file_count = len(list(LEAKS_DIR.rglob("*")))
-        logger.info(f"✅ Załadowano {file_count} plików z: {url}")
+        conn.commit()
+        conn.close()
+        os.remove(zip_path)
+        logger.info("✅ Import zakończony. Dane są w tabeli 'leaks'.")
     except Exception as e:
-        logger.error(f"❌ Błąd podczas ładowania danych: {e}")
+        logger.error(f"❌ Błąd importu: {e}")
 
 
+# === LICENCJE Z SUPABASE ===
 class LicenseManager:
-    def __init__(self):
-        self.table = "licenses"
-
-    def _get_all(self):
-        if not SUPABASE_KEY:
-            return {}
+    def validate(self, key, ip):
         try:
-            response = requests.get(
-                f"{SUPABASE_URL}/rest/v1/{self.table}",
-                headers=SUPABASE_HEADERS,
-                params={"select": "*"}
-            )
-            if response.status_code == 200:
-                records = response.json()
-                return {r["key"]: {
-                    "ip": r.get("ip"),
-                    "active": r.get("active", True),
-                    "activated": r.get("activated"),
-                    "expiry": r.get("expiry")
-                } for r in records}
+            url = f"{SUPABASE_URL}/rest/v1/licenses"
+            r = requests.get(url, headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
+            data = r.json()
+            if not data:
+                return {"success": False, "message": "Nieprawidłowy klucz"}
+            lic = data[0]
+            if not lic["active"]:
+                return {"success": False, "message": "Klucz został zablokowany"}
+            
+            if not lic["ip"]:
+                requests.patch(url, headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"}, json={"ip": ip})
+                return {"success": True, "message": "IP przypisane"}
+            
+            return {"success": True, "message": "OK"} if lic["ip"] == ip else {"success": False, "message": "Klucz przypisany do innego adresu IP"}
         except Exception as e:
-            logger.error(f"Błąd pobierania licencji: {e}")
-        return {}
+            logger.error(f"Błąd walidacji licencji: {e}")
+            return {"success": False, "message": "Błąd serwera"}
 
-    def _save_one(self, key, data):
-        if not SUPABASE_KEY:
-            return
-        try:
-            check = requests.get(
-                f"{SUPABASE_URL}/rest/v1/{self.table}",
-                headers=SUPABASE_HEADERS,
-                params={"key": f"eq.{key}"}
-            )
-            payload = {
-                "key": key,
-                "ip": data.get("ip"),
-                "active": data.get("active", True),
-                "activated": data.get("activated"),
-                "expiry": data.get("expiry")
-            }
-            if check.status_code == 200 and check.json():
-                record_id = check.json()[0]["id"]
-                requests.patch(
-                    f"{SUPABASE_URL}/rest/v1/{self.table}?id=eq.{record_id}",
-                    headers=SUPABASE_HEADERS,
-                    json=payload
-                )
-            else:
-                requests.post(
-                    f"{SUPABASE_URL}/rest/v1/{self.table}",
-                    headers=SUPABASE_HEADERS,
-                    json=payload
-                )
-        except Exception as e:
-            logger.error(f"Błąd zapisu licencji: {e}")
+    def generate(self, days):
+        new_key = str(uuid.uuid4()).replace("-", "").upper()
+        exp = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat() if days > 0 else None
+        requests.post(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, json={"key": new_key, "active": True, "expiry": exp})
+        return new_key
 
-    @property
-    def licenses(self):
-        return self._get_all()
-
-    def generate_key(self, valid_days=None):
-        import uuid
-        key = str(uuid.uuid4()).replace("-", "").upper()
-        license_data = {
-            "ip": None,
-            "active": True,
-            "activated": None,
-            "expiry": None
-        }
-        if valid_days is not None and valid_days > 0:
-            expiry_dt = datetime.utcnow() + timedelta(days=valid_days)
-            license_data["expiry"] = expiry_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        self._save_one(key, license_data)
-        return key
-
-    def revoke_key(self, key):
-        if not SUPABASE_KEY:
-            return False
-        try:
-            response = requests.patch(
-                f"{SUPABASE_URL}/rest/v1/{self.table}?key=eq.{key}",
-                headers=SUPABASE_HEADERS,
-                json={"active": False}
-            )
-            return response.status_code in (200, 204)
-        except Exception:
-            return False
-
-    def validate_license(self, key, ip):
-        licenses = self._get_all()
-        if key not in licenses:
-            return {"success": False, "message": "Nieprawidłowy klucz"}
-        data = licenses[key]
-        if not data["active"]:
-            return {"success": False, "message": "Klucz został zablokowany"}
-        if data.get("expiry"):
-            try:
-                expiry = datetime.fromisoformat(data["expiry"].replace("Z", "+00:00"))
-                if datetime.utcnow() > expiry:
-                    return {"success": False, "message": "Klucz wygasł"}
-            except ValueError:
-                pass
-        if data["ip"] is None:
-            data["ip"] = ip
-            data["activated"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-            self._save_one(key, data)
-            msg = "Klucz aktywowany"
-            if data["expiry"]:
-                msg += f" — ważny do {data['expiry'][:10]}"
-            return {"success": True, "message": msg}
-        if data["ip"] != ip:
-            return {"success": False, "message": "Klucz przypisany do innego adresu IP"}
-        msg = "Dostęp przyznany"
-        if data["expiry"]:
-            msg += f" (wygasa {data['expiry'][:10]})"
-        return {"success": True, "message": msg}
+lic_mgr = LicenseManager()
 
 
-ensure_supabase_table()
-license_manager = LicenseManager()
-
-
-# === PANEL ADMINA Z SESJĄ ===
+# === PANEL ADMINA Z SESJĄ I WYKRESEM ===
 
 ADMIN_TEMPLATE = """
 <!DOCTYPE html>
@@ -425,12 +299,8 @@ ADMIN_TEMPLATE = """
             <!-- Statystyki -->
             <div class="stats-grid">
                 <div class="stat-card">
-                    <div>Aktywni (24h)</div>
-                    <div class="stat-value">{{ active_24h }}</div>
-                </div>
-                <div class="stat-card">
-                    <div>Aktywni (1h)</div>
-                    <div class="stat-value">{{ active_1h }}</div>
+                    <div>Wpisy w bazie</div>
+                    <div class="stat-value">{{ db_count }}</div>
                 </div>
                 <div class="stat-card">
                     <div>Licencji</div>
@@ -452,7 +322,7 @@ ADMIN_TEMPLATE = """
                 <h2>📥 Załaduj dane z URL (.zip)</h2>
                 <form method="POST" action="/admin/load_data">
                     <input type="url" name="url" placeholder="https://dropbox.com/.../leaks.zip?dl=1" required>
-                    <button type="submit">Pobierz i rozpakuj</button>
+                    <button type="submit">Pobierz i zaimportuj do SQLite</button>
                 </form>
             </div>
 
@@ -467,72 +337,30 @@ ADMIN_TEMPLATE = """
                 {% if new_key %}
                     <div class="alert alert-success">
                         <strong>✅ Nowy klucz:</strong><br>
-                        <span style="font-family:monospace; font-size:18px;">{{ new_key }}</span><br>
-                        {% if expiry != "Bezterminowa" %}
-                            <small>Ważny do: {{ expiry }}</small>
-                        {% endif %}
+                        <span style="font-family:monospace; font-size:18px;">{{ new_key }}</span>
                     </div>
                 {% endif %}
-            </div>
-
-            <!-- Zablokuj klucz -->
-            <div class="form-group">
-                <h2>🗑️ Zablokuj klucz</h2>
-                <form method="POST" action="/admin/revoke">
-                    <input type="text" name="key" placeholder="Klucz do zablokowania..." required>
-                    <button type="submit" class="btn-danger">Zablokuj</button>
-                </form>
             </div>
 
             <!-- Licencje -->
             <div class="form-group">
                 <h2>📋 Lista licencji ({{ licenses|length }})</h2>
                 {% for key, data in licenses.items() %}
-                    <div class="license-item {% if not data.active %}revoked{% elif data.expiry and data.expiry < now %}expired{% endif %}">
+                    <div class="license-item {% if not data.active %}revoked{% endif %}">
                         <div class="license-key">{{ key }}</div>
                         <div>
                             <strong>Status:</strong> 
                             {% if not data.active %}
                                 <span class="status-revoked">Zablokowana</span>
-                            {% elif data.expiry and data.expiry < now %}
-                                <span class="status-expired">Wygasła ({{ data.expiry[:10] }})</span>
-                            {% elif data.expiry %}
-                                <span class="status-active">Aktywna (wygasa {{ data.expiry[:10] }})</span>
+                            {% elif data.ip %}
+                                <span class="status-active">Aktywna</span>
                             {% else %}
-                                <span class="status-active">Bezterminowa</span>
+                                <span class="status-active">Nieaktywowana</span>
                             {% endif %}
                         </div>
-                        <div><strong>IP:</strong> {{ data.ip or "— nieaktywowany —" }}</div>
-                        <div><strong>Aktywowana:</strong> {{ data.activated or "—" }}</div>
+                        <div><strong>IP:</strong> {{ data.ip or "—" }}</div>
                     </div>
                 {% endfor %}
-            </div>
-
-            <!-- Logi -->
-            <div class="form-group">
-                <h2>📜 Ostatnie logi</h2>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Czas (UTC)</th>
-                            <th>Typ</th>
-                            <th>IP</th>
-                            <th>Klucz</th>
-                            <th>Zapytanie</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for log in logs[-50:] | reverse %}
-                        <tr>
-                            <td>{{ log.timestamp[:19] }}</td>
-                            <td>{{ log.event }}</td>
-                            <td>{{ log.ip }}</td>
-                            <td>{{ log.key or "—" }}</td>
-                            <td>{{ log.query or "—" }}</td>
-                        </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
             </div>
         {% endif %}
     </div>
@@ -543,18 +371,16 @@ ADMIN_TEMPLATE = """
         new Chart(ctx, {
             type: 'bar',
              {
-                labels: ['Aktywni (1h)', 'Aktywni (24h)', 'Licencji', 'Aktywne'],
+                labels: ['Wpisy w bazie', 'Licencji', 'Aktywne'],
                 datasets: [{
                     label: 'Statystyki',
-                    data: [{{ active_1h }}, {{ active_24h }}, {{ licenses|length }}, {{ active_keys }}],
+                     [{{ db_count }}, {{ licenses|length }}, {{ active_keys }}],
                     backgroundColor: [
                         'rgba(76, 201, 240, 0.7)',
-                        'rgba(76, 201, 240, 0.5)',
                         'rgba(67, 97, 238, 0.6)',
                         'rgba(74, 222, 128, 0.6)'
                     ],
                     borderColor: [
-                        'rgba(76, 201, 240, 1)',
                         'rgba(76, 201, 240, 1)',
                         'rgba(67, 97, 238, 1)',
                         'rgba(74, 222, 128, 1)'
@@ -588,24 +414,35 @@ ADMIN_TEMPLATE = """
 """
 
 
-def render_admin_panel(error=False, new_key=None, expiry=None):
-    logs = load_logs()
-    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    active_24h = get_active_users(24)
-    active_1h = get_active_users(1)
-    licenses = license_manager.licenses
+def get_db_count():
+    conn = sqlite3.connect(DB_PATH)
+    count = conn.execute("SELECT COUNT(*) FROM leaks").fetchone()[0]
+    conn.close()
+    return count
+
+def render_admin_panel(error=False, new_key=None):
+    db_count = get_db_count()
+    licenses = {}
+    try:
+        response = requests.get(
+            f"{SUPABASE_URL}/rest/v1/licenses",
+            headers=SUPABASE_HEADERS,
+            params={"select": "*"}
+        )
+        if response.status_code == 200:
+            records = response.json()
+            licenses = {r["key"]: r for r in records}
+    except Exception as e:
+        logger.error(f"Błąd pobierania licencji: {e}")
+
     active_keys = sum(1 for v in licenses.values() if v["active"])
     return render_template_string(
         ADMIN_TEMPLATE,
         authenticated=True,
         licenses=licenses,
-        logs=logs,
-        new_key=new_key,
-        expiry=expiry,
-        now=now,
-        active_24h=active_24h,
-        active_1h=active_1h,
-        active_keys=active_keys
+        db_count=db_count,
+        active_keys=active_keys,
+        new_key=new_key
     )
 
 
@@ -640,18 +477,8 @@ def admin_generate():
         if days < 0: days = 0
     except ValueError:
         days = 7
-    key = license_manager.generate_key(valid_days=days if days > 0 else None)
-    expiry = license_manager.licenses.get(key, {}).get("expiry", "Bezterminowa")
-    return redirect("/admin?new_key=" + key + "&expiry=" + expiry)
-
-@app.route("/admin/revoke", methods=["POST"])
-def admin_revoke():
-    if not session.get("logged_in"):
-        return redirect("/admin")
-    key = request.form.get("key")
-    if key:
-        license_manager.revoke_key(key)
-    return redirect("/admin")
+    key = lic_mgr.generate(days)
+    return redirect("/admin?new_key=" + key)
 
 @app.route("/admin/load_data", methods=["POST"])
 def admin_load_data():
@@ -659,7 +486,7 @@ def admin_load_data():
         return redirect("/admin")
     url = request.form.get("url")
     if url:
-        thread = threading.Thread(target=download_and_extract_from_url, args=(url,))
+        thread = threading.Thread(target=import_zip_to_sql, args=(url,))
         thread.start()
     return redirect("/admin")
 
@@ -670,22 +497,16 @@ def admin_load_data():
 def index():
     return jsonify({
         "name": "Cold Search Premium API",
-        "version": "5.0",
+        "version": "6.0",
         "status": "online"
     })
 
 @app.route("/api/status", methods=["GET"])
 def api_status():
-    active_24h = get_active_users(24)
-    active_1h = get_active_users(1)
-    licenses = license_manager.licenses
-    total = len(licenses)
-    active_keys = sum(1 for v in licenses.values() if v["active"])
+    db_count = get_db_count()
     return jsonify({
-        "active_users_1h": active_1h,
-        "active_users_24h": active_24h,
-        "total_licenses": total,
-        "active_licenses": active_keys
+        "total_entries": db_count,
+        "database": "SQLite (leaks table)"
     })
 
 @app.route("/auth", methods=["POST"])
@@ -695,8 +516,7 @@ def auth():
     client_ip = data.get("client_ip")
     if not key or not client_ip:
         return jsonify({"success": False, "message": "Brak klucza lub adresu IP"}), 400
-    result = license_manager.validate_license(key, client_ip)
-    save_log("auth", key=key, ip=client_ip)
+    result = lic_mgr.validate(key, client_ip)
     return jsonify(result)
 
 @app.route("/search", methods=["POST"])
@@ -707,47 +527,25 @@ def search():
     client_ip = data.get("client_ip")
     if not key or not query or not client_ip:
         return jsonify({"success": False, "message": "Brak danych"}), 400
-    auth = license_manager.validate_license(key, client_ip)
+    
+    auth = lic_mgr.validate(key, client_ip)
     if not auth["success"]:
-        save_log("search_denied", key=key, ip=client_ip, query=query)
         return jsonify(auth), 403
-    save_log("search", key=key, ip=client_ip, query=query)
-    results = []
-    query_lower = query.lower()
-    extensions = {".txt", ".csv", ".json", ".yml", ".yaml", ".sql", ".cfg", ".log", ".xml", ".ini"}
-    if not LEAKS_DIR.exists():
-        return jsonify({
-            "success": True,
-            "count": 0,
-            "results": [],
-            "warning": "Folder 'leaks' nie istnieje."
-        })
-    for file_path in LEAKS_DIR.rglob("*"):
-        if not file_path.is_file():
-            continue
-        if file_path.suffix.lower() not in extensions:
-            continue
-        try:
-            content = file_path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            try:
-                content = file_path.read_text(encoding="latin-1")
-            except Exception:
-                continue
-        relative_path = file_path.relative_to(LEAKS_DIR).as_posix()
-        for line_num, line in enumerate(content.splitlines(), 1):
-            if query_lower in line.lower():
-                results.append({
-                    "file": relative_path,
-                    "line": line_num,
-                    "content": line.strip()
-                })
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT source, data FROM leaks WHERE data LIKE ? LIMIT 150", (f'%{query}%',))
+    rows = cursor.fetchall()
+    conn.close()
+
+    results = [{"source": r[0], "line": r[1]} for r in rows]
     return jsonify({
         "success": True,
-        "count": len(results),
-        "results": results
+        "results": results,
+        "count": len(results)
     })
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
