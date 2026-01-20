@@ -1,8 +1,8 @@
 # app.py
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, redirect
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from license_manager import LicenseManager
 
@@ -10,16 +10,12 @@ app = Flask(__name__)
 
 LEAKS_DIR = Path("leaks")
 LOGS_FILE = Path("logs.json")
-LICENSE_FILE = Path("licenses.json")
 
-# Inicjalizacja
 LEAKS_DIR.mkdir(exist_ok=True)
 if not LOGS_FILE.exists():
     LOGS_FILE.write_text("[]", encoding="utf-8")
 
 license_manager = LicenseManager()
-
-# 🔒 HASŁO PANELU ADMINA — NA STAŁE
 ADMIN_PASSWORD = "wyciek12"
 
 
@@ -42,14 +38,14 @@ def save_log(event_type, key=None, ip=None, query=None):
     LOGS_FILE.write_text(json.dumps(logs, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-# === PUBLICZNE ENDPOINTY ===
-
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
         "name": "Cold Search Premium API",
+        "version": "2.0",
         "status": "online"
     })
+
 
 @app.route("/auth", methods=["POST"])
 def auth():
@@ -62,6 +58,7 @@ def auth():
     result = license_manager.validate_license(key, client_ip)
     save_log("auth", key=key, ip=client_ip)
     return jsonify(result)
+
 
 @app.route("/search", methods=["POST"])
 def search():
@@ -121,108 +118,271 @@ def search():
     })
 
 
-# === PANEL ADMINA (BEZ SESJI) ===
+# === NOWOCZESNY PANEL ADMINA ===
 
 ADMIN_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="pl">
 <head>
     <meta charset="UTF-8">
-    <title>Cold Search Admin Panel</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cold Search Premium — Admin Panel</title>
     <style>
-        body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #111; color: #eee; margin: 0; padding: 20px; }
-        .container { max-width: 1000px; margin: auto; background: #222; padding: 25px; border-radius: 10px; box-shadow: 0 0 15px rgba(0,0,0,0.7); }
-        h1, h2 { color: #4fc3f7; margin-bottom: 15px; }
-        input, button { padding: 10px; margin: 6px 0; width: 100%; border: none; border-radius: 5px; font-size: 16px; }
-        input[type="password"] { background: #333; color: white; }
-        button { background: #29b6f6; color: black; font-weight: bold; cursor: pointer; }
+        :root {
+            --bg: #0f0f1b;
+            --card-bg: #1a1a2e;
+            --text: #e6e6ff;
+            --primary: #4cc9f0;
+            --success: #4ade80;
+            --warning: #facc15;
+            --danger: #f87171;
+            --border: #2d2d44;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        header {
+            text-align: center;
+            margin-bottom: 30px;
+            padding: 20px;
+            border-bottom: 1px solid var(--border);
+        }
+        h1 {
+            font-size: 2.2rem;
+            background: linear-gradient(90deg, var(--primary), #a663cc);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            margin-bottom: 8px;
+        }
+        .stats {
+            display: flex;
+            gap: 20px;
+            justify-content: center;
+            margin-top: 15px;
+            flex-wrap: wrap;
+        }
+        .stat-box {
+            background: var(--card-bg);
+            padding: 12px 20px;
+            border-radius: 10px;
+            font-weight: bold;
+        }
+        .form-group, .card {
+            background: var(--card-bg);
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+        }
+        h2 {
+            margin-bottom: 15px;
+            color: var(--primary);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        input, select, button {
+            width: 100%;
+            padding: 12px;
+            margin: 8px 0;
+            border: none;
+            border-radius: 8px;
+            background: #25253a;
+            color: white;
+            font-size: 16px;
+        }
+        button {
+            background: linear-gradient(90deg, var(--primary), #4361ee);
+            color: white;
+            font-weight: bold;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
         button:hover { opacity: 0.9; }
-        .key-box { background: #333; padding: 12px; margin: 10px 0; border-radius: 6px; word-break: break-all; }
-        .log-entry { background: #333; padding: 10px; margin: 8px 0; border-left: 4px solid #66bb6a; font-size: 14px; }
-        .log-denied { border-left-color: #ef5350; }
-        .success { color: #66bb6a; }
-        .error { color: #ef5350; }
-        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
-        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #444; }
-        th { color: #4fc3f7; }
-        tr:hover { background: #2a2a2a; }
-        pre { background: #000; padding: 10px; border-radius: 5px; overflow-x: auto; }
+        .license-item {
+            background: #25253a;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 10px 0;
+            border-left: 4px solid var(--success);
+        }
+        .license-item.expired { border-left-color: var(--danger); }
+        .license-item.revoked { border-left-color: var(--warning); }
+        .license-key {
+            font-family: monospace;
+            font-weight: bold;
+            word-break: break-all;
+            margin-bottom: 8px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+        }
+        th {
+            color: var(--primary);
+            font-weight: 600;
+        }
+        tr:hover {
+            background: rgba(67, 97, 238, 0.1);
+        }
+        .status-active { color: var(--success); }
+        .status-expired { color: var(--danger); }
+        .status-revoked { color: var(--warning); }
+        .logout-link {
+            display: inline-block;
+            margin-top: 15px;
+            color: var(--danger);
+            text-decoration: none;
+        }
+        @media (max-width: 768px) {
+            .stats { flex-direction: column; align-items: center; }
+            table, thead, tbody, th, td, tr {
+                display: block;
+            }
+            td {
+                text-align: right;
+                padding-left: 50% !important;
+                position: relative;
+            }
+            td:before {
+                content: attr(data-label) ": ";
+                position: absolute;
+                left: 10px;
+                width: 45%;
+                font-weight: bold;
+                color: var(--primary);
+            }
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🔐 Cold Search Admin Panel</h1>
+        <header>
+            <h1>🔐 Cold Search Premium — Admin Panel</h1>
+            {% if authenticated %}
+                <p>Zalogowany jako administrator</p>
+                <a href="/admin" class="logout-link">→ Wyloguj się (odśwież stronę)</a>
+            {% endif %}
+        </header>
 
         {% if not authenticated %}
-            <form method="POST" action="/admin">
-                <input type="password" name="password" placeholder="Hasło panelu" required>
-                <button type="submit">Zaloguj się</button>
-            </form>
-            {% if error %}
-                <p class="error">❌ Nieprawidłowe hasło.</p>
-            {% endif %}
+            <div class="form-group">
+                <h2>🔒 Logowanie</h2>
+                <form method="POST" action="/admin">
+                    <input type="password" name="password" placeholder="Hasło panelu" required>
+                    <button type="submit">Zaloguj się</button>
+                </form>
+                {% if error %}
+                    <p style="color: var(--danger); margin-top: 10px;">❌ Nieprawidłowe hasło.</p>
+                {% endif %}
+            </div>
         {% else %}
-            <p><strong>✅ Zalogowany</strong> | <a href="/admin" style="color:#ff7043;">Wyloguj → odśwież stronę</a></p>
+            <div class="stats">
+                <div class="stat-box">Licencji: {{ licenses|length }}</div>
+                <div class="stat-box">Aktywnych: {{ active_count }}</div>
+                <div class="stat-box">Wygasłych: {{ expired_count }}</div>
+            </div>
 
             <!-- Generowanie klucza -->
-            <h2>➕ Wygeneruj nowy klucz premium</h2>
-            <form method="POST" action="/admin/generate">
-                <input type="hidden" name="password" value="{{ password }}">
-                <button type="submit">Generuj klucz</button>
-            </form>
-            {% if new_key %}
-                <div class="key-box success">✅ Nowy klucz: <strong>{{ new_key }}</strong></div>
-            {% endif %}
+            <div class="form-group">
+                <h2>➕ Wygeneruj nowy klucz</h2>
+                <form method="POST" action="/admin/generate">
+                    <input type="hidden" name="password" value="{{ password }}">
+                    <select name="days" required>
+                        <option value="1">Ważność: 1 dzień</option>
+                        <option value="7" selected>Ważność: 7 dni</option>
+                        <option value="30">Ważność: 30 dni</option>
+                        <option value="0">Bezterminowy</option>
+                    </select>
+                    <button type="submit">Generuj klucz premium</button>
+                </form>
+                {% if new_key %}
+                    <div style="background:#162e22; padding:15px; border-radius:8px; margin-top:15px; color:var(--success);">
+                        <strong>✅ Nowy klucz:</strong><br>
+                        <span style="font-family:monospace; font-size:18px;">{{ new_key }}</span><br>
+                        {% if expiry != "Bezterminowa" %}
+                            <small>Ważny do: {{ expiry }}</small>
+                        {% endif %}
+                    </div>
+                {% endif %}
+            </div>
 
             <!-- Zablokuj klucz -->
-            <h2>🗑️ Zablokuj klucz</h2>
-            <form method="POST" action="/admin/revoke">
-                <input type="hidden" name="password" value="{{ password }}">
-                <input type="text" name="key" placeholder="Wklej klucz do zablokowania..." required>
-                <button type="submit">Zablokuj</button>
-            </form>
+            <div class="form-group">
+                <h2>🗑️ Zablokuj klucz</h2>
+                <form method="POST" action="/admin/revoke">
+                    <input type="hidden" name="password" value="{{ password }}">
+                    <input type="text" name="key" placeholder="Wklej klucz do zablokowania..." required>
+                    <button type="submit" style="background:var(--danger);">Zablokuj klucz</button>
+                </form>
+            </div>
 
             <!-- Licencje -->
-            <h2>📋 Aktywne licencje</h2>
-            {% for key, data in licenses.items() %}
-                <div class="key-box">
-                    <strong>{{ key }}</strong><br>
-                    Status: {% if data.active %}✅ Aktywny{% else %}❌ Zablokowany{% endif %}<br>
-                    Przypisany do IP: <strong>{{ data.ip or "— nieaktywowany —" }}</strong>
-                </div>
-            {% endfor %}
+            <div class="form-group">
+                <h2>📋 Lista licencji ({{ licenses|length }})</h2>
+                {% for key, data in licenses.items() %}
+                    <div class="license-item {% if not data.active %}revoked{% elif data.expiry and data.expiry < now %}expired{% endif %}">
+                        <div class="license-key">{{ key }}</div>
+                        <div>
+                            <strong>Status:</strong> 
+                            {% if not data.active %}
+                                <span class="status-revoked">Zablokowana</span>
+                            {% elif data.expiry and data.expiry < now %}
+                                <span class="status-expired">Wygasła ({{ data.expiry[:10] }})</span>
+                            {% elif data.expiry %}
+                                <span class="status-active">Aktywna (wygasa {{ data.expiry[:10] }})</span>
+                            {% else %}
+                                <span class="status-active">Bezterminowa</span>
+                            {% endif %}
+                        </div>
+                        <div><strong>IP:</strong> {{ data.ip or "— nieaktywowany —" }}</div>
+                        <div><strong>Aktywowana:</strong> {{ data.activated or "—" }}</div>
+                    </div>
+                {% endfor %}
+            </div>
 
             <!-- Logi -->
-            <h2>📜 Logi aktywności klientów (ostatnie 200 wpisów)</h2>
-            <table>
-                <thead>
-                    <tr>
-                        <th>Czas (UTC)</th>
-                        <th>Typ</th>
-                        <th>IP klienta</th>
-                        <th>Klucz</th>
-                        <th>Zapytanie</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for log in logs[-200:] | reverse %}
-                    <tr class="{% if log.event == 'search_denied' %}log-denied{% else %}log-entry{% endif %}">
-                        <td>{{ log.timestamp[:19] }}</td>
-                        <td>{{ log.event }}</td>
-                        <td><strong>{{ log.ip }}</strong></td>
-                        <td>{{ log.key or "—" }}</td>
-                        <td>{{ log.query or "—" }}</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-
-            <!-- Wyczyść logi -->
-            <form method="POST" action="/admin/clear_logs" style="margin-top:20px;">
-                <input type="hidden" name="password" value="{{ password }}">
-                <button type="submit" style="background:#ef5350;" onclick="return confirm('Na pewno wyczyścić WSZYSTKIE logi?')">Wyczyść logi</button>
-            </form>
+            <div class="form-group">
+                <h2>📜 Ostatnie logi ({{ logs|length }})</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Czas (UTC)</th>
+                            <th>Typ</th>
+                            <th>IP</th>
+                            <th>Klucz</th>
+                            <th>Zapytanie</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for log in logs[-100:] | reverse %}
+                        <tr>
+                            <td data-label="Czas">{{ log.timestamp[:19] }}</td>
+                            <td data-label="Typ">{{ log.event }}</td>
+                            <td data-label="IP">{{ log.ip }}</td>
+                            <td data-label="Klucz">{{ log.key or "—" }}</td>
+                            <td data-label="Zapytanie">{{ log.query or "—" }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
         {% endif %}
     </div>
 </body>
@@ -232,22 +392,32 @@ ADMIN_TEMPLATE = """
 
 @app.route("/admin", methods=["GET", "POST"])
 def admin_panel():
-    password = None
-    if request.method == "POST":
-        password = request.form.get("password")
-    else:
-        # GET — próbujemy pobrać z URL (dla wygody)
-        password = request.args.get("password")
-
+    password = request.form.get("password") if request.method == "POST" else request.args.get("password")
+    
     if password == ADMIN_PASSWORD:
         logs = load_logs()
+        now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        
+        active_count = 0
+        expired_count = 0
+        for data in license_manager.licenses.values():
+            if not data["active"]:
+                continue
+            if data.get("expiry") and data["expiry"] < now:
+                expired_count += 1
+            else:
+                active_count += 1
+
         return render_template_string(
             ADMIN_TEMPLATE,
             authenticated=True,
             password=ADMIN_PASSWORD,
             licenses=license_manager.licenses,
             logs=logs,
-            new_key=None
+            new_key=None,
+            now=now,
+            active_count=active_count,
+            expired_count=expired_count
         )
     else:
         return render_template_string(
@@ -263,15 +433,32 @@ def admin_generate():
     if password != ADMIN_PASSWORD:
         return redirect("/admin")
 
-    key = license_manager.generate_key()
+    days_str = request.form.get("days", "7")
+    try:
+        days = int(days_str)
+    except ValueError:
+        days = 7
+
+    key = license_manager.generate_key(valid_days=days if days > 0 else None)
+    expiry = license_manager.licenses[key].get("expiry", "Bezterminowa")
+    
     logs = load_logs()
+    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    
+    active_count = sum(1 for d in license_manager.licenses.values() if d["active"] and (not d.get("expiry") or d["expiry"] >= now))
+    expired_count = sum(1 for d in license_manager.licenses.values() if d["active"] and d.get("expiry") and d["expiry"] < now)
+
     return render_template_string(
         ADMIN_TEMPLATE,
         authenticated=True,
         password=ADMIN_PASSWORD,
         licenses=license_manager.licenses,
         logs=logs,
-        new_key=key
+        new_key=key,
+        expiry=expiry,
+        now=now,
+        active_count=active_count,
+        expired_count=expired_count
     )
 
 
@@ -284,16 +471,6 @@ def admin_revoke():
     key = request.form.get("key")
     if key:
         license_manager.revoke_key(key)
-    return redirect("/admin")
-
-
-@app.route("/admin/clear_logs", methods=["POST"])
-def admin_clear_logs():
-    password = request.form.get("password")
-    if password != ADMIN_PASSWORD:
-        return redirect("/admin")
-
-    LOGS_FILE.write_text("[]", encoding="utf-8")
     return redirect("/admin")
 
 
