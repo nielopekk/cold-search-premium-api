@@ -119,7 +119,7 @@ class LicenseManager:
         try:
             r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
             data = r.json()
-            if not 
+            if not date:
                 return {"success": False, "message": "Klucz nie istnieje"}
             lic = data[0]
             expiry = datetime.fromisoformat(lic["expiry"].replace('Z', '+00:00'))
@@ -716,7 +716,7 @@ def admin_index():
         )
         data = r.json()
         if isinstance(data, list):
-            for item in 
+            for item in data:
                 if isinstance(item, dict) and "timestamp" in item:
                     ts = datetime.fromisoformat(item["timestamp"].replace('Z', '+00:00'))
                     recent_searches.append({
@@ -781,7 +781,7 @@ def admin_toggle(key):
     try:
         r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
         data = r.json()
-        if 
+        if data:
             current = data[0]["active"]
             new_state = not current
             requests.patch(
