@@ -6,6 +6,8 @@ import logging
 import threading
 import uuid
 import requests
+import zipfile
+import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, render_template_string, redirect, session
@@ -20,7 +22,7 @@ SUPABASE_HEADERS = {
     "Prefer": "return=minimal"
 }
 
-LOGS_FILE = Path("activity.log")  # prosty plik tekstowy
+LOGS_FILE = Path("activity.log")
 ADMIN_PASSWORD = "wyciek12"
 
 app = Flask(__name__)
@@ -34,65 +36,81 @@ logging.basicConfig(
 logger = logging.getLogger("ColdSearch")
 
 
-# === PROSTE LOGI AKTYWNOŚCI ===
+# === LOGI AKTYWNOŚCI ===
 def log_activity(message):
     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    line = f"[{timestamp}] {message}\n"
+    line = f"[{timestamp}] {message}"
     with LOGS_FILE.open("a", encoding="utf-8") as f:
-        f.write(line)
+        f.write(line + "\n")
     logger.info(message)
 
 def load_activity_logs():
     if not LOGS_FILE.exists():
         return []
     try:
-        lines = LOGS_FILE.read_text(encoding="utf-8").strip().split("\n")
-        return [line for line in lines if line.strip()]
+        text = LOGS_FILE.read_text(encoding="utf-8").strip()
+        return [line for line in text.split("\n") if line]
     except Exception:
         return []
 
 
-# === IMPORT DO SUPABASE ===
-def import_leaks_to_supabase():
-    log_activity("🚀 Rozpoczęto import danych z leaks/leaks/")
+# === IMPORT Z ZIP URL ===
+def import_leaks_from_zip_url(zip_url):
+    log_activity(f"📥 Rozpoczęto pobieranie ZIP z: {zip_url}")
     try:
-        leaks_dir = Path("leaks") / "leaks"
-        if not leaks_dir.exists():
-            msg = "⚠️ Folder 'leaks/leaks/' nie istnieje – pomijam import."
+        # Pobierz plik
+        response = requests.get(zip_url, stream=True)
+        response.raise_for_status()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            zip_path = Path(tmp_dir) / "data.zip"
+            with open(zip_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+            # Rozpakuj
+            with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                zip_ref.extractall(tmp_dir)
+
+            log_activity("📦 ZIP rozpakowany — przetwarzam pliki...")
+
+            total = 0
+            batch = []
+            BATCH_SIZE = 1000
+
+            # Przeszukaj wszystkie pliki w rozpakowanym katalogu
+            for file_path in Path(tmp_dir).rglob("*"):
+                if not file_path.is_file():
+                    continue
+                if file_path.suffix.lower() not in {".txt", ".csv", ".log"}:
+                    continue
+
+                # Ścieżka relatywna (bez ścieżki temp)
+                rel_path = file_path.relative_to(tmp_dir).as_posix()
+
+                try:
+                    content = file_path.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    content = file_path.read_text(encoding="latin-1")
+
+                lines = [line.strip() for line in content.splitlines() if line.strip()]
+                for line in lines:
+                    batch.append({"source": rel_path, "data": line})
+                    if len(batch) >= BATCH_SIZE:
+                        _send_batch_to_supabase(batch)
+                        total += len(batch)
+                        batch = []
+                        time.sleep(0.1)
+
+            if batch:
+                _send_batch_to_supabase(batch)
+                total += len(batch)
+
+            msg = f"✅ Import zakończony — dodano {total} wpisów do Supabase."
             log_activity(msg)
-            return
 
-        total = 0
-        batch = []
-        BATCH_SIZE = 1000
-
-        for file_path in leaks_dir.rglob("*"):
-            if not file_path.is_file():
-                continue
-            if file_path.suffix.lower() not in {".txt", ".csv", ".log"}:
-                continue
-            rel_path = file_path.relative_to(leaks_dir.parent).as_posix()  # leaks/leaks/plik.txt → leaks/plik.txt
-            try:
-                content = file_path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                content = file_path.read_text(encoding="latin-1")
-            lines = [line.strip() for line in content.splitlines() if line.strip()]
-            for line in lines:
-                batch.append({"source": rel_path, "data": line})
-                if len(batch) >= BATCH_SIZE:
-                    _send_batch_to_supabase(batch)
-                    total += len(batch)
-                    batch = []
-                    time.sleep(0.1)
-
-        if batch:
-            _send_batch_to_supabase(batch)
-            total += len(batch)
-
-        msg = f"✅ Zakończono import – dodano {total} wpisów do Supabase."
-        log_activity(msg)
     except Exception as e:
-        msg = f"❌ Błąd podczas importu: {str(e)}"
+        msg = f"❌ Błąd podczas importu z ZIP: {str(e)}"
         log_activity(msg)
 
 
@@ -148,7 +166,8 @@ def count_leaks():
     url = f"{SUPABASE_URL}/rest/v1/leaks"
     r = requests.head(url, headers=SUPABASE_HEADERS)
     if r.status_code == 200:
-        return int(r.headers.get("content-range", "0-0/0").split("/")[-1])
+        range_header = r.headers.get("content-range", "0-0/0")
+        return int(range_header.split("/")[-1])
     return 0
 
 def search_leaks(query, limit=150):
@@ -162,21 +181,19 @@ def search_leaks(query, limit=150):
     return r.json() if r.status_code == 200 else []
 
 def get_active_users(hours=24):
-    # Liczymy unikalne IP z logów aktywności (uproszczone)
     logs = load_activity_logs()
     cutoff = datetime.utcnow() - timedelta(hours=hours)
     ips = set()
     for line in logs:
-        if "auth success" in line or "IP przypisane" in line:
-            # Wyszukaj IP w linii (np. "... from 192.168.1.1")
-            parts = line.split()
-            if "from" in parts:
-                try:
-                    ip = parts[parts.index("from") + 1]
-                    if ip.replace(".", "").isdigit():
-                        ips.add(ip)
-                except:
-                    pass
+        if "from" in line and ("Auth success" in line or "IP przypisane" in line):
+            try:
+                parts = line.split()
+                ip_index = parts.index("from") + 1
+                ip = parts[ip_index].split("]")[0]
+                if "." in ip or ":" in ip:
+                    ips.add(ip)
+            except:
+                pass
     return len(ips)
 
 
@@ -308,6 +325,12 @@ ADMIN_TEMPLATE = """
             text-decoration: none;
             font-weight: bold;
         }
+        code {
+            font-family: monospace;
+            background: rgba(0,0,0,0.3);
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
     </style>
 </head>
 <body>
@@ -352,11 +375,12 @@ ADMIN_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- Import -->
+            <!-- Import z ZIP URL -->
             <div class="form-group">
-                <h2>📁 Import z leaks/leaks/</h2>
-                <form method="POST" action="/admin/import_leaks">
-                    <button type="submit">Rozpocznij import</button>
+                <h2>📥 Import z zewnętrznego ZIP</h2>
+                <form method="POST" action="/admin/import_zip">
+                    <input type="url" name="zip_url" placeholder="https://example.com/data.zip" required>
+                    <button type="submit">Pobierz i zaimportuj</button>
                 </form>
             </div>
 
@@ -372,7 +396,6 @@ ADMIN_TEMPLATE = """
                     <div class="alert alert-success">
                         ✅ Utworzono nowy klucz: <strong>{{ new_key }}</strong>
                     </div>
-                    {% set _ = log_activity("🔑 Utworzono nowy klucz: " + new_key) %}
                 {% endif %}
             </div>
 
@@ -426,7 +449,7 @@ def render_admin(error=False, new_key=None):
     )
 
 
-# === ENDPOINTY ===
+# === ENDPOINTY PANELU ===
 @app.route("/admin")
 def admin_index():
     return render_admin()
@@ -435,12 +458,14 @@ def admin_index():
 def admin_login():
     if request.form.get("password") == ADMIN_PASSWORD:
         session["logged_in"] = True
+        log_activity("🔓 Administrator zalogował się do panelu")
         return redirect("/admin")
     return render_admin(error=True)
 
 @app.route("/admin/logout")
 def admin_logout():
     session.pop("logged_in", None)
+    log_activity("🔒 Administrator wylogował się")
     return redirect("/admin")
 
 @app.route("/admin/generate", methods=["POST"])
@@ -451,12 +476,16 @@ def admin_generate():
     key = lic_mgr.generate(days)
     return render_admin(new_key=key)
 
-@app.route("/admin/import_leaks", methods=["POST"])
-def admin_import_leaks():
+@app.route("/admin/import_zip", methods=["POST"])
+def admin_import_zip():
     if not session.get("logged_in"):
         return redirect("/admin")
-    thread = threading.Thread(target=import_leaks_to_supabase)
+    zip_url = request.form.get("zip_url")
+    if not zip_url:
+        return render_admin(error=True)
+    thread = threading.Thread(target=import_leaks_from_zip_url, args=(zip_url,))
     thread.start()
+    log_activity(f"🔄 Uruchomiono wątek importu z: {zip_url}")
     return render_admin()
 
 
