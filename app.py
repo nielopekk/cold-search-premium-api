@@ -108,25 +108,25 @@ def import_leaks_to_sqlite():
 
 # === LICENCJE Z SUPABASE ===
 class LicenseManager:
-    def validate(self, key, ip):
-        try:
-            url = f"{SUPABASE_URL}/rest/v1/licenses"
-            r = requests.get(url, headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
-            data = r.json()
-            if not 
-                return {"success": False, "message": "Nieprawidłowy klucz"}
-            lic = data[0]
-            if not lic["active"]:
-                return {"success": False, "message": "Klucz został zablokowany"}
-            if not lic["ip"]:
-                requests.patch(url, headers=SUPABASE_HEADERS, json={"ip": ip})
-                return {"success": True, "message": "IP przypisane"}
-            if lic["ip"] != ip:
-                return {"success": False, "message": "Klucz przypisany do innego adresu IP"}
-            return {"success": True, "message": "OK"}
-        except Exception as e:
-            logger.error(f"Błąd walidacji: {e}")
-            return {"success": False, "message": "Błąd serwera"}
+def validate(self, key, ip):
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/licenses"
+        r = requests.get(url, headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
+        data = r.json()
+        if not data:  # ←←← TO BYŁO USZKODZONE
+            return {"success": False, "message": "Nieprawidłowy klucz"}
+        lic = data[0]
+        if not lic["active"]:
+            return {"success": False, "message": "Klucz został zablokowany"}
+        if not lic["ip"]:
+            requests.patch(url, headers=SUPABASE_HEADERS, json={"ip": ip})
+            return {"success": True, "message": "IP przypisane"}
+        if lic["ip"] != ip:
+            return {"success": False, "message": "Klucz przypisany do innego adresu IP"}
+        return {"success": True, "message": "OK"}
+    except Exception as e:
+        logger.error(f"Błąd walidacji: {e}")
+        return {"success": False, "message": "Błąd serwera"}
 
     def generate(self, days):
         new_key = str(uuid.uuid4()).replace("-", "").upper()
