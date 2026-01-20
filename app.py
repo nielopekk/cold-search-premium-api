@@ -29,7 +29,7 @@ def log_activity(message):
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {message}"
     try:
-        with LOGS_DIR.open("a", encoding="utf-8") as f:
+        with LOGS_FILE.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
     except:
         pass
@@ -49,9 +49,9 @@ def safe_get_json():
     except:
         return {}
 
-# === IMPORT Z ZIP (Z SOURCE = NAZWA PLIKU) ===
+# === IMPORT Z ZIP ===
 def import_leaks_worker(zip_url):
-    log_activity(f"📥 Start importu z source: {zip_url}")
+    log_activity(f"📥 Start importu: {zip_url}")
     try:
         response = requests.get(zip_url, stream=True, timeout=60)
         response.raise_for_status()
@@ -66,7 +66,6 @@ def import_leaks_worker(zip_url):
             
             total_added = 0
             batch = []
-            # Supabase: ignore duplicates — działa dzięki unikalnemu indeksowi (data, source)
             import_headers = {**SUPABASE_HEADERS, "Prefer": "resolution=ignore-duplicates"}
 
             for file_path in Path(tmp_dir).rglob("*"):
@@ -103,7 +102,7 @@ def import_leaks_worker(zip_url):
                 if resp.status_code in (200, 201, 204):
                     total_added += len(batch)
             
-            log_activity(f"✅ Import zakończony. Dodano próbnie: {total_added} rekordów.")
+            log_activity(f"✅ Import zakończony. Dodano: {total_added} rekordów.")
     except Exception as e:
         log_activity(f"❌ Błąd importu: {str(e)}")
 
@@ -120,7 +119,7 @@ class LicenseManager:
         try:
             r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
             data = r.json()
-            if not date:
+            if not 
                 return {"success": False, "message": "Klucz nie istnieje"}
             lic = data[0]
             expiry = datetime.fromisoformat(lic["expiry"].replace('Z', '+00:00'))
@@ -138,10 +137,7 @@ class LicenseManager:
 
 lic_mgr = LicenseManager()
 
-# === HTML PANELU ===
-# (ten sam ADMIN_HTML co wcześniej — bez zmian, bo już obsługuje source/data)
-# ... (pełny HTML poniżej)
-
+# === HTML PANELU ADMINA (ROZSZERZONY) ===
 ADMIN_HTML = """
 <!DOCTYPE html>
 <html lang="pl">
@@ -161,6 +157,7 @@ ADMIN_HTML = """
             --text-muted: #8888aa;
             --success: #00ffaa;
             --danger: #ff3366;
+            --warning: #ffcc00;
         }
 
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -352,6 +349,11 @@ ADMIN_HTML = """
             background: linear-gradient(135deg, var(--secondary), #8a00d4);
         }
 
+        .btn-danger {
+            background: var(--danger);
+            color: white;
+        }
+
         .generated-key {
             margin-top: 20px;
             padding: 16px;
@@ -401,7 +403,7 @@ ADMIN_HTML = """
             border-radius: 8px;
             font-weight: 600;
         }
-        .status-expired {
+        .status-expired, .status-inactive {
             color: var(--danger);
             background: rgba(255, 51, 102, 0.1);
             padding: 4px 10px;
@@ -409,16 +411,44 @@ ADMIN_HTML = """
             font-weight: 600;
         }
 
-        .recent-searches {
+        .actions {
+            display: flex;
+            gap: 8px;
+        }
+        .action-btn {
+            padding: 4px 10px;
+            border: none;
+            border-radius: 6px;
+            font-size: 0.8rem;
+            cursor: pointer;
+            font-weight: 600;
+        }
+        .btn-toggle {
+            background: var(--warning);
+            color: #000;
+        }
+        .btn-delete {
+            background: var(--danger);
+            color: white;
+        }
+
+        .recent-searches, .logs-card {
             grid-column: 1 / -1;
             background: var(--card-bg);
             border: 1px solid var(--border);
             border-radius: 20px;
             padding: 24px;
         }
-        .recent-searches h3 {
-            margin-bottom: 20px;
+        .logs-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
         }
+        .logs-header h3 {
+            margin: 0;
+        }
+
         .search-item {
             display: grid;
             grid-template-columns: 1fr 2fr 1fr 100px;
@@ -436,14 +466,9 @@ ADMIN_HTML = """
         .search-ip { color: #aaa; }
         .search-time { color: var(--text-muted); }
 
-        .logs-card {
-            grid-column: 1 / -1;
-            background: rgba(0, 0, 0, 0.4);
-            border-radius: 20px;
-            padding: 24px;
-            height: 280px;
+        .logs-content {
+            height: 250px;
             overflow-y: auto;
-            border: 1px solid var(--border);
             font-family: 'JetBrains Mono';
             font-size: 12px;
             color: #aaa;
@@ -547,7 +572,7 @@ ADMIN_HTML = """
                                 <th>Klucz</th>
                                 <th>Status</th>
                                 <th>IP</th>
-                                <th>Pozostało</th>
+                                <th>Akcje</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -560,9 +585,21 @@ ADMIN_HTML = """
                                     {% else %}
                                         <span class="status-expired">Wygasły</span>
                                     {% endif %}
+                                    {% if not lic.active %}
+                                        <span class="status-inactive">Nieaktywny</span>
+                                    {% endif %}
                                 </td>
                                 <td>{{ lic.ip or '—' }}</td>
-                                <td>{{ lic.time_left }}</td>
+                                <td class="actions">
+                                    <form method="POST" action="/admin/toggle/{{ lic.key }}" style="display:inline;">
+                                        <button type="submit" class="action-btn btn-toggle">
+                                            {{ "DEZAKTYWUJ" if lic.active else "AKTYWUJ" }}
+                                        </button>
+                                    </form>
+                                    <form method="POST" action="/admin/delete/{{ lic.key }}" style="display:inline;" onsubmit="return confirm('Na pewno usunąć?');">
+                                        <button type="submit" class="action-btn btn-delete">USUŃ</button>
+                                    </form>
+                                </td>
                             </tr>
                             {% endfor %}
                         </tbody>
@@ -586,25 +623,33 @@ ADMIN_HTML = """
                 </div>
 
                 <div class="logs-card">
-                    {% for line in logs[-50:] | reverse %}
-                        {% set parts = line.split('] ', 1) %}
-                        {% if parts|length == 2 %}
-                            <div class="log-line">
-                                <span class="log-timestamp">{{ parts[0][1:] }}</span>
-                                <span class="log-action">
-                                    {% if "✅" in parts[1] or "Zalogowano" in parts[1] or "Start importu" in parts[1] %}
-                                        <span class="log-success">{{ parts[1] }}</span>
-                                    {% elif "❌" in parts[1] or "Błąd" in parts[1] or "⚠️" in parts[1] %}
-                                        <span class="log-error">{{ parts[1] }}</span>
-                                    {% else %}
-                                        {{ parts[1] }}
-                                    {% endif %}
-                                </span>
-                            </div>
-                        {% else %}
-                            <div class="log-line">{{ line }}</div>
-                        {% endif %}
-                    {% endfor %}
+                    <div class="logs-header">
+                        <h3>📋 Logi systemowe</h3>
+                        <form method="POST" action="/admin/clear_logs" style="display:inline;">
+                            <button type="submit" class="action-btn btn-danger" onclick="return confirm('Wyczyścić logi?')">WYCZYŚĆ</button>
+                        </form>
+                    </div>
+                    <div class="logs-content">
+                        {% for line in logs[-100:] | reverse %}
+                            {% set parts = line.split('] ', 1) %}
+                            {% if parts|length == 2 %}
+                                <div class="log-line">
+                                    <span class="log-timestamp">{{ parts[0][1:] }}</span>
+                                    <span class="log-action">
+                                        {% if "✅" in parts[1] or "Zalogowano" in parts[1] or "Start importu" in parts[1] %}
+                                            <span class="log-success">{{ parts[1] }}</span>
+                                        {% elif "❌" in parts[1] or "Błąd" in parts[1] or "⚠️" in parts[1] %}
+                                            <span class="log-error">{{ parts[1] }}</span>
+                                        {% else %}
+                                            {{ parts[1] }}
+                                        {% endif %}
+                                    </span>
+                                </div>
+                            {% else %}
+                                <div class="log-line">{{ line }}</div>
+                            {% endif %}
+                        {% endfor %}
+                    </div>
                 </div>
             </div>
         {% endif %}
@@ -633,13 +678,14 @@ def admin_index():
         now = datetime.now(timezone.utc)
         for l in r.json():
             exp = datetime.fromisoformat(l["expiry"].replace('Z', '+00:00'))
-            active = l["active"] and now < exp
-            if active:
+            is_active = l["active"] and now < exp
+            if is_active:
                 active_keys += 1
             licenses.append({
                 "key": l["key"],
                 "ip": l.get("ip"),
-                "is_active": active,
+                "active": l["active"],
+                "is_active": is_active,
                 "time_left": "Aktualny"
             })
     except:
@@ -658,7 +704,7 @@ def admin_index():
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         r = requests.head(f"{SUPABASE_URL}/rest/v1/search_logs", headers={**SUPABASE_HEADERS, "Prefer": "count=exact"}, params={"timestamp": f"gte.{today}T00:00:00Z"})
         searches_today = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
-    except Exception as e:
+    except:
         pass
 
     recent_searches = []
@@ -670,7 +716,7 @@ def admin_index():
         )
         data = r.json()
         if isinstance(data, list):
-            for item in data:
+            for item in 
                 if isinstance(item, dict) and "timestamp" in item:
                     ts = datetime.fromisoformat(item["timestamp"].replace('Z', '+00:00'))
                     recent_searches.append({
@@ -700,11 +746,13 @@ def admin_index():
 def admin_login():
     if request.form.get("password") == ADMIN_PASSWORD:
         session["logged_in"] = True
+        log_activity("Zalogowano do panelu")
     return redirect("/admin")
 
 @app.route("/admin/logout")
 def admin_logout():
     session.clear()
+    log_activity("Wylogowano z panelu")
     return redirect("/admin")
 
 @app.route("/admin/generate", methods=["POST"])
@@ -714,6 +762,7 @@ def admin_generate():
     days = int(request.form.get("days", 30))
     key = lic_mgr.generate(days)
     session["new_key"] = key
+    log_activity(f"Nowy klucz: {key} ({days} dni)")
     return redirect("/admin")
 
 @app.route("/admin/import_zip", methods=["POST"])
@@ -722,6 +771,53 @@ def admin_import_zip():
         return redirect("/admin")
     url = request.form.get("zip_url")
     threading.Thread(target=import_leaks_worker, args=(url,), daemon=True).start()
+    log_activity(f"Rozpoczęto import: {url}")
+    return redirect("/admin")
+
+@app.route("/admin/toggle/<key>", methods=["POST"])
+def admin_toggle(key):
+    if not session.get("logged_in"):
+        return redirect("/admin")
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
+        data = r.json()
+        if 
+            current = data[0]["active"]
+            new_state = not current
+            requests.patch(
+                f"{SUPABASE_URL}/rest/v1/licenses?key=eq.{key}",
+                headers=SUPABASE_HEADERS,
+                json={"active": new_state}
+            )
+            log_activity(f"{'Aktywowano' if new_state else 'Dezaktywowano'} klucz: {key}")
+    except Exception as e:
+        log_activity(f"⚠️ Błąd przełączania klucza: {e}")
+    return redirect("/admin")
+
+@app.route("/admin/delete/<key>", methods=["POST"])
+def admin_delete(key):
+    if not session.get("logged_in"):
+        return redirect("/admin")
+    try:
+        requests.delete(
+            f"{SUPABASE_URL}/rest/v1/licenses?key=eq.{key}",
+            headers=SUPABASE_HEADERS
+        )
+        log_activity(f"Usunięto klucz: {key}")
+    except Exception as e:
+        log_activity(f"⚠️ Błąd usuwania klucza: {e}")
+    return redirect("/admin")
+
+@app.route("/admin/clear_logs", methods=["POST"])
+def admin_clear_logs():
+    if not session.get("logged_in"):
+        return redirect("/admin")
+    try:
+        if LOGS_FILE.exists():
+            LOGS_FILE.unlink()
+        log_activity("Wyczyszczono logi systemowe")
+    except Exception as e:
+        pass
     return redirect("/admin")
 
 @app.route("/auth", methods=["POST"])
