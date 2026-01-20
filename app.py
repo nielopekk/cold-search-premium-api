@@ -7,9 +7,8 @@ import shutil
 import logging
 import threading
 import sqlite3
-import zipfile
 import uuid
-import requests  # ←←← KLUCZOWY IMPORT!
+import requests
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, render_template_string, redirect, session
@@ -24,6 +23,7 @@ SUPABASE_HEADERS = {
 }
 
 DB_PATH = "leaks.db"
+LOGS_FILE = Path("logs.json")
 ADMIN_PASSWORD = "wyciek12"
 
 app = Flask(__name__)
@@ -37,7 +37,7 @@ logging.basicConfig(
 logger = logging.getLogger("ColdSearch")
 
 
-# === INICJALIZACJA BAZY SQLITE ===
+# === INICJALIZACJA BAZY I LOGÓW ===
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -52,35 +52,56 @@ def init_db():
     conn.commit()
     conn.close()
 
+if not LOGS_FILE.exists():
+    LOGS_FILE.write_text("[]", encoding="utf-8")
+
 init_db()
 
 
-# === IMPORT ZIP DO SQLITE ===
-def import_zip_to_sql(url):
+def load_logs():
     try:
-        logger.info(f"📥 Pobieranie bazy z: {url}")
-        r = requests.get(url, stream=True)
-        zip_path = "temp_leaks.zip"
-        with open(zip_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
+        return json.loads(LOGS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
 
+def save_log(event_type, key=None, ip=None, query=None):
+    logs = load_logs()
+    entry = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "event": event_type,
+        "key": key,
+        "ip": ip,
+        "query": query
+    }
+    logs.append(entry)
+    LOGS_FILE.write_text(json.dumps(logs, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+# === IMPORT Z FOLDERU LEAKS ===
+def import_leaks_to_sqlite():
+    try:
+        logger.info("📥 Importuję dane z folderu 'leaks/'...")
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        
-        with zipfile.ZipFile(zip_path, 'r') as z:
-            for filename in z.namelist():
-                if filename.endswith(('.txt', '.log', '.csv')):
-                    logger.info(f"⚙️ Importowanie: {filename}")
-                    with z.open(filename) as f:
-                        lines = f.read().decode('utf-8', errors='ignore').splitlines()
-                        batch = [(filename, line.strip()) for line in lines if line.strip()]
-                        cursor.executemany("INSERT INTO leaks (source, data) VALUES (?, ?)", batch)
-        
+        total = 0
+        for file_path in Path("leaks").rglob("*"):
+            if not file_path.is_file():
+                continue
+            if file_path.suffix.lower() not in {".txt", ".csv", ".log"}:
+                continue
+            rel_path = file_path.relative_to("leaks").as_posix()
+            try:
+                content = file_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                content = file_path.read_text(encoding="latin-1")
+            lines = [line.strip() for line in content.splitlines() if line.strip()]
+            batch = [(rel_path, line) for line in lines]
+            if batch:
+                cursor.executemany("INSERT INTO leaks (source, data) VALUES (?, ?)", batch)
+                total += len(batch)
         conn.commit()
         conn.close()
-        os.remove(zip_path)
-        logger.info("✅ Import zakończony. Dane są w tabeli 'leaks'.")
+        logger.info(f"✅ Zaimportowano {total} wpisów.")
     except Exception as e:
         logger.error(f"❌ Błąd importu: {e}")
 
@@ -92,19 +113,19 @@ class LicenseManager:
             url = f"{SUPABASE_URL}/rest/v1/licenses"
             r = requests.get(url, headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
             data = r.json()
-            if not data:
+            if not 
                 return {"success": False, "message": "Nieprawidłowy klucz"}
             lic = data[0]
             if not lic["active"]:
                 return {"success": False, "message": "Klucz został zablokowany"}
-            
             if not lic["ip"]:
-                requests.patch(url, headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"}, json={"ip": ip})
+                requests.patch(url, headers=SUPABASE_HEADERS, json={"ip": ip})
                 return {"success": True, "message": "IP przypisane"}
-            
-            return {"success": True, "message": "OK"} if lic["ip"] == ip else {"success": False, "message": "Klucz przypisany do innego adresu IP"}
+            if lic["ip"] != ip:
+                return {"success": False, "message": "Klucz przypisany do innego adresu IP"}
+            return {"success": True, "message": "OK"}
         except Exception as e:
-            logger.error(f"Błąd walidacji licencji: {e}")
+            logger.error(f"Błąd walidacji: {e}")
             return {"success": False, "message": "Błąd serwera"}
 
     def generate(self, days):
@@ -116,7 +137,39 @@ class LicenseManager:
 lic_mgr = LicenseManager()
 
 
-# === PANEL ADMINA Z WYKRESEM ===
+# === BEZPIECZNE ODPOWIEDZI Z SQLITE ===
+def safe_db_query(query, params=()):
+    for _ in range(3):
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=10)
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            result = cursor.fetchall()
+            conn.close()
+            return result
+        except sqlite3.OperationalError:
+            time.sleep(0.5)
+    return []
+
+def get_leaks_count():
+    result = safe_db_query("SELECT COUNT(*) FROM leaks")
+    return result[0][0] if result else 0
+
+def get_active_users(hours=24):
+    logs = load_logs()
+    cutoff = datetime.utcnow() - timedelta(hours=hours)
+    ips = set()
+    for log in logs:
+        try:
+            ts = datetime.fromisoformat(log["timestamp"].replace("Z", "+00:00"))
+            if ts >= cutoff and log["event"] == "auth":
+                ips.add(log["ip"])
+        except:
+            continue
+    return len(ips)
+
+
+# === PANEL ADMINA — PEŁNA WERSJA ===
 
 ADMIN_TEMPLATE = """
 <!DOCTYPE html>
@@ -226,7 +279,6 @@ ADMIN_TEMPLATE = """
             margin: 12px 0;
             border-left: 4px solid var(--success);
         }
-        .license-item.expired { border-left-color: var(--danger); }
         .license-item.revoked { border-left-color: var(--warning); }
         .license-key {
             font-family: monospace;
@@ -253,7 +305,6 @@ ADMIN_TEMPLATE = """
             background: rgba(67, 97, 238, 0.12);
         }
         .status-active { color: var(--success); }
-        .status-expired { color: var(--danger); }
         .status-revoked { color: var(--warning); }
         .logout-link {
             display: inline-block;
@@ -300,6 +351,10 @@ ADMIN_TEMPLATE = """
             <!-- Statystyki -->
             <div class="stats-grid">
                 <div class="stat-card">
+                    <div>Aktywni (24h)</div>
+                    <div class="stat-value">{{ active_24h }}</div>
+                </div>
+                <div class="stat-card">
                     <div>Wpisy w bazie</div>
                     <div class="stat-value">{{ db_count }}</div>
                 </div>
@@ -318,12 +373,11 @@ ADMIN_TEMPLATE = """
                 <canvas id="statsChart"></canvas>
             </div>
 
-            <!-- Ładowanie danych -->
+            <!-- Import folderu -->
             <div class="form-group">
-                <h2>📥 Załaduj dane z URL (.zip)</h2>
-                <form method="POST" action="/admin/load_data">
-                    <input type="url" name="url" placeholder="https://dropbox.com/.../leaks.zip?dl=1" required>
-                    <button type="submit">Pobierz i zaimportuj do SQLite</button>
+                <h2>📁 Zaimportuj dane z folderu leaks/</h2>
+                <form method="POST" action="/admin/import_leaks">
+                    <button type="submit">Importuj do SQLite</button>
                 </form>
             </div>
 
@@ -360,8 +414,36 @@ ADMIN_TEMPLATE = """
                             {% endif %}
                         </div>
                         <div><strong>IP:</strong> {{ data.ip or "—" }}</div>
+                        <div><strong>Aktywowana:</strong> {{ data.activated or "—" }}</div>
                     </div>
                 {% endfor %}
+            </div>
+
+            <!-- Logi -->
+            <div class="form-group">
+                <h2>📜 Ostatnie logi</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Czas (UTC)</th>
+                            <th>Typ</th>
+                            <th>IP</th>
+                            <th>Klucz</th>
+                            <th>Zapytanie</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for log in logs[-50:] | reverse %}
+                        <tr>
+                            <td>{{ log.timestamp[:19] }}</td>
+                            <td>{{ log.event }}</td>
+                            <td>{{ log.ip }}</td>
+                            <td>{{ log.key or "—" }}</td>
+                            <td>{{ log.query or "—" }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
             </div>
         {% endif %}
     </div>
@@ -372,17 +454,19 @@ ADMIN_TEMPLATE = """
         new Chart(ctx, {
             type: 'bar',
              {
-                labels: ['Wpisy w bazie', 'Licencji', 'Aktywne'],
+                labels: ['Aktywni (24h)', 'Wpisy', 'Licencji', 'Aktywne'],
                 datasets: [{
                     label: 'Statystyki',
-                     [{{ db_count }}, {{ licenses|length }}, {{ active_keys }}],
+                     [{{ active_24h }}, {{ db_count }}, {{ licenses|length }}, {{ active_keys }}],
                     backgroundColor: [
                         'rgba(76, 201, 240, 0.7)',
+                        'rgba(67, 97, 238, 0.6)',
                         'rgba(67, 97, 238, 0.6)',
                         'rgba(74, 222, 128, 0.6)'
                     ],
                     borderColor: [
                         'rgba(76, 201, 240, 1)',
+                        'rgba(67, 97, 238, 1)',
                         'rgba(67, 97, 238, 1)',
                         'rgba(74, 222, 128, 1)'
                     ],
@@ -415,53 +499,46 @@ ADMIN_TEMPLATE = """
 """
 
 
-def get_db_count():
-    conn = sqlite3.connect(DB_PATH)
-    count = conn.execute("SELECT COUNT(*) FROM leaks").fetchone()[0]
-    conn.close()
-    return count
-
-def render_admin_panel(error=False, new_key=None):
-    db_count = get_db_count()
+def render_admin(error=False, new_key=None):
+    logs = load_logs()
+    db_count = get_leaks_count()
+    active_24h = get_active_users(24)
+    
     licenses = {}
     try:
-        response = requests.get(
-            f"{SUPABASE_URL}/rest/v1/licenses",
-            headers=SUPABASE_HEADERS,
-            params={"select": "*"}
-        )
-        if response.status_code == 200:
-            records = response.json()
-            licenses = {r["key"]: r for r in records}
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"select": "*"})
+        if r.status_code == 200:
+            records = r.json()
+            licenses = {rec["key"]: rec for rec in records}
     except Exception as e:
         logger.error(f"Błąd pobierania licencji: {e}")
 
     active_keys = sum(1 for v in licenses.values() if v["active"])
     return render_template_string(
         ADMIN_TEMPLATE,
-        authenticated=True,
-        licenses=licenses,
+        authenticated=session.get("logged_in"),
+        error=error,
+        new_key=new_key,
+        logs=logs,
         db_count=db_count,
-        active_keys=active_keys,
-        new_key=new_key
+        active_24h=active_24h,
+        licenses=licenses,
+        active_keys=active_keys
     )
 
 
+# === ENDPOINTY PANELU ===
+
 @app.route("/admin")
 def admin_index():
-    if session.get("logged_in"):
-        return render_admin_panel()
-    else:
-        return render_template_string(ADMIN_TEMPLATE, authenticated=False, error=False)
+    return render_admin()
 
 @app.route("/admin/login", methods=["POST"])
 def admin_login():
-    password = request.form.get("password")
-    if password == ADMIN_PASSWORD:
+    if request.form.get("password") == ADMIN_PASSWORD:
         session["logged_in"] = True
         return redirect("/admin")
-    else:
-        return render_template_string(ADMIN_TEMPLATE, authenticated=False, error=True)
+    return render_admin(error=True)
 
 @app.route("/admin/logout")
 def admin_logout():
@@ -472,41 +549,30 @@ def admin_logout():
 def admin_generate():
     if not session.get("logged_in"):
         return redirect("/admin")
-    days_str = request.form.get("days", "7")
-    try:
-        days = int(days_str)
-        if days < 0: days = 0
-    except ValueError:
-        days = 7
-    key = lic_mgr.generate(days)
-    return redirect("/admin?new_key=" + key)
+    days = int(request.form.get("days", 7))
+    key = lic_mgr.generate(days if days > 0 else None)
+    return render_admin(new_key=key)
 
-@app.route("/admin/load_data", methods=["POST"])
-def admin_load_data():
+@app.route("/admin/import_leaks", methods=["POST"])
+def admin_import_leaks():
     if not session.get("logged_in"):
         return redirect("/admin")
-    url = request.form.get("url")
-    if url:
-        thread = threading.Thread(target=import_zip_to_sql, args=(url,))
-        thread.start()
-    return redirect("/admin")
+    thread = threading.Thread(target=import_leaks_to_sqlite)
+    thread.start()
+    return render_admin()
 
 
 # === ENDPOINTY PUBLICZNE ===
 
-@app.route("/", methods=["GET"])
+@app.route("/")
 def index():
-    return jsonify({
-        "name": "Cold Search Premium API",
-        "version": "6.1",
-        "status": "online"
-    })
+    return jsonify({"status": "online", "name": "Cold Search Premium API"})
 
-@app.route("/api/status", methods=["GET"])
+@app.route("/api/status")
 def api_status():
-    db_count = get_db_count()
     return jsonify({
-        "total_entries": db_count,
+        "active_users_24h": get_active_users(24),
+        "total_entries": get_leaks_count(),
         "database": "SQLite (leaks table)"
     })
 
@@ -514,10 +580,11 @@ def api_status():
 def auth():
     data = request.json
     key = data.get("key")
-    client_ip = data.get("client_ip")
-    if not key or not client_ip:
-        return jsonify({"success": False, "message": "Brak klucza lub adresu IP"}), 400
-    result = lic_mgr.validate(key, client_ip)
+    ip = data.get("client_ip")
+    if not key or not ip:
+        return jsonify({"success": False, "message": "Brak klucza lub IP"}), 400
+    result = lic_mgr.validate(key, ip)
+    save_log("auth", key=key, ip=ip)
     return jsonify(result)
 
 @app.route("/search", methods=["POST"])
@@ -525,25 +592,25 @@ def search():
     data = request.json
     key = data.get("key")
     query = data.get("query")
-    client_ip = data.get("client_ip")
-    if not key or not query or not client_ip:
+    ip = data.get("client_ip")
+    if not key or not query or not ip:
         return jsonify({"success": False, "message": "Brak danych"}), 400
-    
-    auth = lic_mgr.validate(key, client_ip)
+
+    auth = lic_mgr.validate(key, ip)
     if not auth["success"]:
+        save_log("search_denied", key=key, ip=ip, query=query)
         return jsonify(auth), 403
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT source, data FROM leaks WHERE data LIKE ? LIMIT 150", (f'%{query}%',))
-    rows = cursor.fetchall()
-    conn.close()
+    save_log("search", key=key, ip=ip, query=query)
+    results = []
+    rows = safe_db_query("SELECT source, data FROM leaks WHERE data LIKE ? LIMIT 150", (f"%{query}%",))
+    for row in rows:
+        results.append({"file": row[0], "content": row[1]})
 
-    results = [{"source": r[0], "line": r[1]} for r in rows]
     return jsonify({
         "success": True,
-        "results": results,
-        "count": len(results)
+        "count": len(results),
+        "results": results
     })
 
 
