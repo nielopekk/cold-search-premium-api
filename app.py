@@ -120,7 +120,7 @@ class LicenseManager:
         try:
             r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
             data = r.json()
-            if not 
+            if not date:
                 return {"success": False, "message": "Klucz nie istnieje"}
             lic = data[0]
             expiry = datetime.fromisoformat(lic["expiry"].replace('Z', '+00:00'))
