@@ -120,10 +120,10 @@ class LicenseManager:
             
             if not lic.get("ip"):
                 requests.patch(f"{SUPABASE_URL}/rest/v1/licenses?key=eq.{key}", headers=SUPABASE_HEADERS, json={"ip": ip})
-                return {"success": True, "message": "IP powiązane"}
+                return {"success": True, "message": "HWID powiązane"}
             
             if lic["ip"] != ip:
-                return {"success": False, "message": "Inne IP przypisane"}
+                return {"success": False, "message": "Inne hWID przypisane"}
                 
             return {"success": True, "message": "OK"}
         except Exception as e:
