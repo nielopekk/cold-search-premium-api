@@ -9,6 +9,7 @@ import threading
 import sqlite3
 import zipfile
 import uuid
+import requests  # ←←← KLUCZOWY IMPORT!
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, render_template_string, redirect, session
@@ -115,7 +116,7 @@ class LicenseManager:
 lic_mgr = LicenseManager()
 
 
-# === PANEL ADMINA Z SESJĄ I WYKRESEM ===
+# === PANEL ADMINA Z WYKRESEM ===
 
 ADMIN_TEMPLATE = """
 <!DOCTYPE html>
@@ -497,7 +498,7 @@ def admin_load_data():
 def index():
     return jsonify({
         "name": "Cold Search Premium API",
-        "version": "6.0",
+        "version": "6.1",
         "status": "online"
     })
 
