@@ -144,7 +144,8 @@ def sb_query(table, params=""):
 
 def sb_insert(table, data):
     try:
-        return requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=SUPABASE_HEADERS, json=data, timeout=10)
+        response = requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=SUPABASE_HEADERS, json=data, timeout=10)
+        return response
     except Exception as e:
         logger.error(f"❌ Błąd wstawiania do Supabase ({table}): {e}")
         return None
@@ -177,13 +178,37 @@ def format_datetime(dt):
         return dt.strftime("%d.%m.%Y %H:%M")
     return str(dt)
 
+def safe_get(obj, key, default=None):
+    """Bezpiecznie pobiera wartość z obiektu"""
+    if isinstance(obj, dict) and key in obj:
+        return obj[key]
+    return default
+
 def get_license_usage(key):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
+        # Pobierz dzienne użycie
         today_logs = sb_query("search_logs", f"key=eq.{key}&timestamp=gte.{today}T00:00:00.000Z&select=count(*)")
-        today_count = today_logs[0]["count"] if today_logs and today_logs[0] else 0
+        today_count = 0
+        if today_logs:
+            if isinstance(today_logs, list) and len(today_logs) > 0 and isinstance(today_logs[0], dict):
+                today_count = today_logs[0].get("count", 0)
+            elif isinstance(today_logs, dict):
+                today_count = today_logs.get("count", 0)
+            elif isinstance(today_logs, (int, float)):
+                today_count = int(today_logs)
+        
+        # Pobierz całkowite użycie
         total_logs = sb_query("search_logs", f"key=eq.{key}&select=count(*)")
-        total_count = total_logs[0]["count"] if total_logs and total_logs[0] else 0
+        total_count = 0
+        if total_logs:
+            if isinstance(total_logs, list) and len(total_logs) > 0 and isinstance(total_logs[0], dict):
+                total_count = total_logs[0].get("count", 0)
+            elif isinstance(total_logs, dict):
+                total_count = total_logs.get("count", 0)
+            elif isinstance(total_logs, (int, float)):
+                total_count = int(total_logs)
+                
         return today_count, total_count
     except Exception as e:
         logger.error(f"❌ Błąd pobierania statystyk użycia licencji: {e}")
@@ -204,33 +229,41 @@ def admin_panel():
         else:
             action = request.form.get("action")
             if action == "add_license":
-                days = int(request.form.get("days", 30))
-                daily_limit = int(request.form.get("daily_limit", 100))
-                total_limit = int(request.form.get("total_limit", 1000))
-                new_key = "COLD-" + uuid.uuid4().hex.upper()[:12]
-                expiry = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
-                payload = {
-                    "key": new_key,
-                    "active": True,
-                    "expiry": expiry,
-                    "daily_limit": daily_limit,
-                    "total_limit": total_limit,
-                    "ip": get_client_ip(),
-                    "created_at": "now()"
-                }
-                r = sb_insert("licenses", payload)
-                if r and r.status_code in (200, 201):
-                    flash(f"✅ Licencja: {new_key} (limit dzienny: {daily_limit}, całkowity: {total_limit})", 'success')
-                else:
-                    flash("❌ Błąd generowania licencji", 'error')
+                try:
+                    days = int(request.form.get("days", 30))
+                    daily_limit = int(request.form.get("daily_limit", 100))
+                    total_limit = int(request.form.get("total_limit", 1000))
+                    new_key = "COLD-" + uuid.uuid4().hex.upper()[:12]
+                    expiry = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+                    payload = {
+                        "key": new_key,
+                        "active": True,
+                        "expiry": expiry,
+                        "daily_limit": daily_limit,
+                        "total_limit": total_limit,
+                        "ip": get_client_ip(),
+                        "created_at": datetime.now(timezone.utc).isoformat()
+                    }
+                    r = sb_insert("licenses", payload)
+                    if r and r.status_code in (200, 201):
+                        flash(f"✅ Licencja: {new_key} (limit dzienny: {daily_limit}, całkowity: {total_limit})", 'success')
+                    else:
+                        error_msg = r.text if r else "Brak odpowiedzi serwera"
+                        flash(f"❌ Błąd generowania licencji: {error_msg}", 'error')
+                except Exception as e:
+                    logger.error(f"❌ Błąd podczas generowania licencji: {e}")
+                    flash(f"❌ Błąd generowania licencji: {str(e)}", 'error')
 
             elif action == "toggle_license":
                 key = request.form.get("key")
                 licenses = sb_query("licenses", f"key=eq.{key}")
-                if licenses:
-                    new_status = not licenses[0].get('active', False)
+                if licenses and isinstance(licenses, list) and len(licenses) > 0:
+                    lic = licenses[0]
+                    new_status = not safe_get(lic, 'active', False)
                     sb_update("licenses", {"active": new_status}, f"key=eq.{key}")
                     flash(f"{'Włączono' if new_status else 'Wyłączono'} licencję", 'success')
+                else:
+                    flash("❌ Nie znaleziono licencji", 'error')
 
             elif action == "del_license":
                 key = request.form.get("key")
@@ -240,11 +273,18 @@ def admin_panel():
             elif action == "add_ban":
                 ip = request.form.get("ip", "").strip()
                 if is_valid_ip(ip):
-                    if not sb_query("banned_ips", f"ip=eq.{ip}"):
-                        sb_insert("banned_ips", {"ip": ip, "reason": request.form.get("reason", "—"), "admin_ip": get_client_ip()})
-                        flash(f"✅ Zbanowano IP: {ip}", 'success')
-                    else:
+                    existing = sb_query("banned_ips", f"ip=eq.{ip}")
+                    if existing:
                         flash("❌ IP już zbanowane", 'error')
+                    else:
+                        payload = {
+                            "ip": ip,
+                            "reason": request.form.get("reason", "—"),
+                            "admin_ip": get_client_ip(),
+                            "created_at": datetime.now(timezone.utc).isoformat()
+                        }
+                        sb_insert("banned_ips", payload)
+                        flash(f"✅ Zbanowano IP: {ip}", 'success')
                 else:
                     flash("❌ Nieprawidłowe IP", 'error')
 
@@ -277,24 +317,38 @@ def admin_panel():
             cursor.execute("SELECT source, COUNT(*) as count FROM leaks GROUP BY source ORDER BY count DESC LIMIT 5")
             top_sources = cursor.fetchall()
 
-        licenses = sb_query("licenses", "order=created_at.desc")
-        
-        # Ustawienie domyślnych wartości dla licencji
-        for lic in licenses:
+        # Pobierz licencje i uzupełnij brakujące pola
+        licenses_data = sb_query("licenses", "order=created_at.desc")
+        licenses = []
+        for lic in licenses_data:
+            # Uzupełnij brakujące pola wartościami domyślnymi
             lic.setdefault('daily_limit', 100)
             lic.setdefault('total_limit', 1000)
-            today_count, total_count = get_license_usage(lic["key"])
+            lic.setdefault('active', True)
+            
+            # Pobierz statystyki użycia
+            today_count, total_count = get_license_usage(safe_get(lic, "key", ""))
             lic["today_count"] = today_count
             lic["total_count"] = total_count
             
+            licenses.append(lic)
+            
         banned_ips = sb_query("banned_ips", "order=created_at.desc")
-        active_licenses = sum(1 for lic in licenses if lic.get('active'))
+        active_licenses = sum(1 for lic in licenses if safe_get(lic, 'active', False))
+        
+        # Pobierz całkowitą liczbę wyszukiwań
         total_searches = 0
         try:
             logs = sb_query("search_logs", "select=count(*)")
-            total_searches = logs[0]['count'] if logs else 0
-        except:
-            pass
+            if logs:
+                if isinstance(logs, list) and len(logs) > 0 and isinstance(logs[0], dict):
+                    total_searches = logs[0].get("count", 0)
+                elif isinstance(logs, dict):
+                    total_searches = logs.get("count", 0)
+                elif isinstance(logs, (int, float)):
+                    total_searches = int(logs)
+        except Exception as e:
+            logger.error(f"❌ Błąd pobierania liczby wyszukiwań: {e}")
 
         login_time = datetime.fromisoformat(session['login_time'])
         session_duration = str(datetime.now(timezone.utc) - login_time).split('.')[0]
@@ -316,7 +370,7 @@ def admin_panel():
         )
     except Exception as e:
         logger.error(f"💥 Błąd ładowania panelu: {e}")
-        flash("❌ Błąd serwera", 'error')
+        flash(f"❌ Błąd serwera: {str(e)}", 'error')
         return redirect("/")
 
 @app.route("/logout")
@@ -389,17 +443,15 @@ ADMIN_LOGIN_TEMPLATE = '''
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 <style>
 :root {
---primary: #6366f1; /* indigo-500 */
---primary-dark: #4f46e5; /* indigo-600 */
---bg: #0f172a; /* slate-900 */
---card-bg: #1e293b; /* slate-800 */
---border: #334155; /* slate-700/50 */
---text: #f1f5f9; /* slate-100 */
---text-secondary: #94a3b8; /* slate-400 */
---success: #10b981; /* emerald-500 */
---danger: #ef4444; /* red-500 */
---gradient-start: #8b5cf6; /* purple-500 */
---gradient-end: #ec4899; /* pink-500 */
+--primary: #6366f1;
+--primary-dark: #4f46e5;
+--bg: #0f172a;
+--card-bg: #1e293b;
+--border: #334155;
+--text: #f1f5f9;
+--text-secondary: #94a3b8;
+--success: #10b981;
+--danger: #ef4444;
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
@@ -427,7 +479,7 @@ margin-bottom: 20px;
 .logo-text {
 font-size: 2.8rem;
 font-weight: 800;
-background: linear-gradient(90deg, var(--gradient-start), var(--gradient-end));
+background: linear-gradient(90deg, #8b5cf6, #ec4899);
 -webkit-background-clip: text;
 -webkit-text-fill-color: transparent;
 background-clip: text;
@@ -592,21 +644,21 @@ ADMIN_TEMPLATE = '''
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 <style>
 :root {
---primary: #6366f1; /* indigo-500 */
---primary-dark: #4f46e5; /* indigo-600 */
---secondary: #8b5cf6; /* purple-500 */
---secondary-dark: #7c3aed; /* purple-600 */
---bg: #0f172a; /* slate-900 */
---card-bg: #1e293b; /* slate-800 */
---border: #334155; /* slate-700/50 */
---text: #f1f5f9; /* slate-100 */
---text-secondary: #94a3b8; /* slate-400 */
---success: #10b981; /* emerald-500 */
---danger: #ef4444; /* red-500 */
---warning: #f59e0b; /* amber-500 */
---info: #3b82f6; /* blue-500 */
---gradient-start: #8b5cf6; /* purple-500 */
---gradient-end: #ec4899; /* pink-500 */
+--primary: #6366f1;
+--primary-dark: #4f46e5;
+--secondary: #8b5cf6;
+--secondary-dark: #7c3aed;
+--bg: #0f172a;
+--card-bg: #1e293b;
+--border: #334155;
+--text: #f1f5f9;
+--text-secondary: #94a3b8;
+--success: #10b981;
+--danger: #ef4444;
+--warning: #f59e0b;
+--info: #3b82f6;
+--gradient-start: #8b5cf6;
+--gradient-end: #ec4899;
 --stats-gradient-1: linear-gradient(135deg, #6366f1, #8b5cf6);
 --stats-gradient-2: linear-gradient(135deg, #10b981, #0ea5e9);
 --stats-gradient-3: linear-gradient(135deg, #f59e0b, #ef4444);
@@ -1485,21 +1537,32 @@ def api_auth():
     if not key:
         return jsonify({"success": False, "message": "Brak klucza"}), 400
     licenses = sb_query("licenses", f"key=eq.{key}")
-    if not licenses:
+    if not licenses or (isinstance(licenses, list) and len(licenses) == 0):
         return jsonify({"success": False, "message": "Nieprawidłowy klucz licencyjny"}), 401
-    lic = licenses[0]
-    expiry = datetime.fromisoformat(lic['expiry'].replace('Z', '+00:00'))
-    if datetime.now(timezone.utc) > expiry or not lic.get('active', True):
+    
+    lic = licenses[0] if isinstance(licenses, list) else licenses
+    
+    expiry_str = safe_get(lic, 'expiry')
+    if expiry_str:
+        expiry = datetime.fromisoformat(expiry_str.replace('Z', '+00:00'))
+    else:
+        expiry = datetime.now(timezone.utc) + timedelta(days=30)
+    
+    if datetime.now(timezone.utc) > expiry or not safe_get(lic, 'active', True):
         return jsonify({"success": False, "message": "Licencja wygasła lub została zablokowana"}), 401
-    if not lic.get("ip"):
+    
+    if not safe_get(lic, "ip"):
         sb_update("licenses", {"ip": ip}, f"key=eq.{key}")
-    if lic.get("ip") and lic["ip"] != ip:
+    elif safe_get(lic, "ip") != ip:
         return jsonify({"success": False, "message": "Klucz przypisany do innego adresu IP"}), 403
     
     today_count, total_count = get_license_usage(key)
-    if today_count >= lic.get("daily_limit", 100):
+    daily_limit = safe_get(lic, 'daily_limit', 100)
+    total_limit = safe_get(lic, 'total_limit', 1000)
+    
+    if today_count >= daily_limit:
         return jsonify({"success": False, "message": "Przekroczono dzienny limit wyszukiwań"}), 429
-    if total_count >= lic.get("total_limit", 1000):
+    if total_count >= total_limit:
         return jsonify({"success": False, "message": "Przekroczono całkowity limit wyszukiwań"}), 429
         
     return jsonify({"success": True, "message": "Zalogowano pomyślnie"})
@@ -1515,20 +1578,21 @@ def api_info():
     if auth_response.status_code != 200:
         return auth_response
     licenses = sb_query("licenses", f"key=eq.{key}")
-    if not licenses:
+    if not licenses or (isinstance(licenses, list) and len(licenses) == 0):
         return jsonify({"success": False, "message": "Nie znaleziono licencji"}), 404
-    lic = licenses[0]
+    
+    lic = licenses[0] if isinstance(licenses, list) else licenses
     today_count, total_count = get_license_usage(key)
     return jsonify({
         "success": True,
         "info": {
             "license_type": "Premium",
-            "expiration_date": lic["expiry"].split("T")[0],
-            "daily_limit": lic.get("daily_limit", 100),
-            "total_limit": lic.get("total_limit", 1000),
+            "expiration_date": lic["expiry"].split("T")[0] if "expiry" in lic else "Nieznana",
+            "daily_limit": safe_get(lic, "daily_limit", 100),
+            "total_limit": safe_get(lic, "total_limit", 1000),
             "daily_used": today_count,
             "total_used": total_count,
-            "ip_bound": lic.get("ip", "Nie przypisano"),
+            "ip_bound": safe_get(lic, "ip", "Nie przypisano"),
             "last_search": "Brak danych"
         }
     })
@@ -1552,7 +1616,7 @@ def api_search():
             "key": key,
             "query": query,
             "ip": ip,
-            "timestamp": "now()"
+            "timestamp": datetime.now(timezone.utc).isoformat()
         })
         with get_db() as conn:
             cursor = conn.cursor(dictionary=True)
