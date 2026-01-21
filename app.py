@@ -1388,7 +1388,6 @@ def admin_login():
             # Powiadomienie o logowaniu admina
             threading.Thread(target=lambda: send_discord_notification(
                 f"🔒 **Administrator zalogował się do panelu kontrolnego**\n"
-                f"🌐 IP: `{get_client_ip()}`\n"
                 f"⏰ Czas: `{datetime.now().strftime('%H:%M:%S')}`",
                 title="✅ Logowanie Administratora",
                 color=3066993
@@ -1456,7 +1455,6 @@ def admin_toggle(key):
                         f"🔑 **{action}**\n"
                         f"🔑 Klucz: `{key}`\n"
                         f"🔄 Nowy status: `{'Aktywny' if new_state else 'Nieaktywny'}`\n"
-                        f"👤 Administrator: `{get_client_ip()}`",
                         title="🔄 Zmiana statusu licencji",
                         color=3447003
                     )).start()
@@ -1482,7 +1480,6 @@ def admin_delete(key):
                 f"🗑️ **Usunięto licencję**\n"
                 f"🔑 Klucz: `{key}`\n"
                 f"⚠️ Licencja została trwale usunięta z systemu\n"
-                f"👤 Administrator: `{get_client_ip()}`",
                 title="🗑️ Usunięcie licencji",
                 color=15158332
             )).start()
@@ -1503,7 +1500,6 @@ def admin_clear_logs():
         threading.Thread(target=lambda: send_discord_notification(
             "🧹 **Wyczyszczono logi systemowe**\n"
             "🗂️ Wszystkie logi zostały usunięte z serwera\n"
-            f"👤 Administrator: `{get_client_ip()}`",
             title="🧹 Czyszczenie logów",
             color=10181046
         )).start()
@@ -1565,7 +1561,6 @@ def admin_send_discord_report():
             f"• Serwer: `{os.getenv('ENV', 'production').upper()}`\n"
             f"• Port: `{os.getenv('PORT', '5000')}`\n"
             f"• Ostatnie logi: `{len(load_activity_logs())} wpisów`\n"
-            f"• Administrator: `{get_client_ip()}`\n\n"
             f"✅ Raport wygenerowany ręcznie przez administratora"
         )
         
