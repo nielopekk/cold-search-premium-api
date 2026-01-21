@@ -8,7 +8,7 @@ import gc
 import json
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from flask import Flask, request, jsonify, render_template_string, redirect, session
+from flask import Flask, request, jsonify, render_template_string, redirect, session, make_response
 
 # === KONFIGURACJA ===
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://wcshypmsurncfufbojvp.supabase.co").strip()
@@ -29,7 +29,7 @@ LOGS_FILE = Path("activity.log")
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "cold_search_ultra_2026_fixed")
 
-# === POMOCNICZE FUNKCJE ===
+# === GLOBALNE FUNKCJE POMOCNICZE ===
 def log_activity(message):
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] {message}"
@@ -54,32 +54,25 @@ def load_activity_logs():
 
 def safe_get_json():
     try:
-        data = request.get_json(force=True)
+        data = request.get_json(force=True, silent=True)
+        if data is None:
+            data = request.form.to_dict()
         return data if isinstance(data, dict) else {}
     except Exception as e:
         print(f"Błąd parsowania JSON: {e}")
         return {}
 
-def get_active_users_count():
-    """Pobiera liczbę aktywnych użytkowników w ciągu ostatnich 5 minut"""
-    try:
-        five_minutes_ago = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S")
-        r = requests.head(
-            f"{SUPABASE_URL}/rest/v1/search_logs",
-            headers={**SUPABASE_HEADERS, "Prefer": "count=exact"},
-            params={"timestamp": f"gte.{five_minutes_ago}"}
-        )
-        if r.status_code == 206:  # Partial Content
-            return int(r.headers.get("content-range", "0-0/0").split("/")[-1])
-        return 0
-    except Exception as e:
-        print(f"Błąd pobierania aktywnych użytkowników: {e}")
-        return 0
+def get_client_ip():
+    """Bezpieczne pobieranie IP klienta"""
+    if request.headers.get('X-Forwarded-For'):
+        return request.headers.get('X-Forwarded-For').split(',')[0].strip()
+    return request.remote_addr or '127.0.0.1'
 
+# === DISCORD INTEGRACJA ===
 def send_discord_notification(message, title="Cold Search Premium Alert", color=3447003):
     """Wysyła powiadomienie do Discord webhooka"""
     try:
-        if not DISCORD_WEBHOOK_URL or "placeholder" in DISCORD_WEBHOOK_URL:
+        if not DISCORD_WEBHOOK_URL or "placeholder" in DISCORD_WEBHOOK_URL or not DISCORD_WEBHOOK_URL.startswith("https://discord.com/api/webhooks/"):
             return
             
         embed = {
@@ -104,11 +97,24 @@ def send_discord_notification(message, title="Cold Search Premium Alert", color=
 def send_user_activity_notification(action, user_data=None):
     """Wysyła szczegółowe powiadomienie o aktywności użytkownika"""
     try:
-        active_users = get_active_users_count()
+        # Pobierz liczbę aktywnych użytkowników
+        active_users = 0
+        try:
+            five_minutes_ago = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S")
+            r = requests.head(
+                f"{SUPABASE_URL}/rest/v1/search_logs",
+                headers={**SUPABASE_HEADERS, "Prefer": "count=exact"},
+                params={"timestamp": f"gte.{five_minutes_ago}"}
+            )
+            if r.status_code == 206:
+                active_users = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
+        except:
+            pass
+            
         current_time = datetime.now().strftime("%H:%M:%S")
         
         embed_color = 3066993  # Zielony dla pozytywnych zdarzeń
-        if "błąd" in action.lower() or "error" in action.lower() or "niepowodzenie" in action.lower():
+        if "błąd" in action.lower() or "error" in action.lower() or "niepowodzenie" in action.lower() or "odrzucone" in action.lower():
             embed_color = 15158332  # Czerwony dla błędów
         
         embed = {
@@ -124,13 +130,14 @@ def send_user_activity_notification(action, user_data=None):
             }
         }
         
-        if user_data:
-            if "key" in user_data:
-                embed["fields"].append({"name": "🔑 Klucz", "value": user_data["key"][:8] + "..." if user_data["key"] else "N/A", "inline": True})
-            if "ip" in user_data:
+        if user_
+            if "key" in user_ and user_data["key"]:
+                embed["fields"].append({"name": "🔑 Klucz", "value": user_data["key"][:8] + "..." if len(user_data["key"]) > 8 else user_data["key"], "inline": True})
+            if "ip" in user_ and user_data["ip"]:
                 embed["fields"].append({"name": "🌐 IP", "value": user_data["ip"], "inline": True})
-            if "query" in user_data:
-                embed["fields"].append({"name": "🔍 Zapytanie", "value": user_data["query"][:50] + "..." if len(user_data["query"]) > 50 else user_data["query"], "inline": False})
+            if "query" in user_ and user_data["query"]:
+                query_display = user_data["query"][:50] + "..." if len(user_data["query"]) > 50 else user_data["query"]
+                embed["fields"].append({"name": "🔍 Zapytanie", "value": query_display, "inline": False})
         
         payload = {
             "username": "Cold Search Monitor",
@@ -155,7 +162,8 @@ def send_startup_notification():
             f"🚀 **System Cold Search Premium został uruchomiony**\n"
             f"🕒 Czas: `{server_info['time']}`\n"
             f"🔧 Port: `{server_info['port']}`\n"
-            f"🌍 Środowisko: `{server_info['environment'].upper()}`"
+            f"🌍 Środowisko: `{server_info['environment'].upper()}`\n"
+            f"🔗 URL: `{request.host_url if request else 'localhost'}`"
         )
         
         send_discord_notification(message, title="✅ System Online", color=3066993)
@@ -181,28 +189,45 @@ class LicenseManager:
 
     def validate(self, key, ip):
         try:
-            r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
+            if not key or not ip:
+                return {"success": False, "message": "Brak klucza lub IP"}
+                
+            r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/licenses",
+                headers=SUPABASE_HEADERS,
+                params={"key": f"eq.{key}"}
+            )
+            
             if r.status_code != 200:
-                return {"success": False, "message": f"Błąd bazy danych: {r.status_code}"}
+                error_msg = f"Błąd bazy danych: {r.status_code}, treść: {r.text}"
+                log_activity(error_msg)
+                return {"success": False, "message": "Błąd bazy danych"}
                 
             data = r.json()
-            if not data:
+            if not data or len(data) == 0:
                 send_user_activity_notification(f"Próba dostępu z nieistniejącym kluczem", {"key": key, "ip": ip})
                 return {"success": False, "message": "Klucz nie istnieje"}
                 
             lic = data[0]
+            
+            # Obsługa różnych formatów daty
             expiry_str = lic["expiry"].replace('Z', '+00:00')
             try:
                 expiry = datetime.fromisoformat(expiry_str)
-            except:
-                # Próba alternatywnego formatu
-                expiry = datetime.strptime(expiry_str.split('.')[0], "%Y-%m-%dT%H:%M:%S")
-                
+            except ValueError:
+                try:
+                    # Próba alternatywnego formatu
+                    expiry = datetime.strptime(expiry_str.split('.')[0], "%Y-%m-%dT%H:%M:%S")
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+                except:
+                    # Domyślna data w przyszłości jeśli nie można sparsować
+                    expiry = datetime.now(timezone.utc) + timedelta(days=365)
+            
             now = datetime.now(timezone.utc)
-            if isinstance(expiry, datetime) and expiry.tzinfo is None:
+            if expiry.tzinfo is None:
                 expiry = expiry.replace(tzinfo=timezone.utc)
-                
-            if not lic["active"] or now > expiry:
+            
+            if not lic.get("active", False) or now > expiry:
                 send_user_activity_notification(f"Próba dostępu z wygasłym kluczem", {"key": key, "ip": ip})
                 return {"success": False, "message": "Klucz wygasł"}
                 
@@ -213,6 +238,8 @@ class LicenseManager:
                     json={"ip": ip}
                 )
                 if patch_resp.status_code not in [200, 204]:
+                    error_msg = f"Błąd aktualizacji IP: {patch_resp.status_code}, treść: {patch_resp.text}"
+                    log_activity(error_msg)
                     return {"success": False, "message": "Błąd aktualizacji IP"}
                     
                 send_user_activity_notification(f"Nowe IP powiązane z kluczem", {"key": key, "ip": ip})
@@ -224,13 +251,13 @@ class LicenseManager:
                 
             return {"success": True, "message": "OK"}
         except Exception as e:
-            error_msg = f"Błąd walidacji: {str(e)}"
+            error_msg = f"⚠️ Błąd walidacji klucza '{key}' z IP '{ip}': {str(e)}"
             log_activity(error_msg)
-            return {"success": False, "message": "Błąd bazy danych"}
+            return {"success": False, "message": "Błąd serwera"}
 
 lic_mgr = LicenseManager()
 
-# === IMPORT Z ZIP (ZOPTYMALIZOWANY) ===
+# === IMPORT Z ZIP ===
 def import_leaks_worker(zip_url):
     log_activity(f"📥 Start importu: {zip_url}")
     try:
@@ -297,96 +324,203 @@ def import_leaks_worker(zip_url):
         log_activity(error_msg)
         send_discord_notification(error_msg, title="🚨 Błąd Importu", color=15158332)
 
-# === ENDPOINT: /license_info (NAPRAWIONY DLA KLIENTA) ===
-@app.route("/license_info", methods=["POST"])
-def api_license_info():
-    d = safe_get_json()
-    key = d.get("key")
-    ip = d.get("client_ip")
-
-    if not key or not ip:
-        return jsonify({"success": False, "message": "Brak klucza lub IP"}), 400
-
-    # Walidacja (opcjonalna, ale zalecana)
-    auth = lic_mgr.validate(key, ip)
-    if not auth["success"]:
-        return jsonify({"success": False, "message": auth["message"]}), 403
-
+# === ENDPOINTY API ===
+@app.route("/api/auth", methods=["POST", "GET"])
+def api_auth():
+    """Autoryzacja klucza API"""
     try:
-        # Pobierz dane licencji
-        r = requests.get(
-            f"{SUPABASE_URL}/rest/v1/licenses",
-            headers=SUPABASE_HEADERS,
-            params={"key": f"eq.{key}"}
-        )
+        # Pobierz dane z różnych źródeł
+        data = safe_get_json()
+        key = data.get("key") or request.args.get("key") or request.form.get("key")
+        ip = data.get("client_ip") or request.args.get("client_ip") or request.form.get("client_ip") or get_client_ip()
         
-        if r.status_code != 200:
-            return jsonify({"success": False, "message": f"Błąd bazy danych: {r.status_code}"}), 500
+        if not key:
+            return jsonify({"success": False, "message": "Brak klucza"}), 400
             
-        data = r.json()
-        if not data or len(data) == 0:
-            return jsonify({"success": False, "message": "Licencja nie znaleziona"}), 404
-
-        lic = data[0]
-        expiry = lic["expiry"]
-        active = lic["active"]
-        ip_bound = lic.get("ip", None)
-
-        # Oblicz zużycie zapytań (liczba logów dla tego klucza)
-        try:
-            count_resp = requests.head(
-                f"{SUPABASE_URL}/rest/v1/search_logs",
-                headers={**SUPABASE_HEADERS, "Prefer": "count=exact"},
-                params={"key": f"eq.{key}"}
-            )
-            if count_resp.status_code == 206:  # Partial Content
-                queries_used = int(count_resp.headers.get("content-range", "0-0/0").split("/")[-1])
-            else:
-                queries_used = 0
-        except Exception as e:
-            print(f"Błąd liczenia zapytań: {e}")
-            queries_used = 0
-
-        # Ostatnie wyszukiwanie
-        last_search = "Nigdy"
-        try:
-            search_resp = requests.get(
-                f"{SUPABASE_URL}/rest/v1/search_logs",
-                headers=SUPABASE_HEADERS,
-                params={
-                    "key": f"eq.{key}",
-                    "order": "timestamp.desc",
-                    "limit": 1,
-                    "select": "timestamp"
-                }
-            )
-            if search_resp.status_code == 200:
-                logs = search_resp.json()
-                if logs and isinstance(logs, list) and len(logs) > 0:
-                    last_search = logs[0].get("timestamp", "Nigdy")
-        except Exception as e:
-            print(f"Błąd pobierania ostatniego wyszukiwania: {e}")
-
-        # Przygotuj odpowiedź w formacie zgodnym z klientem
-        response_data = {
-            "success": True,
-            "info": {
-                "license_type": "Premium" if active else "Wygasła",
-                "expiration_date": expiry.split("T")[0] if expiry else "Nieznana",
-                "query_limit": "nieograniczony",
-                "queries_used": queries_used,
-                "last_search": last_search
-            }
-        }
+        result = lic_mgr.validate(key, ip)
         
-        return jsonify(response_data)
-
+        # Logowanie aktywności użytkownika
+        if result["success"]:
+            threading.Thread(target=lambda: send_user_activity_notification(
+                "Udane logowanie",
+                {"key": key, "ip": ip}
+            )).start()
+        else:
+            threading.Thread(target=lambda: send_user_activity_notification(
+                f"Nieudane logowanie: {result['message']}",
+                {"key": key, "ip": ip}
+            )).start()
+        
+        return jsonify(result)
+        
     except Exception as e:
-        error_msg = f"Błąd /license_info: {str(e)}"
+        error_msg = f"Błąd w /api/auth: {str(e)}"
         log_activity(error_msg)
         return jsonify({"success": False, "message": "Błąd serwera"}), 500
 
-# === NOWOCZESNY PANEL ADMINA (REACT-LIKE UI) ===
+@app.route("/api/license-info", methods=["POST", "GET"])
+def api_license_info():
+    """Pobieranie informacji o licencji"""
+    try:
+        # Pobierz dane z różnych źródeł
+        data = safe_get_json()
+        key = data.get("key") or request.args.get("key") or request.form.get("key")
+        ip = data.get("client_ip") or request.args.get("client_ip") or request.form.get("client_ip") or get_client_ip()
+        
+        if not key or not ip:
+            return jsonify({"success": False, "message": "Brak klucza lub IP"}), 400
+
+        # Walidacja klucza
+        auth = lic_mgr.validate(key, ip)
+        if not auth["success"]:
+            return jsonify({"success": False, "message": auth["message"]}), 403
+
+        try:
+            # Pobierz dane licencji
+            r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/licenses",
+                headers=SUPABASE_HEADERS,
+                params={"key": f"eq.{key}"}
+            )
+            
+            if r.status_code != 200:
+                return jsonify({"success": False, "message": f"Błąd bazy danych: {r.status_code}"}), 500
+                
+            data = r.json()
+            if not data or len(data) == 0:
+                return jsonify({"success": False, "message": "Licencja nie znaleziona"}), 404
+
+            lic = data[0]
+            expiry = lic["expiry"]
+            active = lic["active"]
+            ip_bound = lic.get("ip", None)
+
+            # Oblicz zużycie zapytań
+            queries_used = 0
+            try:
+                count_resp = requests.head(
+                    f"{SUPABASE_URL}/rest/v1/search_logs",
+                    headers={**SUPABASE_HEADERS, "Prefer": "count=exact"},
+                    params={"key": f"eq.{key}"}
+                )
+                if count_resp.status_code == 206:  # Partial Content
+                    queries_used = int(count_resp.headers.get("content-range", "0-0/0").split("/")[-1])
+            except Exception as e:
+                print(f"Błąd liczenia zapytań: {e}")
+
+            # Ostatnie wyszukiwanie
+            last_search = "Nigdy"
+            try:
+                search_resp = requests.get(
+                    f"{SUPABASE_URL}/rest/v1/search_logs",
+                    headers=SUPABASE_HEADERS,
+                    params={
+                        "key": f"eq.{key}",
+                        "order": "timestamp.desc",
+                        "limit": 1,
+                        "select": "timestamp"
+                    }
+                )
+                if search_resp.status_code == 200:
+                    logs = search_resp.json()
+                    if logs and isinstance(logs, list) and len(logs) > 0:
+                        last_search = logs[0].get("timestamp", "Nigdy")
+            except Exception as e:
+                print(f"Błąd pobierania ostatniego wyszukiwania: {e}")
+
+            # Przygotuj odpowiedź w formacie zgodnym z klientem
+            response_data = {
+                "success": True,
+                "info": {
+                    "license_type": "Premium" if active else "Wygasła",
+                    "expiration_date": expiry.split("T")[0] if expiry else "Nieznana",
+                    "query_limit": "nieograniczony",
+                    "queries_used": queries_used,
+                    "last_search": last_search
+                }
+            }
+            
+            return jsonify(response_data)
+
+        except Exception as e:
+            error_msg = f"Błąd wewnętrzny /api/license-info: {str(e)}"
+            log_activity(error_msg)
+            return jsonify({"success": False, "message": "Błąd serwera"}), 500
+
+    except Exception as e:
+        error_msg = f"Krytyczny błąd /api/license-info: {str(e)}"
+        log_activity(error_msg)
+        return jsonify({"success": False, "message": "Krytyczny błąd serwera"}), 500
+
+@app.route("/api/search", methods=["POST", "GET"])
+def api_search():
+    """Wyszukiwanie danych wycieków"""
+    try:
+        # Pobierz dane z różnych źródeł
+        data = safe_get_json()
+        key = data.get("key") or request.args.get("key") or request.form.get("key")
+        query = data.get("query", "") or request.args.get("query", "") or request.form.get("query", "")
+        ip = data.get("client_ip") or request.args.get("client_ip") or request.form.get("client_ip") or get_client_ip()
+
+        if not key or not ip:
+            return jsonify({"success": False, "message": "Brak klucza lub IP"}), 400
+
+        auth = lic_mgr.validate(key, ip)
+        if not auth["success"]:
+            threading.Thread(target=lambda: send_discord_notification(
+                f"⚠️ **Odrzucone wyszukiwanie**\n"
+                f"🔑 Klucz: `{key[:8]}...`\n"
+                f"🌐 IP: `{ip}`\n"
+                f"🔍 Zapytanie: `{query[:30]}...`\n"
+                f"❌ Powód: `{auth['message']}`",
+                title="🚫 Odrzucone zapytanie",
+                color=15158332
+            )).start()
+            return jsonify(auth), 403
+
+        try:
+            # Zaloguj wyszukiwanie
+            if query.strip():
+                log_payload = {"key": key, "query": str(query)[:200], "ip": str(ip)}
+                requests.post(f"{SUPABASE_URL}/rest/v1/search_logs", headers=SUPABASE_HEADERS, json=log_payload)
+                
+                # Powiadomienie o wyszukiwaniu (tylko dla ważnych zapytań)
+                if len(query.strip()) > 3 and not query.strip().isdigit():
+                    threading.Thread(target=lambda: send_user_activity_notification(
+                        f"Wyszukiwanie danych: {query.strip()[:30]}...",
+                        {"key": key, "ip": ip, "query": query}
+                    )).start()
+        except Exception as e:
+            print(f"Błąd logowania wyszukiwania: {e}")
+
+        # Wykonaj wyszukiwanie
+        params = {"data": f"ilike.%{query}%", "select": "source,data", "limit": 150}
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/leaks", headers=SUPABASE_HEADERS, params=params)
+        
+        if r.status_code == 200:
+            results = r.json()
+            return jsonify({"success": True, "results": results})
+        else:
+            error_msg = f"Błąd wyszukiwania: {r.status_code}, treść: {r.text}"
+            log_activity(error_msg)
+            return jsonify({"success": False, "message": f"Błąd bazy danych: {r.status_code}"}), 500
+            
+    except Exception as e:
+        error_msg = f"Krytyczny błąd /api/search: {str(e)}"
+        log_activity(error_msg)
+        return jsonify({"success": False, "message": "Krytyczny błąd serwera"}), 500
+
+@app.route("/api/status", methods=["GET", "POST"])
+def api_status():
+    """Sprawdza status serwera"""
+    return jsonify({
+        "success": True,
+        "status": "online",
+        "server_time": datetime.now(timezone.utc).isoformat(),
+        "version": "2.1.0"
+    })
+
+# === PANEL ADMINA ===
 ADMIN_HTML = """
 <!DOCTYPE html>
 <html lang="pl">
@@ -1106,14 +1240,26 @@ ADMIN_HTML = """
 </html>
 """
 
-# === ROUTING ===
+# === ADMIN ROUTES ===
 @app.route("/admin")
 def admin_index():
+    """Główna strona panelu administratora"""
     if not session.get("logged_in"):
         return render_template_string(ADMIN_HTML, authenticated=False)
     
     # Pobierz aktywnych użytkowników
-    active_users = get_active_users_count()
+    active_users = 0
+    try:
+        five_minutes_ago = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S")
+        r = requests.head(
+            f"{SUPABASE_URL}/rest/v1/search_logs",
+            headers={**SUPABASE_HEADERS, "Prefer": "count=exact"},
+            params={"timestamp": f"gte.{five_minutes_ago}"}
+        )
+        if r.status_code == 206:
+            active_users = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
+    except:
+        pass
     
     # Pobierz wyszukiwania dzisiaj
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -1148,20 +1294,24 @@ def admin_index():
                 try:
                     exp = datetime.fromisoformat(exp_str)
                 except:
-                    exp = datetime.strptime(exp_str.split('.')[0], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+                    try:
+                        exp = datetime.strptime(exp_str.split('.')[0], "%Y-%m-%dT%H:%M:%S")
+                        exp = exp.replace(tzinfo=timezone.utc)
+                    except:
+                        exp = datetime.now(timezone.utc) + timedelta(days=30)
                     
-                is_active = l["active"] and now < exp
+                is_active = l.get("active", False) and now < exp
                 if is_active:
                     active_keys += 1
                 licenses.append({
                     "key": l["key"],
                     "ip": l.get("ip"),
-                    "active": l["active"],
+                    "active": l.get("active", False),
                     "is_active": is_active,
                     "time_left": "Aktualny"
                 })
-    except:
-        pass
+    except Exception as e:
+        print(f"Błąd pobierania licencji: {e}")
 
     total_searches = 0
     unique_ips = 0
@@ -1174,14 +1324,17 @@ def admin_index():
         r = requests.get(f"{SUPABASE_URL}/rest/v1/search_logs", headers=SUPABASE_HEADERS, params={"select": "ip"})
         if r.status_code == 200:
             data = r.json()
-            unique_ips = len(set(item.get("ip") for item in data if item.get("ip")))
+            if isinstance(data, list):
+                unique_ips = len(set(item.get("ip") for item in data if item.get("ip")))
+            else:
+                unique_ips = 0
 
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         r = requests.head(f"{SUPABASE_URL}/rest/v1/search_logs", headers={**SUPABASE_HEADERS, "Prefer": "count=exact"}, params={"timestamp": f"gte.{today}T00:00:00Z"})
         if r.status_code == 206:
             searches_today = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
-    except:
-        pass
+    except Exception as e:
+        print(f"Błąd pobierania statystyk: {e}")
 
     recent_searches = []
     try:
@@ -1193,13 +1346,17 @@ def admin_index():
         if r.status_code == 200:
             data = r.json()
             if isinstance(data, list):
-                for item in data:
+                for item in 
                     if isinstance(item, dict) and "timestamp" in item:
                         ts_str = item["timestamp"].replace('Z', '+00:00')
                         try:
                             ts = datetime.fromisoformat(ts_str)
                         except:
-                            ts = datetime.strptime(ts_str.split('.')[0], "%Y-%m-%dT%H:%M:%S")
+                            try:
+                                ts = datetime.strptime(ts_str.split('.')[0], "%Y-%m-%dT%H:%M:%S")
+                                ts = ts.replace(tzinfo=timezone.utc)
+                            except:
+                                ts = datetime.now(timezone.utc)
                         recent_searches.append({
                             "key": item.get("key", "—"),
                             "query": item.get("query", "—"),
@@ -1225,53 +1382,69 @@ def admin_index():
         total_searches_today=total_searches_today
     )
 
-@app.route("/admin/login", methods=["POST"])
+@app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
-    if request.form.get("password") == ADMIN_PASSWORD:
-        session["logged_in"] = True
-        log_activity("Zalogowano do panelu")
-        # Powiadomienie o logowaniu admina
-        threading.Thread(target=lambda: send_discord_notification(
-            f"🔒 Administrator zalogował się do panelu kontrolnego",
-            title="✅ Logowanie Administratora",
-            color=3066993
-        )).start()
+    """Logowanie do panelu administratora"""
+    if request.method == "POST":
+        if request.form.get("password") == ADMIN_PASSWORD:
+            session["logged_in"] = True
+            log_activity(f"Zalogowano do panelu administracyjnego z IP: {get_client_ip()}")
+            # Powiadomienie o logowaniu admina
+            threading.Thread(target=lambda: send_discord_notification(
+                f"🔒 **Administrator zalogował się do panelu kontrolnego**\n"
+                f"🌐 IP: `{get_client_ip()}`\n"
+                f"⏰ Czas: `{datetime.now().strftime('%H:%M:%S')}`",
+                title="✅ Logowanie Administratora",
+                color=3066993
+            )).start()
+            return redirect("/admin")
+        else:
+            log_activity(f"Nieudana próba logowania do panelu z IP: {get_client_ip()}")
+            return redirect("/admin")
     return redirect("/admin")
 
-@app.route("/admin/logout")
+@app.route("/admin/logout", methods=["GET", "POST"])
 def admin_logout():
+    """Wylogowanie z panelu administratora"""
+    ip = get_client_ip()
     session.clear()
-    log_activity("Wylogowano z panelu")
+    log_activity(f"Wylogowano z panelu administracyjnego (IP: {ip})")
     return redirect("/admin")
 
 @app.route("/admin/generate", methods=["POST"])
 def admin_generate():
+    """Generowanie nowego klucza licencji"""
     if not session.get("logged_in"):
         return redirect("/admin")
     days = int(request.form.get("days", 30))
     key = lic_mgr.generate(days)
     session["new_key"] = key
-    log_activity(f"Nowy klucz: {key} ({days} dni)")
+    log_activity(f"Nowy klucz wygenerowany przez administratora: {key} ({days} dni), IP: {get_client_ip()}")
     return redirect("/admin")
 
 @app.route("/admin/import_zip", methods=["POST"])
 def admin_import_zip():
+    """Import bazy z ZIP"""
     if not session.get("logged_in"):
         return redirect("/admin")
     url = request.form.get("zip_url")
+    if not url or not url.startswith("http"):
+        return redirect("/admin")
+        
     threading.Thread(target=import_leaks_worker, args=(url,), daemon=True).start()
-    log_activity(f"Rozpoczęto import: {url}")
+    log_activity(f"Administrator rozpoczął import z URL: {url}, IP: {get_client_ip()}")
     return redirect("/admin")
 
 @app.route("/admin/toggle/<key>", methods=["POST"])
 def admin_toggle(key):
+    """Przełączanie statusu licencji"""
     if not session.get("logged_in"):
         return redirect("/admin")
     try:
         r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
         if r.status_code == 200:
             data = r.json()
-            if data:
+            if 
                 current = data[0]["active"]
                 new_state = not current
                 patch_resp = requests.patch(
@@ -1281,21 +1454,23 @@ def admin_toggle(key):
                 )
                 if patch_resp.status_code in [200, 204]:
                     action = f"{'Aktywowano' if new_state else 'Dezaktywowano'} klucz: {key}"
-                    log_activity(action)
+                    log_activity(f"{action}, IP: {get_client_ip()}")
                     # Powiadomienie do Discorda
                     threading.Thread(target=lambda: send_discord_notification(
                         f"🔑 **{action}**\n"
                         f"🔑 Klucz: `{key}`\n"
-                        f"🔄 Nowy status: `{'Aktywny' if new_state else 'Nieaktywny'}`",
+                        f"🔄 Nowy status: `{'Aktywny' if new_state else 'Nieaktywny'}`\n"
+                        f"👤 Administrator: `{get_client_ip()}`",
                         title="🔄 Zmiana statusu licencji",
                         color=3447003
                     )).start()
     except Exception as e:
-        log_activity(f"⚠️ Błąd przełączania klucza: {e}")
+        log_activity(f"⚠️ Błąd przełączania klucza {key}: {e}, IP: {get_client_ip()}")
     return redirect("/admin")
 
 @app.route("/admin/delete/<key>", methods=["POST"])
 def admin_delete(key):
+    """Usuwanie licencji"""
     if not session.get("logged_in"):
         return redirect("/admin")
     try:
@@ -1305,31 +1480,34 @@ def admin_delete(key):
         )
         if delete_resp.status_code in [200, 204]:
             action = f"Usunięto klucz: {key}"
-            log_activity(action)
+            log_activity(f"{action}, IP: {get_client_ip()}")
             # Powiadomienie do Discorda
             threading.Thread(target=lambda: send_discord_notification(
                 f"🗑️ **Usunięto licencję**\n"
                 f"🔑 Klucz: `{key}`\n"
-                f"⚠️ Licencja została trwale usunięta z systemu",
+                f"⚠️ Licencja została trwale usunięta z systemu\n"
+                f"👤 Administrator: `{get_client_ip()}`",
                 title="🗑️ Usunięcie licencji",
                 color=15158332
             )).start()
     except Exception as e:
-        log_activity(f"⚠️ Błąd usuwania klucza: {e}")
+        log_activity(f"⚠️ Błąd usuwania klucza {key}: {e}, IP: {get_client_ip()}")
     return redirect("/admin")
 
 @app.route("/admin/clear_logs", methods=["POST"])
 def admin_clear_logs():
+    """Czyszczenie logów"""
     if not session.get("logged_in"):
         return redirect("/admin")
     try:
         if LOGS_FILE.exists():
             LOGS_FILE.unlink()
-        log_activity("Wyczyszczono logi systemowe")
+        log_activity(f"Wyczyszczono logi systemowe, IP: {get_client_ip()}")
         # Powiadomienie do Discorda
         threading.Thread(target=lambda: send_discord_notification(
             "🧹 **Wyczyszczono logi systemowe**\n"
-            "🗂️ Wszystkie logi zostały usunięte z serwera",
+            "🗂️ Wszystkie logi zostały usunięte z serwera\n"
+            f"👤 Administrator: `{get_client_ip()}`",
             title="🧹 Czyszczenie logów",
             color=10181046
         )).start()
@@ -1337,9 +1515,9 @@ def admin_clear_logs():
         print(f"Błąd czyszczenia logów: {e}")
     return redirect("/admin")
 
-# === NOWY ENDPOINT: RĘCZNE WYSŁANIE RAPORTU DO DISCORDA ===
 @app.route("/admin/send_discord_report", methods=["POST"])
 def admin_send_discord_report():
+    """Wysyłanie ręcznego raportu do Discorda"""
     if not session.get("logged_in"):
         return jsonify({"success": False}), 403
     
@@ -1353,7 +1531,18 @@ def admin_send_discord_report():
         except:
             pass
             
-        active_users = get_active_users_count()
+        active_users = 0
+        try:
+            five_minutes_ago = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S")
+            r = requests.head(
+                f"{SUPABASE_URL}/rest/v1/search_logs",
+                headers={**SUPABASE_HEADERS, "Prefer": "count=exact"},
+                params={"timestamp": f"gte.{five_minutes_ago}"}
+            )
+            if r.status_code == 206:
+                active_users = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
+        except:
+            pass
         
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         total_searches_today = 0
@@ -1379,90 +1568,68 @@ def admin_send_discord_report():
             f"⚙️ **Stan Serwera:**\n"
             f"• Serwer: `{os.getenv('ENV', 'production').upper()}`\n"
             f"• Port: `{os.getenv('PORT', '5000')}`\n"
-            f"• Ostatnie logi: `{len(load_activity_logs())} wpisów`\n\n"
+            f"• Ostatnie logi: `{len(load_activity_logs())} wpisów`\n"
+            f"• Administrator: `{get_client_ip()}`\n\n"
             f"✅ Raport wygenerowany ręcznie przez administratora"
         )
         
         send_discord_notification(message, title="📊 Ręczny Raport Systemowy", color=3066993)
-        log_activity("Administrator wysłał ręczny raport do Discorda")
+        log_activity(f"Administrator wysłał ręczny raport do Discorda, IP: {get_client_ip()}")
         return jsonify({"success": True})
     except Exception as e:
-        log_activity(f"Błąd ręcznego raportu: {str(e)}")
+        error_msg = f"Błąd ręcznego raportu: {str(e)}"
+        log_activity(error_msg)
         return jsonify({"success": False, "error": str(e)}), 500
 
-@app.route("/auth", methods=["POST"])
-def api_auth():
-    d = safe_get_json()
-    key = d.get("key")
-    ip = d.get("client_ip")
-    result = lic_mgr.validate(key, ip)
-    
-    # Logowanie aktywności użytkownika
-    if result["success"]:
-        threading.Thread(target=lambda: send_user_activity_notification(
-            "Udane logowanie",
-            {"key": key, "ip": ip}
-        )).start()
-    else:
-        threading.Thread(target=lambda: send_user_activity_notification(
-            f"Nieudane logowanie: {result['message']}",
-            {"key": key, "ip": ip}
-        )).start()
-    
-    return jsonify(result)
+# === ERROR HANDLERS ===
+@app.errorhandler(404)
+def not_found_error(error):
+    return jsonify({
+        "success": False,
+        "error": "Endpoint nie istnieje",
+        "available_endpoints": [
+            "/api/auth (POST/GET)",
+            "/api/license-info (POST/GET)",
+            "/api/search (POST/GET)",
+            "/api/status (GET/POST)"
+        ]
+    }), 404
 
-@app.route("/search", methods=["POST"])
-def api_search():
-    d = safe_get_json()
-    key = d.get("key")
-    query = d.get("query", "")
-    ip = d.get("client_ip")
+@app.errorhandler(405)
+def method_not_allowed_error(error):
+    return jsonify({
+        "success": False,
+        "error": "Metoda nie jest dozwolona dla tego endpointu",
+        "allowed_methods": ["GET", "POST"]
+    }), 405
 
-    if not key or not ip:
-        return jsonify({"success": False, "message": "Brak klucza lub IP"}), 400
+@app.errorhandler(500)
+def internal_error(error):
+    error_msg = f"Błąd serwera 500: {str(error)}"
+    log_activity(error_msg)
+    return jsonify({
+        "success": False,
+        "error": "Wewnętrzny błąd serwera"
+    }), 500
 
-    auth = lic_mgr.validate(key, ip)
-    if not auth["success"]:
-        threading.Thread(target=lambda: send_discord_notification(
-            f"⚠️ **Odrzucone wyszukiwanie**\n"
-            f"🔑 Klucz: `{key[:8]}...`\n"
-            f"🌐 IP: `{ip}`\n"
-            f"🔍 Zapytanie: `{query[:30]}...`\n"
-            f"❌ Powód: `{auth['message']}`",
-            title="🚫 Odrzucone zapytanie",
-            color=15158332
-        )).start()
-        return jsonify(auth), 403
-
-    try:
-        log_payload = {"key": key, "query": str(query)[:200], "ip": str(ip)}
-        log_resp = requests.post(f"{SUPABASE_URL}/rest/v1/search_logs", headers=SUPABASE_HEADERS, json=log_payload)
-        
-        # Powiadomienie o wyszukiwaniu (tylko dla ważnych zapytań)
-        if len(query) > 3 and not query.isdigit():  # Ignoruj krótkie i numeryczne zapytania
-            threading.Thread(target=lambda: send_user_activity_notification(
-                f"Wyszukiwanie danych",
-                {"key": key, "ip": ip, "query": query}
-            )).start()
-    except Exception as e:
-        print(f"Błąd logowania wyszukiwania: {e}")
-
-    params = {"data": f"ilike.%{query}%", "select": "source,data", "limit": 150}
-    r = requests.get(f"{SUPABASE_URL}/rest/v1/leaks", headers=SUPABASE_HEADERS, params=params)
-    
-    if r.status_code == 200:
-        return jsonify({"success": True, "results": r.json()})
-    else:
-        return jsonify({"success": False, "message": f"Błąd bazy danych: {r.status_code}"}), 500
-
-# === URUCHOMIENIE APLIKACJI ===
+# === START APPLICATION ===
 if __name__ == "__main__":
     # Wyślij powiadomienie o uruchomieniu aplikacji
     try:
         threading.Thread(target=send_startup_notification).start()
-        log_activity("Aplikacja została uruchomiona")
+        log_activity("✅ Aplikacja została pomyślnie uruchomiona")
     except Exception as e:
-        print(f"Błąd powiadomienia startowego: {e}")
+        print(f"❌ Błąd powiadomienia startowego: {e}")
     
+    # Ustal port
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    
+    # Uruchom aplikację
+    print(f"🚀 Serwer uruchomiony na porcie {port}")
+    print(f"🔗 Dostępne endpointy API:")
+    print(f"   • GET/POST /api/status - status serwera")
+    print(f"   • POST/GET /api/auth - autoryzacja klucza")
+    print(f"   • POST/GET /api/license-info - informacje o licencji")
+    print(f"   • POST/GET /api/search - wyszukiwanie danych")
+    
+    app.run(host="0.0.0.0", port=port, debug=False)
