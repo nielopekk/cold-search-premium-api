@@ -23,8 +23,8 @@ DB_CONFIG = {
     "database": os.getenv("LEAKS_DB_NAME", "cold_search_db"),
     "charset": "utf8mb4",
     "autocommit": True,
-    "connection_timeout": 30,  # 30 sekund timeoutu połączenia
-    "pool_size": 30,  # Zwiększenie puli do 30 połączeń
+    "connection_timeout": 30,
+    "pool_size": 30,
     "pool_reset_session": True
 }
 
@@ -68,7 +68,7 @@ def initialize_db_pool():
             logger.error(f"❌ Błąd połączenia z MariaDB (próba {attempt + 1}): {e}")
             attempt += 1
             if attempt < max_attempts:
-                time.sleep(2 * attempt)  # Wykładnicze opóźnienie
+                time.sleep(2 * attempt)
     
     logger.error("❌ Krytyczny błąd: nie udało się połączyć z MariaDB po wielu próbach")
     raise SystemExit("Nie można kontynuować bez połączenia z bazą danych leaków")
@@ -81,19 +81,16 @@ def get_db_connection():
         initialize_db_pool()
     
     try:
-        # Próba pobrania połączenia z timeoutem
         conn = db_pool.get_connection()
         logger.debug(f"🔌 Uzyskano połączenie z puli. Aktywne połączenia: {db_pool._cnx_queue.qsize()}/{db_pool._pool_size}")
         return conn
     except mysql.connector.Error as e:
         logger.error(f"❌ Błąd pobierania połączenia: {e}")
         
-        # Spróbuj odzyskać połączenia
         if "pool exhausted" in str(e):
             logger.warning("⚠️ Pula połączeń wyczerpana. Próba odzyskania...")
             time.sleep(1)
             
-            # Spróbuj ponownie z mniejszym timeoutem
             try:
                 conn = db_pool.get_connection()
                 logger.info("✅ Połączenie odzyskane po timeout")
@@ -101,8 +98,7 @@ def get_db_connection():
             except:
                 pass
         
-        # Jeśli wszystko zawiedzie, zrestartuj pulę
-        logger.warning("🔄 Restart puli połączeń...")
+        logger.warning("🔄 Reset puli połączeń...")
         initialize_db_pool()
         return get_db_connection()
 
@@ -126,10 +122,8 @@ def log_activity(action, details=None):
     if details:
         log_entry += f" | {details}"
     
-    # Zapis do loga aplikacji
     logger.info(log_entry)
     
-    # Wysłanie do Discorda jeśli skonfigurowano
     if DISCORD_WEBHOOK_URL:
         threading.Thread(target=send_discord_notification, args=(action, details), daemon=True).start()
 
@@ -141,7 +135,7 @@ def send_discord_notification(action, details=None):
             
         embed = {
             "title": "👮 Aktywność Administratora",
-            "color": 3066993,  # Zielony
+            "color": 3066993,
             "fields": [
                 {"name": "🔧 Akcja", "value": action, "inline": False},
                 {"name": "🌐 IP Administratora", "value": get_ip(), "inline": True},
@@ -488,8 +482,33 @@ def admin_dashboard():
             source_count = cursor.fetchone()['sources']
             
             # Ostatnie 5 dodanych rekordów
-            cursor.execute("SELECT data, source, created_at FROM leaks ORDER BY created_at DESC LIMIT 5")
+            # UŻYWAM NOWEJ STRUKTURY - SPRÓBUJ NAJDZIEJSZEJ ISTNIEJĄCEJ KOLUMNY DATY
+            date_column = "created_at"
+            try:
+                cursor.execute("SELECT data, source, created_at FROM leaks ORDER BY created_at DESC LIMIT 5")
+            except mysql.connector.Error as e:
+                if "Unknown column 'created_at'" in str(e):
+                    # Spróbuj inną nazwę kolumny
+                    try:
+                        cursor.execute("SELECT data, source, timestamp FROM leaks ORDER BY timestamp DESC LIMIT 5")
+                        date_column = "timestamp"
+                    except mysql.connector.Error as e2:
+                        if "Unknown column 'timestamp'" in str(e2):
+                            # Jeśli nie ma żadnej kolumny z datą, po prostu pomin sortowanie
+                            cursor.execute("SELECT data, source FROM leaks LIMIT 5")
+                        else:
+                            raise e2
+                else:
+                    raise e
+            
             recent_leaks = cursor.fetchall()
+            
+            # Sprawdź jakie kolumny są dostępne w tabeli leaks
+            cursor.execute("SHOW COLUMNS FROM leaks")
+            columns = [column['Field'] for column in cursor.fetchall()]
+            has_date_column = 'created_at' in columns or 'timestamp' in columns
+            if not has_date_column:
+                logger.warning("⚠️ Tabela leaks nie zawiera kolumny z datą (created_at lub timestamp)")
 
         # Statystyki z Supabase
         licenses = sb_query("licenses", "order=created_at.desc")
@@ -615,13 +634,11 @@ def admin_add_license():
 def admin_toggle_license(key):
     """Aktywacja/dezaktywacja licencji"""
     try:
-        # Pobierz aktualny status licencji
         licenses = sb_query("licenses", f"key=eq.{key}")
         if licenses:
             current_status = licenses[0].get('active', False)
             new_status = not current_status
             
-            # Zaktualizuj status
             response = requests.patch(
                 f"{SUPABASE_URL}/rest/v1/licenses",
                 headers=SUPABASE_HEADERS,
@@ -676,7 +693,6 @@ def admin_add_ban():
             flash("❌ Nieprawidłowy format adresu IP!", 'error')
             return redirect(url_for('admin_bans'))
         
-        # Sprawdź, czy IP nie jest już zbanowane
         existing_bans = sb_query("banned_ips", f"ip=eq.{ip}")
         if existing_bans:
             flash("❌ To IP jest już zbanowane!", 'error')
@@ -737,7 +753,6 @@ def admin_import_start():
         flash("❌ URL musi zaczynać się od http:// lub https://", 'error')
         return redirect(url_for('admin_import_ui'))
     
-    # Uruchom import w tle
     threading.Thread(
         target=import_worker, 
         args=(url,),
@@ -764,28 +779,23 @@ def import_worker(url):
     try:
         log_activity("Rozpoczęto import danych z archiwum ZIP", f"URL: {url}")
         
-        # Pobierz plik ZIP
         response = requests.get(url, stream=True, timeout=300)
         response.raise_for_status()
         
-        # Utwórz plik tymczasowy
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp_file:
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
                     tmp_file.write(chunk)
             tmp_path = tmp_file.name
         
-        # Wyciągnij i przetwórz dane
         total_added = 0
         with tempfile.TemporaryDirectory() as tmp_dir:
             with zipfile.ZipFile(tmp_path, 'r') as zip_ref:
                 zip_ref.extractall(tmp_dir)
             
-            # Połącz się z bazą - użyj context managera do automatycznego zamknięcia
             with get_db() as conn:
                 cursor = conn.cursor()
                 
-                # Przetwórz każdy plik
                 for root, _, files in os.walk(tmp_dir):
                     for filename in files:
                         if filename.endswith(('.txt', '.csv', '.log')):
@@ -808,7 +818,6 @@ def import_worker(url):
                                             total_added += len(batch)
                                             batch = []
                                     
-                                    # Wstaw pozostałe rekordy
                                     if batch:
                                         cursor.executemany(
                                             "INSERT IGNORE INTO leaks (data, source) VALUES (%s, %s)",
@@ -822,7 +831,6 @@ def import_worker(url):
                 
                 conn.commit()
         
-        # Usuń plik tymczasowy
         os.unlink(tmp_path)
         
         log_activity("Import zakończony pomyślnie", f"Liczba dodanych rekordów: {total_added}")
@@ -1223,14 +1231,14 @@ admin_dashboard_template = '''
                 <div class="stat-card">
                     <i class="fas fa-database stat-icon"></i>
                     <div class="stat-title">REKORDY W BAZIE</div>
-                    <div class="stat-value">{{ total_leaks | format_number }}</div>
+                    <div class="stat-value">{{ "{:,}".format(total_leaks).replace(",", " ") }}</div>
                     <div class="stat-footer">Z ostatniego importu</div>
                 </div>
                 
                 <div class="stat-card">
                     <i class="fas fa-file-alt stat-icon"></i>
                     <div class="stat-title">PLIKI ŹRÓDŁOWE</div>
-                    <div class="stat-value">{{ source_count | format_number }}</div>
+                    <div class="stat-value">{{ "{:,}".format(source_count).replace(",", " ") }}</div>
                     <div class="stat-footer">Unikalne źródła danych</div>
                 </div>
                 
@@ -1244,7 +1252,7 @@ admin_dashboard_template = '''
                 <div class="stat-card">
                     <i class="fas fa-search stat-icon"></i>
                     <div class="stat-title">WYSZUKAŃ OGÓŁEM</div>
-                    <div class="stat-value">{{ total_searches | format_number }}</div>
+                    <div class="stat-value">{{ "{:,}".format(total_searches).replace(",", " ") }}</div>
                     <div class="stat-footer">Wszystkie zapytania</div>
                 </div>
             </div>
@@ -1264,7 +1272,11 @@ admin_dashboard_template = '''
                                 <div class="leak-data">{{ leak.data | truncate(60) }}</div>
                                 <div class="leak-meta">
                                     <span class="leak-source">{{ leak.source }}</span>
-                                    <span>{{ leak.created_at.strftime('%Y-%m-%d %H:%M') }}</span>
+                                    {% if leak.created_at or leak.timestamp %}
+                                        <span>{{ (leak.created_at or leak.timestamp).split('T')[0] }}</span>
+                                    {% else %}
+                                        <span>Brak daty</span>
+                                    {% endif %}
                                 </div>
                             </div>
                         {% endfor %}
@@ -1312,12 +1324,10 @@ admin_dashboard_template = '''
     </div>
     
     <script>
-        // Automatyczne odświeżanie statystyk co 30 sekund
         setTimeout(function() {
             window.location.reload();
         }, 30000);
         
-        // Formatowanie liczb z separatorami tysięcy
         function formatNumbers() {
             document.querySelectorAll('.stat-value').forEach(el => {
                 const num = parseInt(el.textContent.replace(/\s/g, ''));
@@ -1327,12 +1337,14 @@ admin_dashboard_template = '''
             });
         }
         
-        // Uruchom formatowanie po załadowaniu strony
         document.addEventListener('DOMContentLoaded', formatNumbers);
     </script>
 </body>
 </html>
 '''
+
+# === POZOSTAŁE SZABLONY HTML ===
+# (Pozostałe szablony pozostają bez zmian, ale zostaną uwzględnione w pełnej wersji)
 
 admin_licenses_template = '''
 <!DOCTYPE html>
@@ -2318,7 +2330,7 @@ admin_bans_template = '''
                                     <tr>
                                         <td><span class="ip-text">{{ ban.ip }}</span></td>
                                         <td><span class="reason-text">{{ ban.reason }}</span></td>
-                                        <td><span class="date-text">{{ ban.created_at.split('T')[0] }}</span></td>
+                                        <td><span class="date-text">{{ ban.created_at.split('T')[0] if ban.created_at else 'Nieznana' }}</span></td>
                                         <td>{{ ban.admin_ip }}</td>
                                         <td>
                                             <form method="post" action="{{ url_for('admin_del_ban', ip=ban.ip) }}" style="display: inline;" onsubmit="return confirm('Na pewno odbanować to IP?')">
@@ -2740,17 +2752,14 @@ admin_logs_template = '''
     
     <script>
         function refreshLogs() {
-            // Przykładowa funkcja odświeżania logów
             const container = document.getElementById('logsContainer');
             container.innerHTML = '<div style="text-align: center; padding: 20px; color: var(--primary);"><i class="fas fa-spinner fa-spin" style="font-size: 2rem;"></i><div style="margin-top: 10px;">Ładowanie...</div></div>';
             
-            // W prawdziwej aplikacji tutaj byłoby zapytanie AJAX do serwera
             setTimeout(() => {
                 location.reload();
             }, 1000);
         }
         
-        // Funkcja filtrowania logów (klient-side dla demonstracji)
         function filterLogs() {
             const keyFilter = document.getElementById('keyFilter').value.toLowerCase();
             const ipFilter = document.getElementById('ipFilter').value.toLowerCase();
@@ -2766,7 +2775,6 @@ admin_logs_template = '''
             });
         }
         
-        // Dodaj event listeners do pól filtrów
         document.getElementById('keyFilter').addEventListener('input', filterLogs);
         document.getElementById('ipFilter').addEventListener('input', filterLogs);
         document.getElementById('queryFilter').addEventListener('input', filterLogs);
@@ -3331,24 +3339,27 @@ def truncate_string(value, length=30):
 # === URUCHOMIENIE APLIKACJI ===
 
 if __name__ == "__main__":
-    # Inicjalizacja puli połączeń przed uruchomieniem serwera
     initialize_db_pool()
     
-    # Logowanie uruchomienia aplikacji
     logger.info("🚀 Cold Search Premium Admin Panel został uruchomiony")
     logger.info(f"🔧 Konfiguracja MariaDB: {DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}")
     logger.info(f"🔧 Konfiguracja Supabase: {SUPABASE_URL}")
     
-    # Sprawdź połączenie z bazą na starcie
     try:
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT 1")
             logger.info("✅ Testowe połączenie z bazą danych zakończone pomyślnie")
+            
+            # Sprawdź strukturę tabeli leaks
+            cursor.execute("DESCRIBE leaks")
+            columns = cursor.fetchall()
+            logger.info("🔧 Struktura tabeli 'leaks':")
+            for column in columns:
+                logger.info(f"  • {column[0]} ({column[1]})")
     except Exception as e:
         logger.error(f"❌ Błąd testowego połączenia z bazą: {e}")
     
-    # Uruchomienie serwera
     port = int(os.environ.get('PORT', 5000))
     debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
     
