@@ -21,7 +21,7 @@ SUPABASE_HEADERS = {
 }
 
 # Konfiguracja Discord Webhooka
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1463453306860081183/1JVeZuCP3Mg0EJi7salIGYxXvvY4618i59SMbHKGj4df2uRow5PQqbQ-AFmlvEdAZ5Ty"
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1463456643915321425/j-UgD95Ocx6sk2viuDdTU5YXmxXq3TS8nEVg9sD92M2eMj1_VxMwUikUk-eBZBsGTHSz"
 
 ADMIN_PASSWORD = "wyciek12"
 LOGS_FILE = Path("activity.log")
