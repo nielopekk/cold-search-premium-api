@@ -12,6 +12,7 @@ from flask import Flask, request, jsonify, render_template_string, redirect, ses
 import mysql.connector
 from mysql.connector import pooling
 import re
+import json
 
 # === KONFIGURACJA ŚRODOWISKOWA ===
 DB_CONFIG = {
@@ -134,32 +135,60 @@ def get_db():
             conn.close()
 
 # === FUNKCJE POMOCNICZE ===
-def sb_query(table, params=""):
+def safe_request(method, url, **kwargs):
+    """Bezpieczne wykonanie żądania HTTP z obsługą błędów"""
     try:
-        r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}?{params}", headers=SUPABASE_HEADERS, timeout=10)
-        return r.json() if r.status_code == 200 else []
+        response = requests.request(method, url, **kwargs)
+        response.raise_for_status()
+        return response
+    except requests.exceptions.RequestException as e:
+        logger.error(f"❌ Błąd żądania HTTP do {url}: {e}")
+        return None
+
+def sb_query(table, params=""):
+    """Bezpieczne zapytanie do Supabase"""
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/{table}"
+        if params:
+            url += f"?{params}"
+        response = safe_request("GET", url, headers=SUPABASE_HEADERS, timeout=10)
+        if response and response.status_code == 200:
+            return response.json()
+        return []
     except Exception as e:
         logger.error(f"❌ Błąd zapytania do Supabase ({table}): {e}")
         return []
 
 def sb_insert(table, data):
+    """Bezpieczne wstawianie do Supabase"""
     try:
-        response = requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=SUPABASE_HEADERS, json=data, timeout=10)
+        response = safe_request("POST", f"{SUPABASE_URL}/rest/v1/{table}", 
+                               headers=SUPABASE_HEADERS, json=data, timeout=10)
         return response
     except Exception as e:
         logger.error(f"❌ Błąd wstawiania do Supabase ({table}): {e}")
         return None
 
 def sb_update(table, data, condition):
+    """Bezpieczna aktualizacja w Supabase"""
     try:
-        return requests.patch(f"{SUPABASE_URL}/rest/v1/{table}?{condition}", headers=SUPABASE_HEADERS, json=data, timeout=10)
+        url = f"{SUPABASE_URL}/rest/v1/{table}"
+        if condition:
+            url += f"?{condition}"
+        response = safe_request("PATCH", url, headers=SUPABASE_HEADERS, json=data, timeout=10)
+        return response
     except Exception as e:
         logger.error(f"❌ Błąd aktualizacji w Supabase ({table}): {e}")
         return None
 
 def sb_delete(table, condition):
+    """Bezpieczne usuwanie z Supabase"""
     try:
-        return requests.delete(f"{SUPABASE_URL}/rest/v1/{table}?{condition}", headers=SUPABASE_HEADERS, timeout=10)
+        url = f"{SUPABASE_URL}/rest/v1/{table}"
+        if condition:
+            url += f"?{condition}"
+        response = safe_request("DELETE", url, headers=SUPABASE_HEADERS, timeout=10)
+        return response
     except Exception as e:
         logger.error(f"❌ Błąd usuwania z Supabase ({table}): {e}")
         return None
@@ -185,28 +214,45 @@ def safe_get(obj, key, default=None):
     return default
 
 def get_license_usage(key):
+    """Bezpiecznie pobiera statystyki użycia licencji"""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    
     try:
         # Pobierz dzienne użycie
-        today_logs = sb_query("search_logs", f"key=eq.{key}&timestamp=gte.{today}T00:00:00.000Z&select=count(*)")
+        today_params = f"key=eq.{key}&timestamp=gte.{today}T00:00:00.000Z&select=count(*)"
+        today_logs = sb_query("search_logs", today_params)
+        
         today_count = 0
         if today_logs:
-            if isinstance(today_logs, list) and len(today_logs) > 0 and isinstance(today_logs[0], dict):
-                today_count = today_logs[0].get("count", 0)
-            elif isinstance(today_logs, dict):
-                today_count = today_logs.get("count", 0)
-            elif isinstance(today_logs, (int, float)):
+            # Obsługa różnych formatów odpowiedzi
+            if isinstance(today_logs, list):
+                if today_logs and isinstance(today_logs[0], dict) and 'count' in today_logs[0]:
+                    today_count = today_logs[0]['count']
+                elif today_logs and isinstance(today_logs[0], int):
+                    today_count = today_logs[0]
+            elif isinstance(today_logs, dict) and 'count' in today_logs:
+                today_count = today_logs['count']
+            elif isinstance(today_logs, int):
+                today_count = today_logs
+            elif isinstance(today_logs, str) and today_logs.isdigit():
                 today_count = int(today_logs)
         
         # Pobierz całkowite użycie
-        total_logs = sb_query("search_logs", f"key=eq.{key}&select=count(*)")
+        total_params = f"key=eq.{key}&select=count(*)"
+        total_logs = sb_query("search_logs", total_params)
+        
         total_count = 0
         if total_logs:
-            if isinstance(total_logs, list) and len(total_logs) > 0 and isinstance(total_logs[0], dict):
-                total_count = total_logs[0].get("count", 0)
-            elif isinstance(total_logs, dict):
-                total_count = total_logs.get("count", 0)
-            elif isinstance(total_logs, (int, float)):
+            if isinstance(total_logs, list):
+                if total_logs and isinstance(total_logs[0], dict) and 'count' in total_logs[0]:
+                    total_count = total_logs[0]['count']
+                elif total_logs and isinstance(total_logs[0], int):
+                    total_count = total_logs[0]
+            elif isinstance(total_logs, dict) and 'count' in total_logs:
+                total_count = total_logs['count']
+            elif isinstance(total_logs, int):
+                total_count = total_logs
+            elif isinstance(total_logs, str) and total_logs.isdigit():
                 total_count = int(total_logs)
                 
         return today_count, total_count
@@ -214,19 +260,22 @@ def get_license_usage(key):
         logger.error(f"❌ Błąd pobierania statystyk użycia licencji: {e}")
         return 0, 0
 
-# === JEDYNY ENDPOINT: / (panel admina) ===
+# === GŁÓWNY ENDPOINT: / (panel admina) ===
 @app.route("/", methods=["GET", "POST"])
 def admin_panel():
     if request.method == "POST":
         if not session.get('is_admin'):
+            # Logowanie administratora
             if request.form.get("password") == ADMIN_PASSWORD:
                 session['is_admin'] = True
                 session['login_time'] = datetime.now(timezone.utc).isoformat()
                 flash('✅ Zalogowano pomyślnie!', 'success')
+                return redirect("/")
             else:
                 flash('❌ Nieprawidłowe hasło!', 'error')
                 return render_template_string(ADMIN_LOGIN_TEMPLATE)
         else:
+            # Obsługa akcji panelu administratora
             action = request.form.get("action")
             if action == "add_license":
                 try:
@@ -235,6 +284,7 @@ def admin_panel():
                     total_limit = int(request.form.get("total_limit", 1000))
                     new_key = "COLD-" + uuid.uuid4().hex.upper()[:12]
                     expiry = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+                    
                     payload = {
                         "key": new_key,
                         "active": True,
@@ -244,11 +294,12 @@ def admin_panel():
                         "ip": get_client_ip(),
                         "created_at": datetime.now(timezone.utc).isoformat()
                     }
-                    r = sb_insert("licenses", payload)
-                    if r and r.status_code in (200, 201):
+                    
+                    response = sb_insert("licenses", payload)
+                    if response and response.status_code in (200, 201):
                         flash(f"✅ Licencja: {new_key} (limit dzienny: {daily_limit}, całkowity: {total_limit})", 'success')
                     else:
-                        error_msg = r.text if r else "Brak odpowiedzi serwera"
+                        error_msg = response.text if response else "Brak odpowiedzi serwera"
                         flash(f"❌ Błąd generowania licencji: {error_msg}", 'error')
                 except Exception as e:
                     logger.error(f"❌ Błąd podczas generowania licencji: {e}")
@@ -256,42 +307,67 @@ def admin_panel():
 
             elif action == "toggle_license":
                 key = request.form.get("key")
-                licenses = sb_query("licenses", f"key=eq.{key}")
-                if licenses and isinstance(licenses, list) and len(licenses) > 0:
-                    lic = licenses[0]
-                    new_status = not safe_get(lic, 'active', False)
-                    sb_update("licenses", {"active": new_status}, f"key=eq.{key}")
-                    flash(f"{'Włączono' if new_status else 'Wyłączono'} licencję", 'success')
-                else:
-                    flash("❌ Nie znaleziono licencji", 'error')
+                try:
+                    licenses = sb_query("licenses", f"key=eq.{key}")
+                    if licenses and isinstance(licenses, list) and len(licenses) > 0:
+                        lic = licenses[0]
+                        new_status = not safe_get(lic, 'active', False)
+                        sb_update("licenses", {"active": new_status}, f"key=eq.{key}")
+                        flash(f"{'Włączono' if new_status else 'Wyłączono'} licencję", 'success')
+                    else:
+                        flash("❌ Nie znaleziono licencji", 'error')
+                except Exception as e:
+                    logger.error(f"❌ Błąd przełączania statusu licencji: {e}")
+                    flash(f"❌ Błąd operacji: {str(e)}", 'error')
 
             elif action == "del_license":
                 key = request.form.get("key")
-                sb_delete("licenses", f"key=eq.{key}")
-                flash("✅ Licencja usunięta", 'success')
+                try:
+                    response = sb_delete("licenses", f"key=eq.{key}")
+                    if response and response.status_code in (200, 204):
+                        flash("✅ Licencja usunięta", 'success')
+                    else:
+                        flash(f"❌ Błąd usuwania licencji: {response.text if response else 'Brak odpowiedzi'}", 'error')
+                except Exception as e:
+                    logger.error(f"❌ Błąd usuwania licencji: {e}")
+                    flash(f"❌ Błąd operacji: {str(e)}", 'error')
 
             elif action == "add_ban":
                 ip = request.form.get("ip", "").strip()
-                if is_valid_ip(ip):
-                    existing = sb_query("banned_ips", f"ip=eq.{ip}")
-                    if existing:
-                        flash("❌ IP już zbanowane", 'error')
-                    else:
-                        payload = {
-                            "ip": ip,
-                            "reason": request.form.get("reason", "—"),
-                            "admin_ip": get_client_ip(),
-                            "created_at": datetime.now(timezone.utc).isoformat()
-                        }
-                        sb_insert("banned_ips", payload)
-                        flash(f"✅ Zbanowano IP: {ip}", 'success')
+                if not is_valid_ip(ip):
+                    flash("❌ Nieprawidłowy format adresu IP!", 'error')
                 else:
-                    flash("❌ Nieprawidłowe IP", 'error')
+                    try:
+                        existing = sb_query("banned_ips", f"ip=eq.{ip}")
+                        if existing:
+                            flash("❌ IP już zbanowane", 'error')
+                        else:
+                            payload = {
+                                "ip": ip,
+                                "reason": request.form.get("reason", "—"),
+                                "admin_ip": get_client_ip(),
+                                "created_at": datetime.now(timezone.utc).isoformat()
+                            }
+                            response = sb_insert("banned_ips", payload)
+                            if response and response.status_code in (200, 201):
+                                flash(f"✅ Zbanowano IP: {ip}", 'success')
+                            else:
+                                flash(f"❌ Błąd banowania IP: {response.text if response else 'Brak odpowiedzi'}", 'error')
+                    except Exception as e:
+                        logger.error(f"❌ Błąd banowania IP: {e}")
+                        flash(f"❌ Błąd operacji: {str(e)}", 'error')
 
             elif action == "del_ban":
                 ip = request.form.get("ip")
-                sb_delete("banned_ips", f"ip=eq.{ip}")
-                flash("✅ Odbanowano IP", 'success')
+                try:
+                    response = sb_delete("banned_ips", f"ip=eq.{ip}")
+                    if response and response.status_code in (200, 204):
+                        flash("✅ Odbanowano IP", 'success')
+                    else:
+                        flash(f"❌ Błąd odbanowywania IP: {response.text if response else 'Brak odpowiedzi'}", 'error')
+                except Exception as e:
+                    logger.error(f"❌ Błąd odbanowywania IP: {e}")
+                    flash(f"❌ Błąd operacji: {str(e)}", 'error')
 
             elif action == "import_start":
                 url = request.form.get("import_url")
@@ -304,23 +380,34 @@ def admin_panel():
     if not session.get('is_admin'):
         return render_template_string(ADMIN_LOGIN_TEMPLATE)
 
-    # Ładowanie danych
+    # Ładowanie danych do panelu
     try:
+        # Pobierz statystyki z bazy danych leaków
         with get_db() as conn:
             cursor = conn.cursor(dictionary=True)
             cursor.execute("SELECT COUNT(*) as total FROM leaks")
             total_leaks = cursor.fetchone()['total']
+            
             cursor.execute("SELECT COUNT(DISTINCT source) as sources FROM leaks")
             source_count = cursor.fetchone()['sources']
+            
             cursor.execute("SELECT data, source, created_at FROM leaks ORDER BY created_at DESC LIMIT 10")
             recent_leaks = cursor.fetchall()
+            
             cursor.execute("SELECT source, COUNT(*) as count FROM leaks GROUP BY source ORDER BY count DESC LIMIT 5")
             top_sources = cursor.fetchall()
 
         # Pobierz licencje i uzupełnij brakujące pola
         licenses_data = sb_query("licenses", "order=created_at.desc")
         licenses = []
+        
+        if not isinstance(licenses_data, list):
+            licenses_data = [licenses_data] if licenses_data else []
+        
         for lic in licenses_data:
+            if not isinstance(lic, dict):
+                continue
+            
             # Uzupełnij brakujące pola wartościami domyślnymi
             lic.setdefault('daily_limit', 100)
             lic.setdefault('total_limit', 1000)
@@ -332,8 +419,12 @@ def admin_panel():
             lic["total_count"] = total_count
             
             licenses.append(lic)
-            
+        
+        # Pobierz zbanowane IP
         banned_ips = sb_query("banned_ips", "order=created_at.desc")
+        if not isinstance(banned_ips, list):
+            banned_ips = [banned_ips] if banned_ips else []
+        
         active_licenses = sum(1 for lic in licenses if safe_get(lic, 'active', False))
         
         # Pobierz całkowitą liczbę wyszukiwań
@@ -341,18 +432,20 @@ def admin_panel():
         try:
             logs = sb_query("search_logs", "select=count(*)")
             if logs:
-                if isinstance(logs, list) and len(logs) > 0 and isinstance(logs[0], dict):
-                    total_searches = logs[0].get("count", 0)
-                elif isinstance(logs, dict):
-                    total_searches = logs.get("count", 0)
-                elif isinstance(logs, (int, float)):
-                    total_searches = int(logs)
+                if isinstance(logs, list) and logs and isinstance(logs[0], dict) and 'count' in logs[0]:
+                    total_searches = logs[0]['count']
+                elif isinstance(logs, dict) and 'count' in logs:
+                    total_searches = logs['count']
+                elif isinstance(logs, int):
+                    total_searches = logs
         except Exception as e:
             logger.error(f"❌ Błąd pobierania liczby wyszukiwań: {e}")
 
+        # Oblicz czas trwania sesji
         login_time = datetime.fromisoformat(session['login_time'])
         session_duration = str(datetime.now(timezone.utc) - login_time).split('.')[0]
 
+        # Renderuj panel administratora
         return render_template_string(
             ADMIN_TEMPLATE,
             total_leaks=total_leaks,
@@ -371,6 +464,7 @@ def admin_panel():
     except Exception as e:
         logger.error(f"💥 Błąd ładowania panelu: {e}")
         flash(f"❌ Błąd serwera: {str(e)}", 'error')
+        session.clear()
         return redirect("/")
 
 @app.route("/logout")
@@ -385,6 +479,7 @@ def import_worker(url):
         logger.info(f"📥 Rozpoczęto import z: {url}")
         response = requests.get(url, stream=True, timeout=300)
         response.raise_for_status()
+        
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp_file:
             for chunk in response.iter_content(chunk_size=8192):
                 tmp_file.write(chunk)
@@ -394,6 +489,7 @@ def import_worker(url):
         with tempfile.TemporaryDirectory() as tmp_dir:
             with zipfile.ZipFile(tmp_path, 'r') as zip_ref:
                 zip_ref.extractall(tmp_dir)
+            
             with get_db() as conn:
                 cursor = conn.cursor()
                 for root, _, files in os.walk(tmp_dir):
@@ -401,6 +497,7 @@ def import_worker(url):
                         if filename.endswith(('.txt', '.csv', '.log')):
                             file_path = os.path.join(root, filename)
                             source_name = os.path.relpath(file_path, tmp_dir)
+                            
                             try:
                                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                                     batch = []
@@ -426,6 +523,7 @@ def import_worker(url):
                             except Exception as e:
                                 logger.error(f"❌ Błąd pliku {source_name}: {e}")
                 conn.commit()
+        
         os.unlink(tmp_path)
         logger.info(f"✅ Import zakończony. Nowe rekordy: {total_added}")
     except Exception as e:
@@ -1106,6 +1204,10 @@ font-size: 0.9rem;
 .form-row { flex-direction: column; }
 .stats-grid { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
 }
+@keyframes fadeIn {
+from { opacity: 0; }
+to { opacity: 1; }
+}
 </style>
 </head>
 <body>
@@ -1463,7 +1565,7 @@ Panel jest chroniony hasłem i dostępny wyłącznie dla upoważnionych administ
 </div>
 
 <script>
-// Funkcja filtrowania rekordów
+// Poprawiona funkcja filtrowania rekordów bez błędu składniowego
 document.getElementById('searchLeaks').addEventListener('input', function(e) {
 const searchTerm = e.target.value.toLowerCase();
 const records = document.querySelectorAll('.leak-record');
@@ -1500,10 +1602,27 @@ location.reload();
 document.addEventListener('DOMContentLoaded', function() {
 const statValues = document.querySelectorAll('.stat-value');
 statValues.forEach(el => {
-const num = el.textContent.replace(/\s/g, '');
-if (!isNaN(num) && num !== '') {
-el.textContent = parseInt(num).toLocaleString('pl-PL');
+const numStr = el.textContent.replace(/\s/g, '');
+const num = parseInt(numStr);
+if (!isNaN(num)) {
+el.textContent = num.toLocaleString('pl-PL');
 }
+});
+});
+
+// Animacja pojawiania się elementów
+document.addEventListener('DOMContentLoaded', function() {
+const elements = document.querySelectorAll('.stat-card, .section');
+elements.forEach((el, index) => {
+setTimeout(() => {
+el.style.animation = 'fadeIn 0.5s ease forwards';
+el.style.opacity = '0';
+el.style.transform = 'translateY(20px)';
+setTimeout(() => {
+el.style.opacity = '1';
+el.style.transform = 'translateY(0)';
+}, 50 * index);
+}, 100 * index);
 });
 });
 </script>
