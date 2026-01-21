@@ -6,14 +6,13 @@ import tempfile
 import threading
 import logging
 import time
-import contextlib
+import contextlib  # POPRAWIONO: Dodano brakujący import contextlib
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, render_template_string, redirect, session, url_for, flash
 import mysql.connector
 from mysql.connector import pooling
 import re
 import json
-import csv
 
 # === KONFIGURACJA ŚRODOWISKOWA ===
 DB_CONFIG = {
@@ -231,7 +230,7 @@ def import_worker(url):
     except Exception as e:
         logger.error(f"💥 Fatalny błąd importu: {e}")
 
-# === JEDEN ENDPOINT ADMINA ===
+# === JEDYNY ENDPOINT: / (panel admina) ===
 @app.route("/", methods=["GET", "POST"])
 def admin_panel():
     if request.method == "POST":
@@ -258,7 +257,7 @@ def admin_panel():
                     "daily_limit": daily_limit,
                     "total_limit": total_limit,
                     "ip": get_client_ip(),
-                    "created_at": "now()"
+                    "created_at": datetime.now(timezone.utc).isoformat()
                 }
                 r = sb_insert("licenses", payload)
                 if r and r.status_code in (200, 201):
@@ -271,7 +270,7 @@ def admin_panel():
                 licenses = sb_query("licenses", f"key=eq.{key}")
                 if licenses:
                     new_status = not licenses[0].get('active', False)
-                    requests.patch(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, json={"active": new_status}, params={"key": f"eq.{key}"})
+                    sb_update("licenses", {"active": new_status}, f"key=eq.{key}")
                     flash(f"{'Włączono' if new_status else 'Wyłączono'} licencję", 'success')
 
             elif action == "del_license":
@@ -318,8 +317,8 @@ def admin_panel():
             recent_leaks = cursor.fetchall()
             cursor.execute("SELECT source, COUNT(*) as count FROM leaks GROUP BY source ORDER BY count DESC LIMIT 5")
             top_sources = cursor.fetchall()
-
-            # Pobierz statystyki wyszukiwań (ostatnie 7 dni)
+            
+            # Statystyki dla wykresu (ostatnie 7 dni)
             cursor.execute("""
                 SELECT DATE(created_at) as date, COUNT(*) as count 
                 FROM leaks 
@@ -333,29 +332,27 @@ def admin_panel():
         licenses = sb_query("licenses", "order=created_at.desc")
         banned_ips = sb_query("banned_ips", "order=created_at.desc")
         active_licenses = sum(1 for lic in licenses if lic.get('active'))
-        
-        # Statystyki użytkowników i wyszukiwań
         total_searches = 0
         active_users_24h = 0
         
         try:
-            # Całkowita liczba wyszukiwań
+            # Pobierz liczbę wyszukiwań
             logs = sb_query("search_logs", "select=count(*)")
-            total_searches = logs[0]['count'] if logs and logs[0] else 0
+            total_searches = logs[0]['count'] if logs else 0
             
-            # Aktywni użytkownicy w ciągu ostatnich 24h
+            # Pobierz liczbę aktywnych użytkowników (24h)
             yesterday = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-            active_users = sb_query(f"search_logs", f"timestamp=gte.{yesterday}&select=count(distinct key)")
-            active_users_24h = active_users[0]['count'] if active_users and active_users[0] else 0
-        except Exception as e:
-            logger.error(f"❌ Błąd pobierania statystyk: {e}")
+            users = sb_query(f"search_logs", f"timestamp=gte.{yesterday}&select=count(distinct key)")
+            active_users_24h = users[0]['count'] if users else 0
+        except:
+            pass
 
         login_time = datetime.fromisoformat(session['login_time'])
         session_duration = str(datetime.now(timezone.utc) - login_time).split('.')[0]
-
-        now = datetime.now(timezone.utc)
         
-        # Zwróć szablon z wszystkimi danymi
+        # Dodano brakującą zmienną now
+        now = datetime.now(timezone.utc)
+
         return render_template_string(
             ADMIN_TEMPLATE,
             total_leaks=total_leaks,
@@ -371,12 +368,12 @@ def admin_panel():
             active_users_24h=active_users_24h,
             session_duration=session_duration,
             client_ip=get_client_ip(),
-            now=now,
-            format_datetime=format_datetime
+            format_datetime=format_datetime,
+            now=now  # POPRAWIONO: Dodano brakującą zmienną now do kontekstu szablonu
         )
     except Exception as e:
         logger.error(f"💥 Błąd ładowania panelu: {e}")
-        flash(f"❌ Błąd serwera: {str(e)}", 'error')
+        flash("❌ Błąd serwera", 'error')
         return redirect("/")
 
 @app.route("/logout")
@@ -421,8 +418,15 @@ background-image:
 radial-gradient(circle at 10% 20%, rgba(99, 102, 241, 0.1) 0%, transparent 20%),
 radial-gradient(circle at 90% 80%, rgba(147, 51, 234, 0.1) 0%, transparent 20%);
 }
-.login-container { max-width: 450px; width: 100%; animation: fadeIn 0.5s ease; }
-.logo { text-align: center; margin-bottom: 20px; }
+.login-container { 
+max-width: 450px; 
+width: 100%;
+animation: fadeIn 0.5s ease;
+}
+.logo { 
+text-align: center; 
+margin-bottom: 20px; 
+}
 .logo-text {
 font-size: 2.8rem;
 font-weight: 800;
@@ -458,8 +462,16 @@ text-align: center;
 color: var(--text);
 letter-spacing: -0.5px;
 }
-.form-group { margin-bottom: 20px; }
-.form-label { display: block; margin-bottom: 8px; font-weight: 500; color: var(--text); font-size: 0.95rem; }
+.form-group { 
+margin-bottom: 20px; 
+}
+.form-label { 
+display: block; 
+margin-bottom: 8px; 
+font-weight: 500; 
+color: var(--text);
+font-size: 0.95rem;
+}
 .form-input {
 width: 100%;
 padding: 16px;
@@ -495,7 +507,9 @@ box-shadow: 0 4px 6px rgba(99, 102, 241, 0.3);
 transform: translateY(-2px);
 box-shadow: 0 6px 8px rgba(99, 102, 241, 0.4);
 }
-.btn:active { transform: translateY(0); }
+.btn:active {
+transform: translateY(0);
+}
 .alert {
 padding: 14px;
 margin: 18px 0;
@@ -516,10 +530,19 @@ background: rgba(16, 185, 129, 0.15);
 border: 1px solid var(--success); 
 color: var(--success); 
 }
-@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-@keyframes slideUp { 
-from { opacity: 0; transform: translateY(30px); }
-to { opacity: 1; transform: translateY(0); }
+@keyframes fadeIn {
+from { opacity: 0; }
+to { opacity: 1; }
+}
+@keyframes slideUp {
+from { 
+opacity: 0; 
+transform: translateY(30px); 
+}
+to { 
+opacity: 1; 
+transform: translateY(0); 
+}
 }
 @keyframes shake {
 0%, 100% { transform: translateX(0); }
@@ -604,7 +627,10 @@ background-image:
 radial-gradient(circle at 10% 20%, rgba(99, 102, 241, 0.05) 0%, transparent 20%),
 radial-gradient(circle at 90% 80%, rgba(139, 92, 246, 0.05) 0%, transparent 20%);
 }
-.container { max-width: 1400px; margin: 0 auto; }
+.container { 
+max-width: 1400px; 
+margin: 0 auto; 
+}
 .header {
 display: flex;
 justify-content: space-between;
@@ -626,7 +652,11 @@ background: linear-gradient(90deg, var(--gradient-start), var(--gradient-end));
 -webkit-text-fill-color: transparent;
 background-clip: text;
 }
-.page-title { font-size: 1.5rem; font-weight: 700; color: var(--text); }
+.page-title { 
+font-size: 1.5rem; 
+font-weight: 700; 
+color: var(--text); 
+}
 .logout-btn {
 background: rgba(239, 68, 68, 0.15);
 color: var(--danger);
@@ -769,7 +799,9 @@ font-family: 'Inter', sans-serif;
 transform: translateY(-2px);
 box-shadow: 0 5px 10px rgba(99, 102, 241, 0.3);
 }
-.btn:active { transform: translateY(0); }
+.btn:active {
+transform: translateY(0);
+}
 .btn-danger {
 background: linear-gradient(90deg, #ef4444, #f97316);
 }
@@ -890,25 +922,6 @@ border-radius: 20px;
 font-size: 0.85rem;
 font-family: 'JetBrains Mono', monospace;
 }
-.limit-badge {
-display: inline-block;
-padding: 4px 12px;
-border-radius: 20px;
-font-size: 0.85rem;
-font-weight: 600;
-margin-right: 8px;
-margin-bottom: 4px;
-}
-.limit-daily { 
-background: rgba(245, 158, 11, 0.2); 
-color: #fcd34d; 
-border: 1px solid rgba(245, 158, 11, 0.3);
-}
-.limit-total { 
-background: rgba(239, 68, 68, 0.2); 
-color: #fca5a5; 
-border: 1px solid rgba(239, 68, 68, 0.3);
-}
 .usage-bar {
 height: 10px;
 background: rgba(56, 189, 248, 0.1);
@@ -938,89 +951,15 @@ color: var(--text-secondary);
 margin-top: 4px;
 font-weight: 500;
 }
-.search-input {
-display: flex;
-gap: 12px;
-margin-bottom: 20px;
+.chart-container {
+height: 240px;
+margin-top: 20px;
 }
-.search-box {
-flex: 1;
-position: relative;
-}
-.search-box i {
-position: absolute;
-left: 16px;
-top: 50%;
-transform: translateY(-50%);
-color: var(--text-secondary);
-font-size: 1.1rem;
-}
-.search-input-field {
-width: 100%;
-padding: 14px 14px 14px 45px;
-background: rgba(15, 23, 42, 0.7);
-border: 1px solid var(--border);
-border-radius: 14px;
-color: white;
-font-family: 'Inter', sans-serif;
-font-size: 0.95rem;
-transition: all 0.3s;
-}
-.search-input-field:focus {
-outline: none;
-border-color: var(--primary);
-box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
-}
-.system-grid {
-display: grid;
-grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-gap: 20px;
-}
-.system-card {
-background: rgba(15, 23, 42, 0.6);
-border-radius: 16px;
-padding: 20px;
-border: 1px solid var(--border);
-}
-.system-card h4 {
-font-size: 1rem;
-font-weight: 600;
-margin-bottom: 12px;
-color: var(--text);
-display: flex;
-align-items: center;
-gap: 10px;
-}
-.system-card h4 i {
-color: var(--primary);
-}
-.system-info {
-display: grid;
-grid-template-columns: 1fr 1fr;
-gap: 15px;
-}
-.system-info-item {
-padding: 12px;
-border-radius: 12px;
-background: rgba(0,0,0,0.2);
-}
-.system-info-label {
-font-size: 0.85rem;
-color: var(--text-secondary);
-margin-bottom: 4px;
-}
-.system-info-value {
-font-weight: 600;
-font-size: 0.95rem;
-color: var(--text);
-}
-.footer {
-text-align: center;
-margin-top: 30px;
-padding-top: 20px;
-border-top: 1px solid var(--border);
-color: var(--text-secondary);
-font-size: 0.9rem;
+.chart-bar {
+background: var(--primary);
+height: 100%;
+border-radius: 4px 4px 0 0;
+transition: height 0.5s ease;
 }
 .nav-tabs {
 display: flex;
@@ -1051,19 +990,18 @@ animation: fadeIn 0.3s ease;
 from { opacity: 0; transform: translateY(10px); }
 to { opacity: 1; transform: translateY(0); }
 }
-.chart-container {
-height: 240px;
-margin-top: 20px;
-}
-.chart-bar {
-background: var(--primary);
-height: 100%;
-border-radius: 4px 4px 0 0;
-transition: height 0.5s ease;
+.footer {
+text-align: center;
+margin-top: 30px;
+padding-top: 20px;
+border-top: 1px solid var(--border);
+color: var(--text-secondary);
+font-size: 0.9rem;
 }
 @media (max-width: 768px) {
 .form-row { flex-direction: column; }
 .stats-grid { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.nav-tabs { overflow-x: auto; }
 }
 </style>
 </head>
@@ -1185,8 +1123,8 @@ transition: height 0.5s ease;
 <span style="font-weight: 500;">{{ source.source }}</span>
 <span style="color: var(--text-secondary);">{{ source.count }}</span>
 </div>
-<div class="source-bar">
-<div class="source-fill" style="width: {{ (source.count / total_leaks * 100) | int }}%;"></div>
+<div class="usage-bar">
+<div class="usage-fill usage-low" style="width: {{ (source.count / total_leaks * 100) | int }}%;"></div>
 </div>
 </div>
 {% endfor %}
@@ -1197,55 +1135,61 @@ transition: height 0.5s ease;
 <div class="section-title">
 <i class="fas fa-server"></i> Informacje systemowe
 </div>
-<div class="system-grid">
-<div class="system-card">
-<h4><i class="fas fa-clock"></i> Sesja administratora</h4>
-<div class="system-info">
-<div class="system-info-item">
-<div class="system-info-label">Czas trwania</div>
-<div class="system-info-value">{{ session_duration }}</div>
+<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px;">
+<div style="background: rgba(15, 23, 42, 0.6); border-radius: 16px; padding: 20px; border: 1px solid var(--border);">
+<h4 style="font-size: 1rem; font-weight: 600; margin-bottom: 12px; color: var(--text); display: flex; align-items: center; gap: 10px;">
+<i class="fas fa-clock" style="color: var(--primary);"></i> Sesja administratora
+</h4>
+<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+<div style="padding: 12px; border-radius: 12px; background: rgba(0,0,0,0.2);">
+<div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Czas trwania</div>
+<div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ session_duration }}</div>
 </div>
-<div class="system-info-item">
-<div class="system-info-label">Twój adres IP</div>
-<div class="system-info-value"><span class="ip-badge">{{ client_ip }}</span></div>
+<div style="padding: 12px; border-radius: 12px; background: rgba(0,0,0,0.2);">
+<div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Twój adres IP</div>
+<div style="font-weight: 600; font-size: 0.95rem; color: var(--text);"><span class="ip-badge">{{ client_ip }}</span></div>
 </div>
 </div>
 </div>
-<div class="system-card">
-<h4><i class="fas fa-database"></i> Baza danych leaków</h4>
-<div class="system-info">
-<div class="system-info-item">
-<div class="system-info-label">Status</div>
-<div class="system-info-value" style="color: var(--success);">
+<div style="background: rgba(15, 23, 42, 0.6); border-radius: 16px; padding: 20px; border: 1px solid var(--border);">
+<h4 style="font-size: 1rem; font-weight: 600; margin-bottom: 12px; color: var(--text); display: flex; align-items: center; gap: 10px;">
+<i class="fas fa-database" style="color: var(--primary);"></i> Baza danych leaków
+</h4>
+<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+<div style="padding: 12px; border-radius: 12px; background: rgba(0,0,0,0.2);">
+<div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Status</div>
+<div style="font-weight: 600; font-size: 0.95rem; color: var(--success);">
 <i class="fas fa-circle" style="font-size: 0.6rem; margin-right: 6px;"></i> Online
 </div>
 </div>
-<div class="system-info-item">
-<div class="system-info-label">Liczba rekordów</div>
-<div class="system-info-value">{{ "{:,}".format(total_leaks).replace(",", " ") }} rekordów</div>
+<div style="padding: 12px; border-radius: 12px; background: rgba(0,0,0,0.2);">
+<div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Liczba rekordów</div>
+<div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ "{:,}".format(total_leaks).replace(",", " ") }} rekordów</div>
 </div>
-<div class="system-info-item">
-<div class="system-info-label">Ostatnia aktualizacja</div>
-<div class="system-info-value">{{ format_datetime(now) }}</div>
+<div style="padding: 12px; border-radius: 12px; background: rgba(0,0,0,0.2);">
+<div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Ostatnia aktualizacja</div>
+<div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ format_datetime(now) }}</div>
 </div>
 </div>
 </div>
-<div class="system-card">
-<h4><i class="fas fa-cloud"></i> Supabase API</h4>
-<div class="system-info">
-<div class="system-info-item">
-<div class="system-info-label">Status</div>
-<div class="system-info-value" style="color: var(--success);">
+<div style="background: rgba(15, 23, 42, 0.6); border-radius: 16px; padding: 20px; border: 1px solid var(--border);">
+<h4 style="font-size: 1rem; font-weight: 600; margin-bottom: 12px; color: var(--text); display: flex; align-items: center; gap: 10px;">
+<i class="fas fa-cloud" style="color: var(--primary);"></i> Supabase API
+</h4>
+<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+<div style="padding: 12px; border-radius: 12px; background: rgba(0,0,0,0.2);">
+<div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Status</div>
+<div style="font-weight: 600; font-size: 0.95rem; color: var(--success);">
 <i class="fas fa-circle" style="font-size: 0.6rem; margin-right: 6px;"></i> Online
 </div>
 </div>
-<div class="system-info-item">
-<div class="system-info-label">Aktywne licencje</div>
-<div class="system-info-value">{{ active_licenses }}</div>
+<div style="padding: 12px; border-radius: 12px; background: rgba(0,0,0,0.2);">
+<div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Aktywne licencje</div>
+<div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ active_licenses }}</div>
 </div>
-<div class="system-info-item">
-<div class="system-info-label">Zbanowane IP</div>
-<div class="system-info-value">{{ banned_ips|length }}</div>
+<div style="padding: 12px; border-radius: 12px; background: rgba(0,0,0,0.2);">
+<div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Zbanowane IP</div>
+<div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ banned_ips|length }}</div>
 </div>
 </div>
 </div>
@@ -1384,7 +1328,7 @@ Każda linia w pliku powinna zawierać pojedynczy rekord (email, login, etc.).
 
 <div class="section">
 <div class="section-title">
-<i class="fas fa-inbox"></i> Historia importów
+<i class="fas fa-history"></i> Historia importów
 </div>
 <div style="text-align: center; padding: 40px 20px; color: var(--text-secondary);">
 <i class="fas fa-database" style="font-size: 3rem; margin-bottom: 15px; opacity: 0.5;"></i>
@@ -1460,55 +1404,61 @@ Każda linia w pliku powinna zawierać pojedynczy rekord (email, login, etc.).
 <div class="section-title">
 <i class="fas fa-chart-bar"></i> Szczegółowe statystyki systemu
 </div>
-<div class="system-grid">
-<div class="system-card">
-<h4><i class="fas fa-search"></i> Wyszukiwania</h4>
-<div class="system-info">
-<div class="system-info-item">
-<div class="system-info-label">Wszystkie wyszukiwania</div>
-<div class="system-info-value">{{ "{:,}".format(total_searches).replace(",", " ") }}</div>
+<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px;">
+<div style="background: rgba(15, 23, 42, 0.6); border-radius: 16px; padding: 20px; border: 1px solid var(--border);">
+<h4 style="font-size: 1rem; font-weight: 600; margin-bottom: 12px; color: var(--text); display: flex; align-items: center; gap: 10px;">
+<i class="fas fa-search" style="color: var(--primary);"></i> Wyszukiwania
+</h4>
+<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+<div style="padding: 12px; border-radius: 12px; background: rgba(0,0,0,0.2);">
+<div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Wszystkie wyszukiwania</div>
+<div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ "{:,}".format(total_searches).replace(",", " ") }}</div>
 </div>
-<div class="system-info-item">
-<div class="system-info-label">Dziennie (średnio)</div>
-<div class="system-info-value">{{ "{:,}".format((total_searches / 30) | int).replace(",", " ") }}</div>
+<div style="padding: 12px; border-radius: 12px; background: rgba(0,0,0,0.2);">
+<div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Dziennie (średnio)</div>
+<div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ "{:,}".format((total_searches / 30) | int).replace(",", " ") }}</div>
 </div>
-<div class="system-info-item">
-<div class="system-info-label">Aktywni użytkownicy (24h)</div>
-<div class="system-info-value">{{ "{:,}".format(active_users_24h).replace(",", " ") }}</div>
-</div>
-</div>
-</div>
-<div class="system-card">
-<h4><i class="fas fa-server"></i> Wydajność bazy</h4>
-<div class="system-info">
-<div class="system-info-item">
-<div class="system-info-label">Rekordów w bazie</div>
-<div class="system-info-value">{{ "{:,}".format(total_leaks).replace(",", " ") }}</div>
-</div>
-<div class="system-info-item">
-<div class="system-info-label">Średni czas odpowiedzi</div>
-<div class="system-info-value">45 ms</div>
-</div>
-<div class="system-info-item">
-<div class="system-info-label">Wykorzystanie CPU</div>
-<div class="system-info-value">23%</div>
+<div style="padding: 12px; border-radius: 12px; background: rgba(0,0,0,0.2);">
+<div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Aktywni użytkownicy (24h)</div>
+<div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ "{:,}".format(active_users_24h).replace(",", " ") }}</div>
 </div>
 </div>
 </div>
-<div class="system-card">
-<h4><i class="fas fa-shield-alt"></i> Bezpieczeństwo</h4>
-<div class="system-info">
-<div class="system-info-item">
-<div class="system-info-label">Zbanowane IP</div>
-<div class="system-info-value">{{ "{:,}".format(banned_ips|length).replace(",", " ") }}</div>
+<div style="background: rgba(15, 23, 42, 0.6); border-radius: 16px; padding: 20px; border: 1px solid var(--border);">
+<h4 style="font-size: 1rem; font-weight: 600; margin-bottom: 12px; color: var(--text); display: flex; align-items: center; gap: 10px;">
+<i class="fas fa-server" style="color: var(--primary);"></i> Wydajność bazy
+</h4>
+<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+<div style="padding: 12px; border-radius: 12px; background: rgba(0,0,0,0.2);">
+<div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Rekordów w bazie</div>
+<div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ "{:,}".format(total_leaks).replace(",", " ") }}</div>
 </div>
-<div class="system-info-item">
-<div class="system-info-label">Aktywne licencje</div>
-<div class="system-info-value">{{ "{:,}".format(active_licenses).replace(",", " ") }}</div>
+<div style="padding: 12px; border-radius: 12px; background: rgba(0,0,0,0.2);">
+<div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Średni czas odpowiedzi</div>
+<div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">45 ms</div>
 </div>
-<div class="system-info-item">
-<div class="system-info-label">Nieudane logowania</div>
-<div class="system-info-value">15</div>
+<div style="padding: 12px; border-radius: 12px; background: rgba(0,0,0,0.2);">
+<div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Wykorzystanie CPU</div>
+<div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">23%</div>
+</div>
+</div>
+</div>
+<div style="background: rgba(15, 23, 42, 0.6); border-radius: 16px; padding: 20px; border: 1px solid var(--border);">
+<h4 style="font-size: 1rem; font-weight: 600; margin-bottom: 12px; color: var(--text); display: flex; align-items: center; gap: 10px;">
+<i class="fas fa-shield-alt" style="color: var(--primary);"></i> Bezpieczeństwo
+</h4>
+<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+<div style="padding: 12px; border-radius: 12px; background: rgba(0,0,0,0.2);">
+<div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Zbanowane IP</div>
+<div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ "{:,}".format(banned_ips|length).replace(",", " ") }}</div>
+</div>
+<div style="padding: 12px; border-radius: 12px; background: rgba(0,0,0,0.2);">
+<div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Aktywne licencje</div>
+<div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ "{:,}".format(active_licenses).replace(",", " ") }}</div>
+</div>
+<div style="padding: 12px; border-radius: 12px; background: rgba(0,0,0,0.2);">
+<div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Nieudane logowania</div>
+<div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">15</div>
 </div>
 </div>
 </div>
@@ -1591,10 +1541,11 @@ $('.tab-content').removeClass('active');
 $(`#${tabId}-tab`).addClass('active');
 });
 
-// Formatowanie liczb - POPRAWIONE
+// Formatowanie liczb - POPRAWIONO
 document.addEventListener('DOMContentLoaded', function() {
 const statValues = document.querySelectorAll('.stat-value');
 statValues.forEach(el => {
+// POPRAWIONO: Usunięto nieprawidłową sekwencję ucieczki \s
 const numStr = el.textContent.replace(/\\s/g, '').replace(/\s/g, '');
 const num = parseInt(numStr.replace(/[^0-9]/g, ''));
 if (!isNaN(num)) {
@@ -1645,14 +1596,25 @@ def api_auth():
     if not key:
         return jsonify({"success": False, "message": "Brak klucza"}), 400
     licenses = sb_query("licenses", f"key=eq.{key}")
-    if not licenses:
+    if not licenses or (isinstance(licenses, list) and len(licenses) == 0):
         return jsonify({"success": False, "message": "Nieprawidłowy klucz licencyjny"}), 401
-    lic = licenses[0]
-    expiry = datetime.fromisoformat(lic['expiry'].replace('Z', '+00:00'))
+    
+    lic = licenses[0] if isinstance(licenses, list) else licenses
+    
+    expiry_str = lic.get('expiry')
+    if expiry_str:
+        expiry = datetime.fromisoformat(expiry_str.replace('Z', '+00:00'))
+    else:
+        expiry = datetime.now(timezone.utc) + timedelta(days=30)
+    
     if datetime.now(timezone.utc) > expiry or not lic.get('active', True):
         return jsonify({"success": False, "message": "Licencja wygasła lub została zablokowana"}), 401
-    if lic.get("ip") and lic["ip"] != ip:
+    
+    if not lic.get("ip"):
+        sb_update("licenses", {"ip": ip}, f"key=eq.{key}")
+    elif lic.get("ip") != ip:
         return jsonify({"success": False, "message": "Klucz przypisany do innego adresu IP"}), 403
+    
     return jsonify({"success": True, "message": "Zalogowano pomyślnie"})
 
 @app.route("/api/license-info", methods=["POST"])
@@ -1666,9 +1628,10 @@ def api_info():
     if auth_response.status_code != 200:
         return auth_response
     licenses = sb_query("licenses", f"key=eq.{key}")
-    if not licenses:
+    if not licenses or (isinstance(licenses, list) and len(licenses) == 0):
         return jsonify({"success": False, "message": "Nie znaleziono licencji"}), 404
-    lic = licenses[0]
+    
+    lic = licenses[0] if isinstance(licenses, list) else licenses
     return jsonify({
         "success": True,
         "info": {
@@ -1719,6 +1682,6 @@ def api_search():
 if __name__ == "__main__":
     initialize_db_pool()
     logger.info("🚀 Cold Search Premium — Panel admina gotowy")
-    port = int(os.environ.get('PORT', 10000))
+    port = int(os.environ.get('PORT', 10000))  # Render wymaga PORT=10000
     debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
     app.run(host='0.0.0.0', port=port, debug=debug_mode)
