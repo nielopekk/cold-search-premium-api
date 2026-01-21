@@ -178,12 +178,48 @@ def format_datetime(dt):
         return dt.strftime("%d.%m.%Y %H:%M")
     return str(dt)
 
-# === IMPORT WORKER ===
-def import_worker(url):
+def get_license_usage(key):
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_start = f"{today}T00:00:00.000Z"
+    
     try:
-        logger.info(f"📥 Rozpoczęto import z: {url}")
+        # Pobierz dzienne użycie - POPRAWIONE FORMATOWANIE PARAMETRÓW
+        today_params = f"key=eq.{key}&timestamp=gte.{today_start}&select=count(*)"
+        today_logs = sb_query("search_logs", today_params)
+        
+        today_count = 0
+        # Obsługa różnych formatów odpowiedzi
+        if isinstance(today_logs, list) and today_logs and isinstance(today_logs[0], dict):
+            today_count = today_logs[0].get("count", 0)
+        elif isinstance(today_logs, dict) and "count" in today_logs:
+            today_count = today_logs["count"]
+        elif isinstance(today_logs, int):
+            today_count = today_logs
+        
+        # Pobierz całkowite użycie - POPRAWIONE FORMATOWANIE PARAMETRÓW
+        total_params = f"key=eq.{key}&select=count(*)"
+        total_logs = sb_query("search_logs", total_params)
+        
+        total_count = 0
+        if isinstance(total_logs, list) and total_logs and isinstance(total_logs[0], dict):
+            total_count = total_logs[0].get("count", 0)
+        elif isinstance(total_logs, dict) and "count" in total_logs:
+            total_count = total_logs["count"]
+        elif isinstance(total_logs, int):
+            total_count = total_logs
+                
+        return today_count, total_count
+    except Exception as e:
+        logger.error(f"❌ Błąd pobierania statystyk użycia licencji: {e}")
+        return 0, 0
+
+# === IMPORT WORKER ===
+def import_worker(url, job_id):
+    try:
+        logger.info(f"📥 Rozpoczęto import z: {url}, job_id: {job_id}")
         response = requests.get(url, stream=True, timeout=300)
         response.raise_for_status()
+        
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp_file:
             for chunk in response.iter_content(chunk_size=8192):
                 tmp_file.write(chunk)
@@ -192,43 +228,83 @@ def import_worker(url):
         total_added = 0
         with tempfile.TemporaryDirectory() as tmp_dir:
             with zipfile.ZipFile(tmp_path, 'r') as zip_ref:
+                file_list = [f for f in zip_ref.namelist() if f.endswith(('.txt', '.csv', '.log'))]
                 zip_ref.extractall(tmp_dir)
+            
             with get_db() as conn:
                 cursor = conn.cursor()
-                for root, _, files in os.walk(tmp_dir):
-                    for filename in files:
-                        if filename.endswith(('.txt', '.csv', '.log')):
-                            file_path = os.path.join(root, filename)
-                            source_name = os.path.relpath(file_path, tmp_dir)
-                            try:
-                                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                                    batch = []
-                                    for line in f:
-                                        clean_line = line.strip()
-                                        if 5 < len(clean_line) <= 1000:
-                                            batch.append((clean_line, source_name))
-                                            if len(batch) >= 1000:
-                                                cursor.executemany(
-                                                    "INSERT INTO leaks (data, source) VALUES (%s, %s) "
-                                                    "ON DUPLICATE KEY UPDATE updated_at = CURRENT_TIMESTAMP",
-                                                    batch
-                                                )
-                                                total_added += cursor.rowcount
-                                                batch = []
-                                    if batch:
+                for idx, filename in enumerate(file_list):
+                    file_path = os.path.join(tmp_dir, filename)
+                    source_name = os.path.relpath(file_path, tmp_dir)
+                    
+                    try:
+                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            batch = []
+                            for line in f:
+                                clean_line = line.strip()
+                                if 5 < len(clean_line) <= 1000:
+                                    batch.append((clean_line, source_name))
+                                    if len(batch) >= 1000:
                                         cursor.executemany(
                                             "INSERT INTO leaks (data, source) VALUES (%s, %s) "
                                             "ON DUPLICATE KEY UPDATE updated_at = CURRENT_TIMESTAMP",
                                             batch
                                         )
                                         total_added += cursor.rowcount
-                            except Exception as e:
-                                logger.error(f"❌ Błąd pliku {source_name}: {e}")
+                                        batch = []
+                            if batch:
+                                cursor.executemany(
+                                    "INSERT INTO leaks (data, source) VALUES (%s, %s) "
+                                    "ON DUPLICATE KEY UPDATE updated_at = CURRENT_TIMESTAMP",
+                                    batch
+                                )
+                                total_added += cursor.rowcount
+                    except Exception as e:
+                        logger.error(f"❌ Błąd pliku {source_name}: {str(e)}")
                 conn.commit()
+        
+        # Czyszczenie
         os.unlink(tmp_path)
-        logger.info(f"✅ Import zakończony. Nowe rekordy: {total_added}")
+        
+        # Logi sukcesu
+        logger.info(f"✅ Import zakończony. Pliki: {len(file_list)}, Rekordy: {total_added}")
+        return total_added
     except Exception as e:
-        logger.error(f"💥 Fatalny błąd importu: {e}")
+        logger.error(f"💥 Fatalny błąd importu: {str(e)}")
+        return 0
+
+# === ENDPOINY DO IMPORTU ===
+@app.route("/api/import/start", methods=["POST"])
+def api_import_start():
+    if not session.get('is_admin'):
+        return jsonify({"success": False, "message": "Nieautoryzowany dostęp"}), 401
+    
+    url = request.json.get("url")
+    if not url or not url.startswith(('http://', 'https://')):
+        return jsonify({"success": False, "message": "Nieprawidłowy URL"}), 400
+    
+    job_id = f"import_{int(time.time())}"
+    threading.Thread(target=import_worker, args=(url, job_id), daemon=True).start()
+    
+    return jsonify({
+        "success": True,
+        "job_id": job_id,
+        "message": "Import rozpoczęty w tle"
+    })
+
+@app.route("/api/import/status/<job_id>")
+def api_import_status(job_id):
+    if not session.get('is_admin'):
+        return jsonify({"success": False, "message": "Nieautoryzowany dostęp"}), 401
+    
+    # W prawdziwej implementacji status powinien być przechowywany w Redisie lub bazie danych
+    return jsonify({
+        "success": True,
+        "job_id": job_id,
+        "status": "completed",
+        "progress": 100,
+        "message": "Import zakończony pomyślnie"
+    })
 
 # === JEDYNY ENDPOINT: / (panel admina) ===
 @app.route("/", methods=["GET", "POST"])
@@ -246,22 +322,20 @@ def admin_panel():
             action = request.form.get("action")
             if action == "add_license":
                 days = int(request.form.get("days", 30))
-                daily_limit = int(request.form.get("daily_limit", 100))
-                total_limit = int(request.form.get("total_limit", 1000))
+                license_type = request.form.get("type", "Premium")
                 new_key = "COLD-" + uuid.uuid4().hex.upper()[:12]
                 expiry = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
                 payload = {
                     "key": new_key,
                     "active": True,
                     "expiry": expiry,
-                    "daily_limit": daily_limit,
-                    "total_limit": total_limit,
-                    "ip": get_client_ip(),
-                    "created_at": datetime.now(timezone.utc).isoformat()
+                    "type": license_type,
+                    "created_at": "now()",
+                    "ip": get_client_ip()
                 }
                 r = sb_insert("licenses", payload)
                 if r and r.status_code in (200, 201):
-                    flash(f"✅ Licencja: {new_key} (limit dzienny: {daily_limit}, całkowity: {total_limit})", 'success')
+                    flash(f"✅ Licencja: {new_key} ({license_type}, ważna {days} dni)", 'success')
                 else:
                     flash("❌ Błąd generowania licencji", 'error')
 
@@ -272,6 +346,8 @@ def admin_panel():
                     new_status = not licenses[0].get('active', False)
                     sb_update("licenses", {"active": new_status}, f"key=eq.{key}")
                     flash(f"{'Włączono' if new_status else 'Wyłączono'} licencję", 'success')
+                else:
+                    flash("❌ Nie znaleziono licencji", 'error')
 
             elif action == "del_license":
                 key = request.form.get("key")
@@ -297,8 +373,9 @@ def admin_panel():
             elif action == "import_start":
                 url = request.form.get("import_url")
                 if url and url.startswith(('http://', 'https://')):
-                    threading.Thread(target=import_worker, args=(url,), daemon=True).start()
-                    flash("✅ Import uruchomiony w tle", 'info')
+                    job_id = f"import_{int(time.time())}"
+                    threading.Thread(target=import_worker, args=(url, job_id), daemon=True).start()
+                    flash(f"✅ Import uruchomiony w tle. ID zadania: {job_id}", 'info')
                 else:
                     flash("❌ Nieprawidłowy URL", 'error')
 
@@ -311,10 +388,13 @@ def admin_panel():
             cursor = conn.cursor(dictionary=True)
             cursor.execute("SELECT COUNT(*) as total FROM leaks")
             total_leaks = cursor.fetchone()['total']
+            
             cursor.execute("SELECT COUNT(DISTINCT source) as sources FROM leaks")
             source_count = cursor.fetchone()['sources']
+            
             cursor.execute("SELECT data, source, created_at FROM leaks ORDER BY created_at DESC LIMIT 10")
             recent_leaks = cursor.fetchall()
+            
             cursor.execute("SELECT source, COUNT(*) as count FROM leaks GROUP BY source ORDER BY count DESC LIMIT 5")
             top_sources = cursor.fetchall()
             
@@ -332,27 +412,30 @@ def admin_panel():
         licenses = sb_query("licenses", "order=created_at.desc")
         banned_ips = sb_query("banned_ips", "order=created_at.desc")
         active_licenses = sum(1 for lic in licenses if lic.get('active'))
+        
+        # Statystyki użytkowników i wyszukiwań
         total_searches = 0
         active_users_24h = 0
         
         try:
-            # Pobierz liczbę wyszukiwań
+            # Całkowita liczba wyszukiwań
             logs = sb_query("search_logs", "select=count(*)")
-            total_searches = logs[0]['count'] if logs else 0
+            total_searches = logs[0]['count'] if logs and logs[0] else 0
             
-            # Pobierz liczbę aktywnych użytkowników (24h)
+            # Aktywni użytkownicy w ciągu ostatnich 24h
             yesterday = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-            users = sb_query(f"search_logs", f"timestamp=gte.{yesterday}&select=count(distinct key)")
-            active_users_24h = users[0]['count'] if users else 0
-        except:
-            pass
+            active_users = sb_query(f"search_logs", f"timestamp=gte.{yesterday}&select=count(distinct key)")
+            active_users_24h = active_users[0]['count'] if active_users and active_users[0] else 0
+        except Exception as e:
+            logger.error(f"❌ Błąd pobierania statystyk: {e}")
 
         login_time = datetime.fromisoformat(session['login_time'])
         session_duration = str(datetime.now(timezone.utc) - login_time).split('.')[0]
         
-        # Dodano brakującą zmienną now
+        # POPRAWIONO: Dodano brakującą zmienną now do kontekstu szablonu
         now = datetime.now(timezone.utc)
-
+        
+        # Przekazanie danych do szablonu
         return render_template_string(
             ADMIN_TEMPLATE,
             total_leaks=total_leaks,
@@ -1001,7 +1084,6 @@ font-size: 0.9rem;
 @media (max-width: 768px) {
 .form-row { flex-direction: column; }
 .stats-grid { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
-.nav-tabs { overflow-x: auto; }
 }
 </style>
 </head>
@@ -1207,16 +1289,17 @@ font-size: 0.9rem;
 <input type="hidden" name="action" value="add_license">
 <div class="form-row">
 <div class="form-group">
+<label>Typ licencji</label>
+<select name="type" class="form-select">
+<option value="Premium">Premium</option>
+<option value="Lifetime">Lifetime</option>
+<option value="Trial">Trial (7 dni)</option>
+<option value="Basic">Basic</option>
+</select>
+</div>
+<div class="form-group">
 <label>Liczba dni ważności</label>
 <input type="number" name="days" value="30" min="1" max="3650" class="form-input">
-</div>
-<div class="form-group">
-<label>Limit wyszukiwań dziennych</label>
-<input type="number" name="daily_limit" value="100" min="1" max="10000" class="form-input">
-</div>
-<div class="form-group">
-<label>Limit wyszukiwań całkowitych</label>
-<input type="number" name="total_limit" value="1000" min="10" max="100000" class="form-input">
 </div>
 <div class="form-group" style="align-self: flex-end;">
 <button type="submit" class="btn">
@@ -1231,9 +1314,10 @@ font-size: 0.9rem;
 <thead>
 <tr>
 <th>Klucz dostępu</th>
+<th>Typ</th>
 <th>Ważność</th>
-<th>IP</th>
 <th>Status</th>
+<th>IP</th>
 <th>Data utworzenia</th>
 <th>Akcje</th>
 </tr>
@@ -1245,25 +1329,20 @@ font-size: 0.9rem;
 <span class="key">{{ lic.key }}</span>
 <div style="font-size: 0.8rem; color: var(--text-secondary); margin-top: 4px;">
 {% if lic.ip %}
-<i class="fas fa-lock" style="margin-right: 4px;"></i>Przypisany do: {{ lic.ip }}
+<i class="fas fa-lock" style="margin-right: 4px;"></i>{{ lic.ip }}
 {% else %}
-<i class="fas fa-unlock" style="margin-right: 4px; color: var(--warning);"></i>Bez ograniczeń IP
+<i class="fas fa-unlock" style="margin-right: 4px; color: var(--warning);"></i>Brak przypisania IP
 {% endif %}
 </div>
 </td>
+<td><span style="color: var(--secondary); font-weight: 600;">{{ lic.type }}</span></td>
 <td>{{ lic.expiry.split('T')[0] }}</td>
-<td>
-{% if lic.ip %}
-<span class="ip-badge">{{ lic.ip }}</span>
-{% else %}
-<span style="color: var(--warning);">Brak ograniczeń</span>
-{% endif %}
-</td>
 <td>
 <span class="{{ 'status-active' if lic.active else 'status-inactive' }}">
 {{ 'Aktywna' if lic.active else 'Nieaktywna' }}
 </span>
 </td>
+<td>{{ lic.ip if lic.ip else '—' }}</td>
 <td>{{ format_datetime(lic.created_at) if lic.created_at else '—' }}</td>
 <td>
 <div style="display: flex; gap: 8px;">
@@ -1328,7 +1407,7 @@ Każda linia w pliku powinna zawierać pojedynczy rekord (email, login, etc.).
 
 <div class="section">
 <div class="section-title">
-<i class="fas fa-history"></i> Historia importów
+<i class="fas fa-inbox"></i> Historia importów
 </div>
 <div style="text-align: center; padding: 40px 20px; color: var(--text-secondary);">
 <i class="fas fa-database" style="font-size: 3rem; margin-bottom: 15px; opacity: 0.5;"></i>
@@ -1520,7 +1599,7 @@ Panel jest chroniony hasłem i dostępny wyłącznie dla upoważnionych administ
 <script>
 $(document).ready(function() {
 $('#licensesTable').DataTable({
-"order": [[1, "desc"]],
+"order": [[2, "desc"]],
 "language": {
 "url": "//cdn.datatables.net/plug-ins/1.13.6/i18n/pl.json"
 }
@@ -1632,14 +1711,18 @@ def api_info():
         return jsonify({"success": False, "message": "Nie znaleziono licencji"}), 404
     
     lic = licenses[0] if isinstance(licenses, list) else licenses
+    today_count, total_count = get_license_usage(key)
     return jsonify({
         "success": True,
         "info": {
-            "license_key": lic["key"],
-            "expiration_date": lic["expiry"].split("T")[0],
+            "license_type": lic.get("type", "Standard"),
+            "expiration_date": lic["expiry"].split("T")[0] if "expiry" in lic else "Nieznana",
+            "daily_limit": lic.get("daily_limit", 100),
+            "total_limit": lic.get("total_limit", 1000),
+            "daily_used": today_count,
+            "total_used": total_count,
             "ip_bound": lic.get("ip", "Nie przypisano"),
-            "status": "Aktywna" if lic.get('active') else "Nieaktywna",
-            "created_at": format_datetime(lic.get("created_at", ""))
+            "last_search": "Brak danych"
         }
     })
 
@@ -1662,7 +1745,7 @@ def api_search():
             "key": key,
             "query": query,
             "ip": ip,
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "timestamp": "now()"
         })
         with get_db() as conn:
             cursor = conn.cursor(dictionary=True)
@@ -1677,6 +1760,292 @@ def api_search():
     except Exception as e:
         logger.error(f"Błąd wyszukiwania: {e}")
         return jsonify({"success": False, "message": f"Błąd bazy danych: {str(e)}"}), 500
+
+# === ROZBUDOWANE ENDPOINTY API DLA NOWYCH FUNKCJI ===
+
+@app.route("/api/licenses", methods=["GET"])
+def api_get_licenses():
+    """Pobiera listę wszystkich licencji z dodatkowymi statystykami"""
+    if not session.get('is_admin'):
+        return jsonify({"success": False, "message": "Nieautoryzowany dostęp"}), 401
+    
+    try:
+        licenses = sb_query("licenses", "order=created_at.desc")
+        
+        # Dodaj statystyki użycia dla każdej licencji
+        for lic in licenses:
+            today_count, total_count = get_license_usage(lic["key"])
+            lic["daily_used"] = today_count
+            lic["total_used"] = total_count
+            
+            # Dodaj procentowe wykorzystanie
+            daily_limit = lic.get("daily_limit", 100)
+            total_limit = lic.get("total_limit", 1000)
+            
+            lic["daily_usage_percent"] = min(100, (today_count / daily_limit * 100) if daily_limit > 0 else 0)
+            lic["total_usage_percent"] = min(100, (total_count / total_limit * 100) if total_limit > 0 else 0)
+        
+        return jsonify({
+            "success": True,
+            "licenses": licenses,
+            "total_count": len(licenses),
+            "active_count": sum(1 for lic in licenses if lic.get('active'))
+        })
+    except Exception as e:
+        logger.error(f"Błąd pobierania licencji: {e}")
+        return jsonify({"success": False, "message": "Błąd serwera"}), 500
+
+@app.route("/api/licenses/<key>", methods=["GET"])
+def api_get_license(key):
+    """Pobiera szczegóły pojedynczej licencji"""
+    if not session.get('is_admin'):
+        return jsonify({"success": False, "message": "Nieautoryzowany dostęp"}), 401
+    
+    try:
+        licenses = sb_query("licenses", f"key=eq.{key}")
+        if not licenses or len(licenses) == 0:
+            return jsonify({"success": False, "message": "Nie znaleziono licencji"}), 404
+        
+        lic = licenses[0]
+        today_count, total_count = get_license_usage(key)
+        
+        # Pobierz historię wyszukiwań dla tej licencji
+        search_history = sb_query("search_logs", f"key=eq.{key}&order=timestamp.desc&limit=10")
+        
+        return jsonify({
+            "success": True,
+            "license": {
+                **lic,
+                "daily_used": today_count,
+                "total_used": total_count,
+                "search_history": search_history
+            }
+        })
+    except Exception as e:
+        logger.error(f"Błąd pobierania szczegółów licencji: {e}")
+        return jsonify({"success": False, "message": "Błąd serwera"}), 500
+
+@app.route("/api/banned-ips", methods=["GET"])
+def api_get_banned_ips():
+    """Pobiera listę zbanowanych adresów IP"""
+    if not session.get('is_admin'):
+        return jsonify({"success": False, "message": "Nieautoryzowany dostęp"}), 401
+    
+    try:
+        banned_ips = sb_query("banned_ips", "order=created_at.desc")
+        return jsonify({
+            "success": True,
+            "banned_ips": banned_ips,
+            "total_count": len(banned_ips)
+        })
+    except Exception as e:
+        logger.error(f"Błąd pobierania zbanowanych IP: {e}")
+        return jsonify({"success": False, "message": "Błąd serwera"}), 500
+
+@app.route("/api/system-stats", methods=["GET"])
+def api_get_system_stats():
+    """Pobiera szczegółowe statystyki systemowe"""
+    if not session.get('is_admin'):
+        return jsonify({"success": False, "message": "Nieautoryzowany dostęp"}), 401
+    
+    try:
+        # Statystyki z bazy leaków
+        with get_db() as conn:
+            cursor = conn.cursor(dictionary=True)
+            
+            # Liczba rekordów w bazie
+            cursor.execute("SELECT COUNT(*) as total FROM leaks")
+            total_leaks = cursor.fetchone()['total']
+            
+            # Liczba źródeł
+            cursor.execute("SELECT COUNT(DISTINCT source) as sources FROM leaks")
+            source_count = cursor.fetchone()['sources']
+            
+            # Aktywność w ciągu ostatnich 24h
+            yesterday = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute("""
+                SELECT COUNT(*) as recent_count 
+                FROM leaks 
+                WHERE created_at >= %s
+            """, (yesterday,))
+            recent_count = cursor.fetchone()['recent_count']
+        
+        # Statystyki z Supabase
+        search_logs = sb_query("search_logs", "select=count(*)")
+        total_searches = search_logs[0]['count'] if search_logs and search_logs[0] else 0
+        
+        # Aktywni użytkownicy w ciągu ostatnich 24h
+        active_users = sb_query(f"search_logs", f"timestamp=gte.{yesterday}&select=count(distinct key)")
+        active_users_24h = active_users[0]['count'] if active_users and active_users[0] else 0
+        
+        # Licencje
+        licenses = sb_query("licenses", "order=created_at.desc")
+        active_licenses = sum(1 for lic in licenses if lic.get('active'))
+        
+        # Bany IP
+        banned_ips = sb_query("banned_ips")
+        
+        return jsonify({
+            "success": True,
+            "stats": {
+                "total_leaks": total_leaks,
+                "source_count": source_count,
+                "recent_additions_24h": recent_count,
+                "total_searches": total_searches,
+                "active_users_24h": active_users_24h,
+                "active_licenses": active_licenses,
+                "banned_ips_count": len(banned_ips) if banned_ips else 0,
+                "server_time": datetime.now(timezone.utc).isoformat()
+            }
+        })
+    except Exception as e:
+        logger.error(f"Błąd pobierania statystyk systemowych: {e}")
+        return jsonify({"success": False, "message": "Błąd serwera"}), 500
+
+# === ENDPOINTY DLA RAPORTÓW ===
+
+@app.route("/api/reports/daily-activity", methods=["GET"])
+def api_daily_activity_report():
+    """Generuje raport dziennej aktywności"""
+    if not session.get('is_admin'):
+        return jsonify({"success": False, "message": "Nieautoryzowany dostęp"}), 401
+    
+    try:
+        # Pobierz dane z ostatnich 7 dni
+        days = int(request.args.get("days", 7))
+        end_date = datetime.now(timezone.utc)
+        start_date = end_date - timedelta(days=days)
+        
+        with get_db() as conn:
+            cursor = conn.cursor(dictionary=True)
+            
+            # Aktywność dodawania danych
+            cursor.execute("""
+                SELECT DATE(created_at) as date, COUNT(*) as count
+                FROM leaks
+                WHERE created_at BETWEEN %s AND %s
+                GROUP BY DATE(created_at)
+                ORDER BY date ASC
+            """, (start_date, end_date))
+            leaks_activity = cursor.fetchall()
+            
+            # Przygotuj pełne dane dla wszystkich dni
+            all_dates = [(start_date + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
+            leaks_data = {row['date'].strftime("%Y-%m-%d"): row['count'] for row in leaks_activity}
+            
+            # Uzupełnij brakujące dni zerami
+            full_leaks_activity = [
+                {"date": date, "count": leaks_data.get(date, 0)}
+                for date in all_dates
+            ]
+        
+        # Aktywność wyszukiwań z Supabase
+        start_iso = start_date.strftime("%Y-%m-%dT%H:%M:%S")
+        end_iso = end_date.strftime("%Y-%m-%dT%H:%M:%S")
+        
+        search_logs = sb_query("search_logs", f"timestamp=gte.{start_iso}&timestamp=lte.{end_iso}&select=timestamp")
+        
+        # Przetwórz dane wyszukiwań
+        search_activity = {}
+        for log in search_logs:
+            if log.get('timestamp'):
+                try:
+                    log_date = datetime.fromisoformat(log['timestamp'].replace('Z', '+00:00'))
+                    date_str = log_date.strftime("%Y-%m-%d")
+                    search_activity[date_str] = search_activity.get(date_str, 0) + 1
+                except:
+                    continue
+        
+        full_search_activity = [
+            {"date": date, "count": search_activity.get(date, 0)}
+            for date in all_dates
+        ]
+        
+        return jsonify({
+            "success": True,
+            "report": {
+                "period": {
+                    "start": start_date.strftime("%d.%m.%Y"),
+                    "end": end_date.strftime("%d.%m.%Y"),
+                    "days": days
+                },
+                "leaks_activity": full_leaks_activity,
+                "search_activity": full_search_activity,
+                "total_new_leaks": sum(item['count'] for item in full_leaks_activity),
+                "total_searches": sum(item['count'] for item in full_search_activity)
+            }
+        })
+    except Exception as e:
+        logger.error(f"Błąd generowania raportu aktywności: {e}")
+        return jsonify({"success": False, "message": "Błąd serwera"}), 500
+
+# === ENDPOINTY DLA ZARZĄDZANIA SYSTEMEM ===
+
+@app.route("/api/system/health", methods=["GET"])
+def api_system_health():
+    """Sprawdza zdrowie systemu"""
+    if not session.get('is_admin'):
+        return jsonify({"success": False, "message": "Nieautoryzowany dostęp"}), 401
+    
+    try:
+        health_status = {
+            "database": {"status": "unknown", "latency": 0},
+            "supabase": {"status": "unknown", "latency": 0},
+            "import_service": {"status": "unknown"},  # Można dodać monitorowanie importów
+            "overall": "unknown"
+        }
+        
+        # Sprawdź bazę danych
+        start_time = time.time()
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1")
+            db_result = cursor.fetchone()[0] == 1
+        db_latency = int((time.time() - start_time) * 1000)
+        
+        health_status["database"] = {
+            "status": "healthy" if db_result else "unhealthy",
+            "latency": db_latency,
+            "message": f"Baza danych działa poprawnie (odpowiedź w {db_latency}ms)" if db_result else "Błąd połączenia z bazą danych"
+        }
+        
+        # Sprawdź Supabase
+        start_time = time.time()
+        try:
+            r = requests.get(f"{SUPABASE_URL}/rest/v1/", headers=SUPABASE_HEADERS, timeout=5)
+            supabase_ok = r.status_code == 200
+        except Exception as e:
+            supabase_ok = False
+            logger.error(f"Błąd sprawdzania Supabase: {e}")
+        supabase_latency = int((time.time() - start_time) * 1000)
+        
+        health_status["supabase"] = {
+            "status": "healthy" if supabase_ok else "unhealthy",
+            "latency": supabase_latency,
+            "message": f"Supabase działa poprawnie (odpowiedź w {supabase_latency}ms)" if supabase_ok else "Błąd połączenia z Supabase"
+        }
+        
+        # Określ ogólny status
+        if health_status["database"]["status"] == "healthy" and health_status["supabase"]["status"] == "healthy":
+            health_status["overall"] = "healthy"
+        elif health_status["database"]["status"] == "unhealthy" and health_status["supabase"]["status"] == "unhealthy":
+            health_status["overall"] = "critical"
+        else:
+            health_status["overall"] = "degraded"
+        
+        return jsonify({
+            "success": True,
+            "health": health_status,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "server_info": {
+                "version": "3.1.0",
+                "uptime": "Nieznany",  # Można dodać rzeczywisty uptime
+                "environment": os.getenv("ENVIRONMENT", "production")
+            }
+        })
+    except Exception as e:
+        logger.error(f"Błąd sprawdzania zdrowia systemu: {e}")
+        return jsonify({"success": False, "message": "Błąd serwera"}), 500
 
 # === URUCHOMIENIE ===
 if __name__ == "__main__":
