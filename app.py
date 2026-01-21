@@ -63,7 +63,7 @@ class LicenseManager:
         try:
             r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
             data = r.json()
-            if not 
+            if not data:
                 return {"success": False, "message": "Klucz nie istnieje"}
             lic = data[0]
             expiry = datetime.fromisoformat(lic["expiry"].replace('Z', '+00:00'))
@@ -813,8 +813,9 @@ def admin_index():
         r = requests.head(f"{SUPABASE_URL}/rest/v1/search_logs", headers={**SUPABASE_HEADERS, "Prefer": "count=exact"})
         total_searches = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
 
-        r = requests.get(f"{SUPABASE_URL}/rest/v1/search_logs", headers=SUPABASE_HEADERS, params={"select": "ip", "distinct": "true"})
-        unique_ips = len(r.json())
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/search_logs", headers=SUPABASE_HEADERS, params={"select": "ip"})
+        data = r.json()
+        unique_ips = len(set(item.get("ip") for item in data if item.get("ip")))
 
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         r = requests.head(f"{SUPABASE_URL}/rest/v1/search_logs", headers={**SUPABASE_HEADERS, "Prefer": "count=exact"}, params={"timestamp": f"gte.{today}T00:00:00Z"})
@@ -831,7 +832,7 @@ def admin_index():
         )
         data = r.json()
         if isinstance(data, list):
-            for item in 
+            for item in data:
                 if isinstance(item, dict) and "timestamp" in item:
                     ts = datetime.fromisoformat(item["timestamp"].replace('Z', '+00:00'))
                     recent_searches.append({
@@ -896,7 +897,7 @@ def admin_toggle(key):
     try:
         r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
         data = r.json()
-        if 
+        if data:
             current = data[0]["active"]
             new_state = not current
             requests.patch(
@@ -969,3 +970,4 @@ def api_search():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
