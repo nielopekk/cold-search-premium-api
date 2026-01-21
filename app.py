@@ -1,17 +1,25 @@
+
 import os
 import uuid
 import requests
 import zipfile
 import tempfile
 import threading
-import gc
 import json
-from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, render_template_string, redirect, session
-from import_db import import_db
+from functools import wraps
+import logging
+import mysql.connector
+from mysql.connector import Error
 
 # === KONFIGURACJA ===
+LEAKS_DB_HOST = os.getenv("LEAKS_DB_HOST", "136.243.54.157")
+LEAKS_DB_PORT = int(os.getenv("LEAKS_DB_PORT", "25618"))
+LEAKS_DB_USER = os.getenv("LEAKS_DB_USER", "admin_cold")
+LEAKS_DB_PASS = os.getenv("LEAKS_DB_PASS", "Wyciek12")
+LEAKS_DB_NAME = os.getenv("LEAKS_DB_NAME", "cold_search_db")
+
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://wcshypmsurncfufbojvp.supabase.co").strip()
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "sb_secret_Ci0yyib3FCJW3GMivhX3XA_D2vHmhpP").strip()
 SUPABASE_HEADERS = {
@@ -21,1558 +29,621 @@ SUPABASE_HEADERS = {
     "Prefer": "return=minimal"
 }
 
-DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "https://discord.com/api/webhooks/1463456643915321425/j-UgD95Ocx6sk2viuDdTU5YXmxXq3TS8nEVg9sD92M2eMj1_VxMwUikUk-eBZBsGTHSz")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "wyciek12")
-LOGS_FILE = Path("/tmp/activity.log")
-
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "secure_admin_password_2026")
 SENSITIVE_IPS = {"37.47.217.112", "88.156.189.157"}
 
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "cold_search_ultra_2026_fixed")
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "cold_search_secure_key")
 
+# === LOGOWANIE ===
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# === POMOCNICZE FUNKCJE ===
+# === FUNKCJE POMOCNICZE ===
 def sanitize_ip(ip):
-    """Maskuje wrażliwe IP na 127.0.0.1"""
     if not ip:
         return "unknown"
     if ip in SENSITIVE_IPS:
         return "127.0.0.1"
     return ip
 
-
-def log_activity(message):
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{timestamp}] {message}"
-    try:
-        with LOGS_FILE.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception as e:
-        print(f"Błąd zapisu logu: {e}")
-
-    # Wysyłaj ważne logi do Discorda
-    if DISCORD_WEBHOOK_URL and DISCORD_WEBHOOK_URL.startswith("https://discord.com/api/webhooks/"):
-        if any(keyword in message.lower() for keyword in ["błąd", "error", "niepowodzenie", "wygasł", "usunięto", "nowy klucz"]):
-            send_discord_notification(f"🚨 Log systemowy: {message}")
-
-
-def load_activity_logs():
-    if not LOGS_FILE.exists():
-        return []
-    try:
-        return LOGS_FILE.read_text(encoding="utf-8").strip().split("\n")
-    except Exception as e:
-        print(f"Błąd wczytywania logów: {e}")
-        return []
-
-
-def safe_get_json():
-    try:
-        data = request.get_json(force=True, silent=True)
-        if data is None:
-            data = request.form.to_dict()
-        return data if isinstance(data, dict) else {}
-    except Exception as e:
-        print(f"Błąd parsowania JSON: {e}")
-        return {}
-
-
 def get_client_ip():
-    """Bezpieczne pobieranie IP klienta z maskowaniem"""
-    raw_ip = request.headers.get('X-Forwarded-For', '').split(',')[0].strip() or request.remote_addr or '127.0.0.1'
-    return sanitize_ip(raw_ip)
+    if request.headers.get('X-Forwarded-For'):
+        ip = request.headers.get('X-Forwarded-For').split(',')[0].strip()
+    else:
+        ip = request.remote_addr or '127.0.0.1'
+    return sanitize_ip(ip)
 
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get('logged_in'):
+            return redirect('/admin/login')
+        return f(*args, **kwargs)
+    return decorated_function
 
-# === DISCORD INTEGRACJA ===
-def send_discord_notification(message, title="Cold Search Premium Alert", color=3447003):
+def get_leaks_db_connection():
     try:
-        if not DISCORD_WEBHOOK_URL or not DISCORD_WEBHOOK_URL.startswith("https://discord.com/api/webhooks/"):
-            return
-        
-        # Parse message for structured content if needed
-        if "🔗" in message or "📈" in message or "⏰" in message:
-            # Break down message into fields
-            lines = message.split('\n')
-            fields = []
-            description = ""
-            
-            for line in lines:
-                if "🔗 URL:" in line:
-                    fields.append({
-                        "name": "🔗 URL Importu",
-                        "value": line.split("🔗 URL:")[-1].strip(),
-                        "inline": False
-                    })
-                elif "📈 Dodano rekordów:" in line:
-                    fields.append({
-                        "name": "📊 Rekordy dodane",
-                        "value": line.split("📈 Dodano rekordów:")[-1].strip(),
-                        "inline": True
-                    })
-                elif "⏰" in line:
-                    fields.append({
-                        "name": "⏰ Czas",
-                        "value": line.split("⏰")[-1].strip(),
-                        "inline": True
-                    })
-                elif "**" in line:
-                    # Extract bold text as field names
-                    clean_line = line.replace("**", "")
-                    if ":" in clean_line:
-                        parts = clean_line.split(":", 1)
-                        fields.append({
-                            "name": parts[0].strip(),
-                            "value": parts[1].strip(),
-                            "inline": False
-                        })
-                else:
-                    if line.strip():
-                        description += line + "\n"
-            
-            if not fields and description:
-                # Fallback to simple description
-                payload = {
-                    "username": "Cold Search System",
-                    "avatar_url": "https://i.imgur.com/8Y6XJpC.png",
-                    "embeds": [{
-                        "title": title,
-                        "description": description.strip(),
-                        "color": color,
-                        "footer": {"text": f"Cold Search Premium | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"}
-                    }]
-                }
-            else:
-                payload = {
-                    "username": "Cold Search System",
-                    "avatar_url": "https://i.imgur.com/8Y6XJpC.png",
-                    "embeds": [{
-                        "title": title,
-                        "description": description.strip() if description.strip() else "Szczegóły zdarzenia:",
-                        "color": color,
-                        "fields": fields,
-                        "footer": {"text": f"Cold Search Premium | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"}
-                    }]
-                }
-        else:
-            # Original simple message handling
-            payload = {
-                "username": "Cold Search System",
-                "avatar_url": "https://i.imgur.com/8Y6XJpC.png",
-                "embeds": [{
-                    "title": title,
-                    "description": message,
-                    "color": color,
-                    "footer": {"text": f"Cold Search Premium | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"}
-                }]
-            }
-        
-        requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)
-    except Exception as e:
-        print(f"Błąd wysyłania do Discorda: {e}")
-
-
-def send_user_activity_notification(action, user_data=None):
-    try:
-        active_users = 0
-        try:
-            five_minutes_ago = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S")
-            r = requests.head(
-                f"{SUPABASE_URL}/rest/v1/search_logs",
-                headers={**SUPABASE_HEADERS, "Prefer": "count=exact"},
-                params={"timestamp": f"gte.{five_minutes_ago}"}
-            )
-            if r.status_code == 206:
-                active_users = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
-        except:
-            pass
-
-        current_time = datetime.now().strftime("%H:%M:%S")
-        embed_color = 3066993  # Zielony
-        if any(err in action.lower() for err in ["błąd", "error", "niepowodzenie", "odrzucone"]):
-            embed_color = 15158332  # Czerwony
-
-        fields = [
-            {"name": "⏰ Czas", "value": current_time, "inline": True},
-            {"name": "👥 Aktywni użytkownicy", "value": f"{active_users} (ost. 5 min)", "inline": True},
-            {"name": "🔧 Akcja", "value": action, "inline": False},
-        ]
-
-        if user_data:
-            key = user_data.get("key")
-            ip = sanitize_ip(user_data.get("ip"))
-            query = user_data.get("query")
-
-            if key:
-                fields.append({"name": "🔑 Klucz", "value": key[:8] + "..." if len(key) > 8 else key, "inline": True})
-            if ip:
-                fields.append({"name": "🌐 IP", "value": ip, "inline": True})
-            if query:
-                q_display = (query[:50] + "...") if len(query) > 50 else query
-                fields.append({"name": "🔍 Zapytanie", "value": q_display, "inline": False})
-
-        payload = {
-            "username": "Cold Search Monitor",
-            "avatar_url": "https://i.imgur.com/dR5GqRf.png",
-            "embeds": [{
-                "title": "📊 Aktywność Systemu",
-                "color": embed_color,
-                "fields": fields,
-                "footer": {"text": "Cold Search Premium Monitoring System"}
-            }]
-        }
-
-        threading.Thread(target=lambda: requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)).start()
-    except Exception as e:
-        print(f"Błąd wysyłania szczegółowego powiadomienia: {e}")
-
-
-def send_startup_notification():
-    try:
-        server_info = {
-            "port": os.environ.get("PORT", 5000),
-            "environment": os.environ.get("ENV", "production"),
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        message = (
-            f"🚀 **System Cold Search Premium został uruchomiony**\n"
-            f"🕒 Czas: `{server_info['time']}`\n"
-            f"🔧 Port: `{server_info['port']}`\n"
-            f"🌍 Środowisko: `{server_info['environment'].upper()}`"
+        return mysql.connector.connect(
+            host=LEAKS_DB_HOST,
+            port=LEAKS_DB_PORT,
+            user=LEAKS_DB_USER,
+            password=LEAKS_DB_PASS,
+            database=LEAKS_DB_NAME,
+            charset='utf8mb4',
+            autocommit=True
         )
-        send_discord_notification(message, title="✅ System Online", color=3066993)
-    except Exception as e:
-        print(f"Błąd powiadomienia startowego: {e}")
+    except Error as e:
+        logger.error(f"Błąd połączenia z bazą wycieków: {e}")
+        raise
 
-
-# === LICENCJE ===
+# === ZARZĄDZANIE LICENCJAMI ===
 class LicenseManager:
-    def generate(self, days):
+    def generate(self, days, license_type="premium"):
         new_key = "COLD-" + uuid.uuid4().hex.upper()[:12]
         expiry = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
-        payload = {"key": new_key, "active": True, "expiry": expiry}
-        r = requests.post(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, json=payload)
-        if r.status_code in [200, 201, 204]:
-            threading.Thread(target=lambda: send_user_activity_notification(
-                f"Nowy klucz wygenerowany ({days} dni)",
-                {"key": new_key}
-            )).start()
-            return new_key
-        return f"Error: {r.status_code}"
+        payload = {
+            "key": new_key,
+            "active": True,
+            "expiry": expiry,
+            "license_type": license_type,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        try:
+            r = requests.post(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, json=payload)
+            return new_key if r.status_code in [200, 201] else None
+        except Exception as e:
+            logger.error(f"Błąd generowania klucza: {e}")
+            return None
 
     def validate(self, key, ip):
         try:
-            if not key or not ip:
-                return {"success": False, "message": "Brak klucza lub IP"}
-            r = requests.get(
-                f"{SUPABASE_URL}/rest/v1/licenses",
-                headers=SUPABASE_HEADERS,
-                params={"key": f"eq.{key}"}
-            )
-            if r.status_code != 200:
-                return {"success": False, "message": f"Błąd bazy danych: {r.status_code}"}
-            data = r.json()
-            if not data:
-                send_user_activity_notification(f"Próba dostępu z nieistniejącym kluczem", {"key": key, "ip": ip})
-                return {"success": False, "message": "Klucz nie istnieje"}
-            lic = data[0]
-            expiry_str = lic["expiry"].replace('Z', '+00:00')
-            try:
-                expiry = datetime.fromisoformat(expiry_str)
-            except ValueError:
-                try:
-                    expiry = datetime.strptime(expiry_str.split('.')[0], "%Y-%m-%dT%H:%M:%S")
-                    expiry = expiry.replace(tzinfo=timezone.utc)
-                except:
-                    expiry = datetime.now(timezone.utc) + timedelta(days=365)
-            now = datetime.now(timezone.utc)
-            if expiry.tzinfo is None:
-                expiry = expiry.replace(tzinfo=timezone.utc)
-            if not lic.get("active", False) or now > expiry:
-                send_user_activity_notification(f"Próba dostępu z wygasłym kluczem", {"key": key, "ip": ip})
+            r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
+            if r.status_code != 200 or not r.json():
+                return {"success": False, "message": "Nieprawidłowy klucz"}
+            
+            lic = r.json()[0]
+            expiry = datetime.fromisoformat(lic["expiry"].replace('Z', '+00:00'))
+            
+            if not lic.get("active", False) or datetime.now(timezone.utc) > expiry:
                 return {"success": False, "message": "Klucz wygasł"}
+            
             if not lic.get("ip"):
-                patch_resp = requests.patch(
-                    f"{SUPABASE_URL}/rest/v1/licenses?key=eq.{key}",
-                    headers=SUPABASE_HEADERS,
-                    json={"ip": ip}
-                )
-                if patch_resp.status_code not in [200, 204]:
-                    return {"success": False, "message": "Błąd aktualizacji IP"}
-                send_user_activity_notification(f"Nowe IP powiązane z kluczem", {"key": key, "ip": ip})
+                requests.patch(f"{SUPABASE_URL}/rest/v1/licenses?key=eq.{key}", headers=SUPABASE_HEADERS, json={"ip": ip})
                 return {"success": True, "message": "IP powiązane"}
+            
             if lic["ip"] != ip:
-                send_user_activity_notification(f"Próba dostępu z niepowiązanym IP", {"key": key, "ip": ip, "bound_ip": lic["ip"]})
                 return {"success": False, "message": "Inne IP przypisane"}
+            
             return {"success": True, "message": "OK"}
         except Exception as e:
-            error_msg = f"⚠️ Błąd walidacji klucza '{key}' z IP '{ip}': {str(e)}"
-            log_activity(error_msg)
+            logger.error(f"Błąd walidacji klucza: {e}")
             return {"success": False, "message": "Błąd serwera"}
-
 
 lic_mgr = LicenseManager()
 
-
-# === IMPORT Z ZIP ===
-def import_leaks_worker(zip_url):
-    log_activity(f"📥 Start importu: {zip_url}")
+def import_leaks_to_mysql(file_path, source_name):
+    added_count = 0
     try:
-        # Use the separate import database connection instead of Supabase
-        if not import_db.connect():
-            raise Exception("Nie można połączyć z bazą importu")
+        conn = get_leaks_db_connection()
+        cursor = conn.cursor()
         
+        # Tworzenie tabeli jeśli nie istnieje
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS leaks (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            data TEXT NOT NULL,
+            source VARCHAR(255) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_data (data(255)),
+            INDEX idx_source (source)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """)
+        
+        # Import danych
+        insert_query = "INSERT IGNORE INTO leaks (data, source) VALUES (%s, %s)"
+        batch = []
+        
+        with open(file_path, "r", errors="replace") as f:
+            for line in f:
+                clean_line = line.strip()
+                if clean_line and len(clean_line) <= 1000:
+                    batch.append((clean_line, source_name))
+                    if len(batch) >= 500:
+                        cursor.executemany(insert_query, batch)
+                        added_count += cursor.rowcount
+                        batch = []
+        
+        if batch:
+            cursor.executemany(insert_query, batch)
+            added_count += cursor.rowcount
+            
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Błąd importu: {e}")
+    return added_count
+
+def import_leaks_worker(zip_url, callback=None):
+    try:
         response = requests.get(zip_url, stream=True, timeout=60)
-        response.raise_for_status()
         with tempfile.TemporaryDirectory() as tmp_dir:
-            zip_path = Path(tmp_dir) / "data.zip"
+            zip_path = os.path.join(tmp_dir, "import.zip")
             with open(zip_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
+                for chunk in response.iter_content(8192):
                     f.write(chunk)
+            
             with zipfile.ZipFile(zip_path, "r") as zip_ref:
                 zip_ref.extractall(tmp_dir)
-            total_added = 0
-            batch = []
-            for file_path in Path(tmp_dir).rglob("*"):
-                if not file_path.is_file() or file_path.suffix.lower() not in {".txt", ".csv", ".log"}:
-                    continue
-                source_name = file_path.name
-                try:
-                    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                        for line in f:
-                            clean_line = line.strip()
-                            if clean_line and len(clean_line) <= 1000:
-                                batch.append({"data": clean_line, "source": source_name})
-                                # Process in batches to avoid memory issues
-                                if len(batch) >= 1000:
-                                    inserted_count = import_db.bulk_insert_leaks(batch)
-                                    total_added += inserted_count
-                                    batch = []  # Reset batch
-                except Exception as e:
-                    log_activity(f"⚠️ Błąd pliku {source_name}: {e}")
-                    continue
-            # Process remaining items in batch
-            if batch:
-                inserted_count = import_db.bulk_insert_leaks(batch)
-                total_added += inserted_count
             
-            log_activity(f"✅ Import zakończony. Dodano: {total_added} rekordów.")
-            send_discord_notification(
-                f"✅ Import zakończony pomyślnie\n🔗 URL: {zip_url[:50]}...\n📈 Dodano rekordów: {total_added}",
-                title="📥 Import Bazy Zakończony",
-                color=3066993
-            )
+            total_added = 0
+            for root, _, files in os.walk(tmp_dir):
+                for file_name in files:
+                    if any(file_name.lower().endswith(ext) for ext in [".txt", ".csv", ".log"]):
+                        file_path = os.path.join(root, file_name)
+                        total_added += import_leaks_to_mysql(file_path, file_name)
+            
+            if callback:
+                callback(total_added)
     except Exception as e:
-        error_msg = f"❌ Błąd importu: {str(e)}"
-        log_activity(error_msg)
-        send_discord_notification(error_msg, title="🚨 Błąd Importu", color=15158332)
-    finally:
-        import_db.disconnect()
+        logger.error(f"Błąd importu: {e}")
+        if callback:
+            callback(-1)
 
+# === BEZPIECZEŃSTWO ===
+def check_ip_ban(ip):
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/banned_ips", headers=SUPABASE_HEADERS, params={"ip": f"eq.{ip}"})
+        if r.status_code == 200 and r.json():
+            ban = r.json()[0]
+            if ban.get("expires_at"):
+                expires_at = datetime.fromisoformat(ban["expires_at"].replace('Z', '+00:00'))
+                if datetime.now(timezone.utc) < expires_at:
+                    return True
+    except Exception as e:
+        logger.error(f"Błąd sprawdzania bana: {e}")
+    return False
 
-# === PANEL ADMINA HTML ===
-# (Nie zmieniam HTML — zostaje taki sam jak wcześniej)
+def ban_ip(ip, reason="Nieokreślony powód", duration_hours=24):
+    try:
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=duration_hours)).isoformat()
+        payload = {"ip": ip, "reason": reason, "expires_at": expires_at}
+        requests.post(f"{SUPABASE_URL}/rest/v1/banned_ips", headers=SUPABASE_HEADERS, json=payload)
+        return True
+    except Exception as e:
+        logger.error(f"Błąd banowania IP: {e}")
+        return False
 
+def check_rate_limit(ip, max_requests=10, period_minutes=1):
+    try:
+        timestamp = (datetime.now(timezone.utc) - timedelta(minutes=period_minutes)).isoformat()
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/rate_limits", headers=SUPABASE_HEADERS, 
+                        params={"ip": f"eq.{ip}", "timestamp": f"gte.{timestamp}"})
+        if r.status_code == 200:
+            count = len(r.json())
+            if count >= max_requests:
+                ban_ip(ip, f"Przekroczono limit żądań ({count}/{max_requests})", 1)
+                return False
+            return True
+    except Exception as e:
+        logger.error(f"Błąd rate limit: {e}")
+    return True
+
+# === PANEL ADMINA ===
 ADMIN_HTML = """
 <!DOCTYPE html>
-<html lang="pl">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Cold Search | Admin Panel</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <title>Cold Search Admin</title>
     <style>
-        :root {
-            --primary: #00f2ff;
-            --secondary: #bc13fe;
-            --bg: #0a0a12;
-            --card-bg: rgba(15, 15, 25, 0.7);
-            --border: rgba(255, 255, 255, 0.08);
-            --text: #eaeaff;
-            --text-muted: #8888aa;
-            --success: #00ffaa;
-            --danger: #ff3366;
-            --warning: #ffcc00;
-            --discord: #5865F2;
-        }
-
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            background: var(--bg);
-            color: var(--text);
-            font-family: 'Inter', sans-serif;
-            min-height: 100vh;
-            background-image:
-                radial-gradient(circle at 10% 20%, rgba(0, 242, 255, 0.05) 0%, transparent 20%),
-                radial-gradient(circle at 90% 80%, rgba(188, 19, 254, 0.05) 0%, transparent 20%);
-            padding: 20px;
-        }
-
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-        }
-
-        /* LOGIN */
-        .login-card {
-            max-width: 420px;
-            margin: 120px auto;
-            background: var(--card-bg);
-            padding: 40px;
-            border-radius: 24px;
-            border: 1px solid var(--border);
-            backdrop-filter: blur(12px);
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
-        }
-        .login-card h2 {
-            text-align: center;
-            margin-bottom: 30px;
-            font-weight: 800;
-            font-size: 1.8rem;
-            background: linear-gradient(90deg, var(--primary), var(--secondary));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-        .login-card input {
-            width: 100%;
-            padding: 16px;
-            background: rgba(0, 0, 0, 0.3);
-            border: 1px solid var(--border);
-            border-radius: 14px;
-            color: white;
-            font-family: 'JetBrains Mono';
-            margin-bottom: 20px;
-            font-size: 1rem;
-        }
-        .login-card button {
-            width: 100%;
-            padding: 16px;
-            background: linear-gradient(135deg, var(--primary), var(--secondary));
-            color: #000;
-            font-weight: 700;
-            border: none;
-            border-radius: 14px;
-            cursor: pointer;
-            font-size: 1.05rem;
-            transition: transform 0.2s, opacity 0.2s;
-        }
-        .login-card button:hover {
-            transform: translateY(-2px);
-            opacity: 0.95;
-        }
-
-        /* HEADER */
-        header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 24px 32px;
-            background: var(--card-bg);
-            border-radius: 24px;
-            border: 1px solid var(--border);
-            margin-bottom: 32px;
-            backdrop-filter: blur(12px);
-            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.3);
-        }
-        .logo {
-            font-size: 1.8rem;
-            font-weight: 800;
-            background: linear-gradient(90deg, var(--primary), var(--secondary));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-        .btn-logout {
-            padding: 10px 24px;
-            background: transparent;
-            border: 1px solid var(--danger);
-            color: var(--danger);
-            border-radius: 12px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.2s;
-        }
-        .btn-logout:hover {
-            background: rgba(255, 51, 102, 0.1);
-        }
-
-        /* STATS */
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 24px;
-            margin-bottom: 32px;
-        }
-        .stat-card {
-            background: var(--card-bg);
-            padding: 28px;
-            border-radius: 20px;
-            border: 1px solid var(--border);
-            display: flex;
-            flex-direction: column;
-        }
-        .stat-label {
-            font-size: 0.9rem;
-            color: var(--text-muted);
-            margin-bottom: 8px;
-        }
-        .stat-value {
-            font-size: 2.2rem;
-            font-weight: 800;
-            font-family: 'JetBrains Mono', monospace;
-            color: white;
-        }
-
-        /* MAIN LAYOUT */
-        .main-layout {
-            display: grid;
-            grid-template-columns: 1fr;
-            gap: 28px;
-        }
-        @media (min-width: 992px) {
-            .main-layout {
-                grid-template-columns: 380px 1fr;
-            }
-        }
-
-        .card {
-            background: var(--card-bg);
-            padding: 32px;
-            border-radius: 24px;
-            border: 1px solid var(--border);
-            backdrop-filter: blur(10px);
-        }
-        .card h3 {
-            font-size: 1.3rem;
-            margin-bottom: 24px;
-            font-weight: 700;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .card h3 svg {
-            width: 20px;
-            height: 20px;
-            fill: var(--primary);
-        }
-
-        input[type="number"],
-        input[type="url"] {
-            width: 100%;
-            padding: 14px;
-            background: rgba(0, 0, 0, 0.35);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            color: white;
-            font-family: 'JetBrains Mono';
-            margin-bottom: 18px;
-            font-size: 1rem;
-        }
-
-        .btn-primary {
-            width: 100%;
-            padding: 15px;
-            background: linear-gradient(135deg, var(--primary), var(--secondary));
-            color: #000;
-            font-weight: 700;
-            border: none;
-            border-radius: 12px;
-            cursor: pointer;
-            font-size: 1rem;
-            transition: transform 0.2s, opacity 0.2s;
-        }
-        .btn-primary:hover {
-            transform: translateY(-2px);
-            opacity: 0.95;
-        }
-
-        .btn-secondary {
-            background: linear-gradient(135deg, var(--secondary), #8a00d4);
-        }
-        
-        .btn-discord {
-            background: linear-gradient(135deg, var(--discord), #4752c4);
-            color: white;
-        }
-
-        .generated-key {
-            margin-top: 20px;
-            padding: 16px;
-            background: rgba(0, 0, 0, 0.4);
-            border: 1px dashed var(--primary);
-            border-radius: 12px;
-            text-align: center;
-            font-family: 'JetBrains Mono';
-            font-size: 1.1rem;
-            color: var(--primary);
-            word-break: break-all;
-        }
-
-        /* TABLE */
-        .table-container {
-            overflow-x: auto;
-            border-radius: 20px;
-            border: 1px solid var(--border);
-            background: var(--card-bg);
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            font-family: 'JetBrains Mono';
-            font-size: 0.95rem;
-        }
-        th {
-            padding: 16px;
-            text-align: left;
-            color: var(--text-muted);
-            font-weight: 600;
-            font-size: 0.8rem;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            border-bottom: 1px solid var(--border);
-        }
-        td {
-            padding: 16px;
-            border-bottom: 1px solid var(--border);
-        }
-        tr:last-child td {
-            border-bottom: none;
-        }
-        .status-active {
-            color: var(--success);
-            background: rgba(0, 255, 170, 0.1);
-            padding: 4px 10px;
-            border-radius: 8px;
-            font-weight: 600;
-        }
-        .status-expired, .status-inactive {
-            color: var(--danger);
-            background: rgba(255, 51, 102, 0.1);
-            padding: 4px 10px;
-            border-radius: 8px;
-            font-weight: 600;
-        }
-
-        .actions {
-            display: flex;
-            gap: 8px;
-        }
-        .action-btn {
-            padding: 4px 10px;
-            border: none;
-            border-radius: 6px;
-            font-size: 0.8rem;
-            cursor: pointer;
-            font-weight: 600;
-        }
-        .btn-toggle {
-            background: var(--warning);
-            color: #000;
-        }
-        .btn-delete {
-            background: var(--danger);
-            color: white;
-        }
-
-        /* RECENT SEARCHES */
-        .recent-searches {
-            grid-column: 1 / -1;
-            background: var(--card-bg);
-            border: 1px solid var(--border);
-            border-radius: 20px;
-            padding: 24px;
-        }
-        .recent-searches h3 {
-            margin-bottom: 20px;
-        }
-        .search-item {
-            display: grid;
-            grid-template-columns: 1fr 2fr 1fr 100px;
-            gap: 12px;
-            padding: 12px 0;
-            border-bottom: 1px solid var(--border);
-            font-family: 'JetBrains Mono';
-            font-size: 0.9rem;
-        }
-        .search-item:last-child {
-            border-bottom: none;
-        }
-        .search-key { color: var(--primary); }
-        .search-query { color: white; }
-        .search-ip { color: #aaa; }
-        .search-time { color: var(--text-muted); }
-
-        /* LOGS */
-        .logs-card {
-            grid-column: 1 / -1;
-            background: rgba(0, 0, 0, 0.4);
-            border-radius: 20px;
-            padding: 24px;
-            height: 280px;
-            overflow-y: auto;
-            border: 1px solid var(--border);
-            font-family: 'JetBrains Mono';
-            font-size: 12px;
-            color: #aaa;
-        }
-        .log-line {
-            margin-bottom: 6px;
-            line-height: 1.4;
-        }
-        .log-timestamp {
-            color: var(--primary);
-            margin-right: 8px;
-        }
-        .log-action {
-            color: var(--text);
-        }
-        .log-error {
-            color: var(--danger);
-        }
-        .log-success {
-            color: var(--success);
-        }
-        
-        /* DISCORD NOTIFICATION CARD */
-        .discord-card {
-            background: linear-gradient(135deg, #5865F2, #4752C4);
-            color: white;
-            border: none;
-            margin-bottom: 24px;
-        }
-        .discord-card h3 {
-            color: white;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .discord-card h3 svg {
-            fill: white;
-        }
-        .discord-status {
-            display: flex;
-            gap: 20px;
-            margin-top: 16px;
-        }
-        .status-item {
-            text-align: center;
-        }
-        .status-value {
-            font-size: 1.8rem;
-            font-weight: 800;
-            margin: 8px 0;
-        }
-        .status-label {
-            font-size: 0.9rem;
-            opacity: 0.9;
-        }
-
-        /* LOADING INDICATOR */
-        .loading {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.7);
-            z-index: 1000;
-            justify-content: center;
-            align-items: center;
-            color: white;
-            font-size: 1.2rem;
-        }
-        .loading.active {
-            display: flex;
-        }
-
-        /* NOTIFICATION */
-        .notification {
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            padding: 12px 20px;
-            border-radius: 8px;
-            background: var(--card-bg);
-            border: 1px solid var(--border);
-            z-index: 1001;
-            transform: translateX(200%);
-            transition: transform 0.3s ease;
-        }
-        .notification.show {
-            transform: translateX(0);
-        }
-        .notification.success { border-left: 4px solid var(--success); }
-        .notification.error { border-left: 4px solid var(--danger); }
-
-        ::-webkit-scrollbar { width: 8px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.1); border-radius: 4px; }
-        ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.2); }
+        body { font-family: Arial, sans-serif; background: #0f0f1a; color: #e6e6ff; margin: 0; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .card { background: #1a1a2e; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #2d2d44; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 25px; }
+        .stat-card { background: #25253a; padding: 15px; border-radius: 8px; text-align: center; }
+        .stat-value { font-size: 24px; font-weight: bold; color: #00f2ff; }
+        .table-container { overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #2d2d44; }
+        th { background: #25253a; color: #a0a0c0; font-weight: 600; }
+        .btn { padding: 10px 15px; background: #00f2ff; color: #000; border: none; border-radius: 6px; cursor: pointer; margin-right: 8px; }
+        .btn-danger { background: #ff3366; }
+        .btn-warning { background: #ffcc00; }
+        .status-active { color: #00ffaa; }
+        .status-inactive { color: #ff3366; }
+        .login-card { max-width: 400px; margin: 100px auto; background: #1a1a2e; padding: 30px; border-radius: 8px; }
     </style>
 </head>
 <body>
     <div class="container">
         {% if not authenticated %}
-            <div class="login-card">
-                <h2>🔐 Secure Login</h2>
-                <form id="loginForm">
-                    <input type="password" name="password" placeholder="Wprowadź hasło administratora" required autofocus autocomplete="off">
-                    <button type="submit">ZALOGUJ SIĘ</button>
+        <div class="login-card">
+            <h2>Panel Administratora</h2>
+            {% if login_error %}
+            <p style="color: #ff3366;">Nieprawidłowe hasło</p>
+            {% endif %}
+            <form method="POST">
+                <input type="password" name="password" placeholder="Hasło administratora" required style="width: 100%; padding: 10px; margin: 10px 0; border-radius: 4px; border: 1px solid #2d2d44; background: #25253a; color: white;">
+                <button type="submit" class="btn" style="width: 100%;">Zaloguj</button>
+            </form>
+        </div>
+        {% else %}
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px;">
+            <h1>Cold Search Premium</h1>
+            <div>
+                <span>{{ admin_name }}</span>
+                <form method="POST" action="/admin/logout" style="display: inline;">
+                    <button type="submit" class="btn btn-danger">Wyloguj</button>
                 </form>
             </div>
-        {% else %}
-            <header>
-                <div class="logo">❄️ Cold Search Premium</div>
-                <button class="btn-logout" id="logoutBtn">WYLOGUJ</button>
-            </header>
-
-            <div class="discord-card card">
-                <h3>
-                    <svg viewBox="0 0 24 24"><path d="M19.54 9.27a6.69 6.69 0 0 1 .46 2.47c0 2.48-1.7 4.49-4.13 5.25a7.21 7.21 0 0 1-3.37.43 7.4 7.4 0 0 1-3.38-.43c-2.58-.81-3.96-2.74-4-5.17.71.4 1.52.63 2.39.65a4.5 4.5 0 0 0 2.37-.7 2 2 0 0 1-1.6-1.93c.1-1.32.86-2.45 1.8-3.09a1.8 1.8 0 0 1 .89-.22c-.28 1.04.2 2.02 1.2 2.62a3.6 3.6 0 0 1 1.04.83 2.01 2.01 0 0 1-2.79 2.98c1.24-.69 2.05-1.98 1.86-3.34a2 2 0 0 1 2.45-2.21 3.47 3.47 0 0 0 1.33-.25c1.23-.5 2.16-1.61 2.37-2.93a2 2 0 0 1 2.49 2.14c-.03.69-.32 1.25-.78 1.65a3.5 3.5 0 0 1 1.75.39c-.61.91-1.77 1.4-3.05 1.4c-.48 0-.94-.08-1.4-.22a2 2 0 0 1-.75 3.84h.01Z"/><circle cx="8.53" cy="11.03" r="1.03"/><circle cx="15.4" cy="11.03" r="1.03"/></svg>
-                    Monitor Discord
-                </h3>
-                <p style="margin-bottom: 20px; opacity: 0.9; line-height: 1.5;">
-                    System automatycznie wysyła powiadomienia do Discorda o ważnych zdarzeniach w systemie, takich jak:
-                    logowania użytkowników, próby dostępu z nieautoryzowanych adresów IP, generowanie nowych kluczy,
-                    oraz błędy systemowe. Poniżej aktualny stan monitoringu.
-                </p>
-                <div class="discord-status">
-                    <div class="status-item">
-                        <div class="status-value">{{ active_users }}</div>
-                        <div class="status-label">Aktywni użytkownicy</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">{{ total_searches_today }}</div>
-                        <div class="status-label">Wyszukiwań dzisiaj</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-value">✅</div>
-                        <div class="status-label">Status webhooka</div>
-                    </div>
-                </div>
-                <button class="btn-primary btn-discord" id="sendReportBtn" style="margin-top: 20px; width: auto;">
-                    WYŚLIJ RĘCZNY RAPORT DO DISCORDA
-                </button>
+        </div>
+        
+        <div class="stats">
+            <div class="stat-card">
+                <div>Rekordy w bazie</div>
+                <div class="stat-value">{{ db_count }}</div>
             </div>
-
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <div class="stat-label">REKORDY W BAZIE</div>
-                    <div class="stat-value" id="dbCount">{{ "{:,}".format(db_count).replace(",", " ") }}</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">AKTYWNE LICENCJE</div>
-                    <div class="stat-value" id="activeKeys">{{ active_keys }}</div>
-                </div>
+            <div class="stat-card">
+                <div>Aktywne licencje</div>
+                <div class="stat-value">{{ active_keys }}</div>
             </div>
-
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <div class="stat-label">WYSZUKAŃ OGÓŁEM</div>
-                    <div class="stat-value" id="totalSearches">{{ "{:,}".format(total_searches).replace(",", " ") }}</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">UNIKALNE IP</div>
-                    <div class="stat-value" id="uniqueIps">{{ "{:,}".format(unique_ips).replace(",", " ") }}</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">WYSZUKAŃ DZIŚ</div>
-                    <div class="stat-value" id="searchesToday">{{ "{:,}".format(searches_today).replace(",", " ") }}</div>
-                </div>
+            <div class="stat-card">
+                <div>Wyszukiwań dziś</div>
+                <div class="stat-value">{{ searches_today }}</div>
             </div>
-
-            <div class="main-layout">
-                <div class="card">
-                    <h3>
-                        <svg viewBox="0 0 24 24"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>
-                        Nowa Licencja
-                    </h3>
-                    <form id="generateForm">
-                        <input type="number" name="days" value="30" min="1" placeholder="Liczba dni ważności">
-                        <button type="submit" class="btn-primary">GENERUJ KLUCZ</button>
-                    </form>
-                    <div id="generatedKey" class="generated-key" style="display:none;"></div>
-
-                    <h3 style="margin-top: 36px;">
-                        <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
-                        Import Bazy ZIP
-                    </h3>
-                    <form id="importForm">
-                        <input type="url" name="zip_url" placeholder="https://example.com/data.zip" required>
-                        <button type="submit" class="btn-primary btn-secondary">ROZPOCZNIJ IMPORT</button>
-                    </form>
+            <div class="stat-card">
+                <div>Zbanowane IP</div>
+                <div class="stat-value">{{ banned_ips }}</div>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h2>Generowanie nowej licencji</h2>
+            <form method="POST" action="/admin/generate">
+                <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 15px;">
+                    <div>
+                        <label>Dni ważności:</label>
+                        <input type="number" name="days" value="30" min="1" max="365" required style="width: 100%; padding: 8px; border-radius: 4px; border: 1px solid #2d2d44; background: #25253a; color: white;">
+                    </div>
+                    <div>
+                        <label>Typ licencji:</label>
+                        <select name="license_type" style="width: 100%; padding: 8px; border-radius: 4px; border: 1px solid #2d2d44; background: #25253a; color: white;">
+                            <option value="premium">Premium</option>
+                            <option value="standard">Standard</option>
+                        </select>
+                    </div>
                 </div>
-
-                <div class="table-container">
-                    <table id="licensesTable">
-                        <thead>
-                            <tr>
-                                <th>Klucz</th>
-                                <th>Status</th>
-                                <th>IP</th>
-                                <th>Akcje</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {% for lic in licenses %}
-                            <tr data-key="{{ lic.key }}">
-                                <td style="color:var(--primary); font-weight:600;">{{ lic.key }}</td>
-                                <td>
-                                    {% if lic.is_active %}
-                                        <span class="status-active">Aktywny</span>
-                                    {% else %}
-                                        <span class="status-expired">Wygasły</span>
-                                    {% endif %}
-                                    {% if not lic.active %}
-                                        <span class="status-inactive">Nieaktywny</span>
-                                    {% endif %}
-                                </td>
-                                <td>{{ lic.ip or '—' }}</td>
-                                <td class="actions">
-                                    <button class="action-btn btn-toggle" onclick="toggleLicense('{{ lic.key }}')">
-                                        {{ "DEZAKTYWUJ" if lic.active else "AKTYWUJ" }}
+                <button type="submit" class="btn" style="margin-top: 15px;">Generuj klucz</button>
+            </form>
+            {% if new_key %}
+            <div style="margin-top: 20px; padding: 15px; background: rgba(0, 242, 255, 0.1); border: 1px dashed #00f2ff; border-radius: 6px;">
+                <strong>Nowy klucz:</strong> {{ new_key }}
+            </div>
+            {% endif %}
+        </div>
+        
+        <div class="card">
+            <h2>Import danych z ZIP</h2>
+            <form method="POST" action="/admin/import_zip">
+                <label>URL pliku ZIP:</label>
+                <input type="url" name="zip_url" placeholder="https://example.com/data.zip" required style="width: 100%; padding: 8px; margin: 8px 0; border-radius: 4px; border: 1px solid #2d2d44; background: #25253a; color: white;">
+                <button type="submit" class="btn">Rozpocznij import</button>
+            </form>
+        </div>
+        
+        <div class="card">
+            <h2>Zarządzanie licencjami</h2>
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Klucz</th>
+                            <th>Typ</th>
+                            <th>IP</th>
+                            <th>Status</th>
+                            <th>Akcje</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for lic in licenses %}
+                        <tr>
+                            <td style="color: #00f2ff; font-weight: bold;">{{ lic.key[:10] }}...</td>
+                            <td>{{ lic.license_type }}</td>
+                            <td>{{ lic.ip or 'niepowiązane' }}</td>
+                            <td>
+                                <span class="status-{{ 'active' if lic.is_active else 'inactive' }}">
+                                    {{ 'Aktywna' if lic.is_active else 'Nieaktywna' }}
+                                </span>
+                            </td>
+                            <td>
+                                <form method="POST" action="/admin/toggle_license" style="display: inline;">
+                                    <input type="hidden" name="key" value="{{ lic.key }}">
+                                    <button type="submit" class="btn {% if lic.active %}btn-warning{% else %}btn{% endif %}">
+                                        {{ "Dezaktywuj" if lic.active else "Aktywuj" }}
                                     </button>
-                                    <button class="action-btn btn-delete" onclick="deleteLicense('{{ lic.key }}')">USUŃ</button>
-                                </td>
-                            </tr>
-                            {% endfor %}
-                        </tbody>
-                    </table>
-                </div>
-
-                <div class="recent-searches">
-                    <h3>🔍 Ostatnie wyszukiwania</h3>
-                    <div id="recentSearches">
-                        {% if recent_searches %}
-                            {% for s in recent_searches %}
-                            <div class="search-item">
-                                <div class="search-key">{{ s.key }}</div>
-                                <div class="search-query">{{ s.query }}</div>
-                                <div class="search-ip">{{ s.ip }}</div>
-                                <div class="search-time">{{ s.time }}</div>
-                            </div>
-                            {% endfor %}
-                        {% else %}
-                            <div style="color:var(--text-muted); font-style:italic;">Brak ostatnich wyszukiwań</div>
-                        {% endif %}
-                    </div>
-                </div>
-
-                <div class="logs-card">
-                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
-                        <h3>📋 Logi systemowe</h3>
-                        <button class="action-btn btn-danger" onclick="clearLogs()">WYCZYŚĆ LOGI</button>
-                    </div>
-                    <div id="logsContent">
-                        {% for line in logs[-100:] | reverse %}
-                            {% set parts = line.split('] ', 1) %}
-                            {% if parts|length == 2 %}
-                                <div class="log-line">
-                                    <span class="log-timestamp">{{ parts[0][1:] }}</span>
-                                    <span class="log-action">
-                                        {% if "✅" in parts[1] or "Zalogowano" in parts[1] or "Start importu" in parts[1] %}
-                                            <span class="log-success">{{ parts[1] }}</span>
-                                        {% elif "❌" in parts[1] or "Błąd" in parts[1] or "🚨" in parts[1] or "⚠️" in parts[1] %}
-                                            <span class="log-error">{{ parts[1] }}</span>
-                                        {% else %}
-                                            {{ parts[1] }}
-                                        {% endif %}
-                                    </span>
-                                </div>
-                            {% else %}
-                                <div class="log-line">{{ line }}</div>
-                            {% endif %}
+                                </form>
+                                <form method="POST" action="/admin/delete_license" style="display: inline;">
+                                    <input type="hidden" name="key" value="{{ lic.key }}">
+                                    <button type="submit" class="btn btn-danger" onclick="return confirm('Na pewno usunąć?')">Usuń</button>
+                                </form>
+                            </td>
+                        </tr>
                         {% endfor %}
-                    </div>
-                </div>
+                    </tbody>
+                </table>
             </div>
+        </div>
+        
+        <div class="card">
+            <h2>Logi systemowe</h2>
+            <div style="max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 14px;">
+                {% for log in logs %}
+                <div style="margin-bottom: 4px; {% if 'ERROR' in log or 'BŁĄD' in log %}color: #ff3366;{% elif 'SUCCES' in log or 'OK' in log %}color: #00ffaa;{% endif %}">
+                    {{ log }}
+                </div>
+                {% endfor %}
+            </div>
+            <form method="POST" action="/admin/clear_logs" style="margin-top: 15px;">
+                <button type="submit" class="btn btn-danger" onclick="return confirm('Na pewno wyczyścić logi?')">Wyczyść logi</button>
+            </form>
+        </div>
         {% endif %}
     </div>
-
-    <!-- LOADING & NOTIFICATIONS -->
-    <div class="loading" id="loading">Trwa przetwarzanie...</div>
-    <div class="notification" id="notification"></div>
-
-    <script>
-        // Helper functions
-        const showLoading = () => document.getElementById('loading').classList.add('active');
-        const hideLoading = () => document.getElementById('loading').classList.remove('active');
-        const showNotification = (message, type = 'success') => {
-            const notif = document.getElementById('notification');
-            notif.textContent = message;
-            notif.className = `notification ${type}`;
-            notif.classList.add('show');
-            setTimeout(() => notif.classList.remove('show'), 3000);
-        };
-
-        // Form handlers
-        document.getElementById('loginForm')?.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const formData = new FormData(e.target);
-            const res = await fetch('/admin/login', {
-                method: 'POST',
-                body: formData
-            });
-            if (res.redirected) window.location.reload();
-        });
-
-        document.getElementById('generateForm')?.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            showLoading();
-            const formData = new FormData(e.target);
-            const res = await fetch('/admin/generate', {
-                method: 'POST',
-                body: formData
-            });
-            hideLoading();
-            if (res.redirected) window.location.reload();
-        });
-
-        document.getElementById('importForm')?.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            showLoading();
-            const formData = new FormData(e.target);
-            const res = await fetch('/admin/import_zip', {
-                method: 'POST',
-                body: formData
-            });
-            hideLoading();
-            if (res.redirected) {
-                showNotification('Import został uruchomiony w tle!', 'success');
-                e.target.reset();
-            }
-        });
-
-        document.getElementById('logoutBtn')?.addEventListener('click', () => {
-            fetch('/admin/logout').then(() => window.location.reload());
-        });
-        
-        document.getElementById('sendReportBtn')?.addEventListener('click', async () => {
-            if (!confirm('Na pewno wysłać raport do Discorda?')) return;
-            showLoading();
-            try {
-                const res = await fetch('/admin/send_discord_report', { method: 'POST' });
-                if (res.ok) {
-                    showNotification('Raport został wysłany do Discorda!', 'success');
-                } else {
-                    showNotification('Błąd podczas wysyłania raportu', 'error');
-                }
-            } catch (error) {
-                showNotification('Błąd połączenia', 'error');
-            }
-            hideLoading();
-        });
-
-        // Action handlers
-        async function toggleLicense(key) {
-            if (!confirm(`Na pewno ${key.startsWith('DEZ') ? 'dezaktywować' : 'aktywować'} klucz?`)) return;
-            showLoading();
-            const res = await fetch(`/admin/toggle/${key}`, { method: 'POST' });
-            hideLoading();
-            if (res.redirected) window.location.reload();
-        }
-
-        async function deleteLicense(key) {
-            if (!confirm('Na pewno usunąć ten klucz?')) return;
-            showLoading();
-            const res = await fetch(`/admin/delete/${key}`, { method: 'POST' });
-            hideLoading();
-            if (res.redirected) window.location.reload();
-        }
-
-        async function clearLogs() {
-            if (!confirm('Na pewno wyczyścić wszystkie logi?')) return;
-            showLoading();
-            const res = await fetch('/admin/clear_logs', { method: 'POST' });
-            hideLoading();
-            if (res.redirected) window.location.reload();
-        }
-    </script>
 </body>
 </html>
 """
 
-
 # === ENDPOINTY API ===
-@app.route("/api/auth", methods=["POST", "GET"])
+@app.route("/api/auth", methods=["POST"])
 def api_auth():
     try:
-        data = safe_get_json()
-        key = data.get("key") or request.args.get("key") or request.form.get("key")
-        ip = data.get("client_ip") or request.args.get("client_ip") or request.form.get("client_ip") or get_client_ip()
+        data = request.json
+        key = data.get("key")
+        ip = get_client_ip()
+        
         if not key:
             return jsonify({"success": False, "message": "Brak klucza"}), 400
-        result = lic_mgr.validate(key, ip)
-        if result["success"]:
-            threading.Thread(target=lambda: send_user_activity_notification("Udane logowanie", {"key": key, "ip": ip})).start()
-        else:
-            threading.Thread(target=lambda: send_user_activity_notification(f"Nieudane logowanie: {result['message']}", {"key": key, "ip": ip})).start()
-        return jsonify(result)
+            
+        if check_ip_ban(ip):
+            return jsonify({"success": False, "message": "Twój adres IP został zbanowany"}), 403
+            
+        if not check_rate_limit(ip):
+            return jsonify({"success": False, "message": "Przekroczono limit żądań"}), 429
+            
+        return jsonify(lic_mgr.validate(key, ip))
     except Exception as e:
-        error_msg = f"Błąd w /api/auth: {str(e)}"
-        log_activity(error_msg)
+        logger.error(f"Błąd auth: {e}")
         return jsonify({"success": False, "message": "Błąd serwera"}), 500
 
-
-@app.route("/api/license-info", methods=["POST", "GET"])
+@app.route("/api/license-info", methods=["POST"])
 def api_license_info():
     try:
-        data = safe_get_json()
-        key = data.get("key") or request.args.get("key") or request.form.get("key")
-        ip = data.get("client_ip") or request.args.get("client_ip") or request.form.get("client_ip") or get_client_ip()
+        data = request.json
+        key = data.get("key")
+        ip = get_client_ip()
+        
         if not key or not ip:
             return jsonify({"success": False, "message": "Brak klucza lub IP"}), 400
+            
         auth = lic_mgr.validate(key, ip)
         if not auth["success"]:
             return jsonify({"success": False, "message": auth["message"]}), 403
+            
         r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
-        if r.status_code != 200:
-            return jsonify({"success": False, "message": f"Błąd bazy danych: {r.status_code}"}), 500
-        data = r.json()
-        if not data:
+        if r.status_code != 200 or not r.json():
             return jsonify({"success": False, "message": "Licencja nie znaleziona"}), 404
-        lic = data[0]
-        queries_used = 0
-        try:
-            count_resp = requests.head(f"{SUPABASE_URL}/rest/v1/search_logs", headers={**SUPABASE_HEADERS, "Prefer": "count=exact"}, params={"key": f"eq.{key}"})
-            if count_resp.status_code == 206:
-                queries_used = int(count_resp.headers.get("content-range", "0-0/0").split("/")[-1])
-        except:
-            pass
-        last_search = "Nigdy"
-        try:
-            search_resp = requests.get(f"{SUPABASE_URL}/rest/v1/search_logs", headers=SUPABASE_HEADERS, params={"key": f"eq.{key}", "order": "timestamp.desc", "limit": 1, "select": "timestamp"})
-            if search_resp.status_code == 200:
-                logs = search_resp.json()
-                if logs:
-                    last_search = logs[0].get("timestamp", "Nigdy")
-        except:
-            pass
-        response_data = {
+            
+        lic = r.json()[0]
+        return jsonify({
             "success": True,
             "info": {
-                "license_type": "Premium" if lic.get("active") else "Wygasła",
-                "expiration_date": lic["expiry"].split("T")[0] if lic.get("expiry") else "Nieznana",
+                "license_type": lic.get("license_type", "standard"),
+                "expiration_date": lic["expiry"].split("T")[0],
                 "query_limit": "nieograniczony",
-                "queries_used": queries_used,
-                "last_search": last_search
+                "queries_used": 0,
+                "last_search": "Nigdy"
             }
-        }
-        return jsonify(response_data)
+        })
     except Exception as e:
-        error_msg = f"Błąd wewnętrzny /api/license-info: {str(e)}"
-        log_activity(error_msg)
+        logger.error(f"Błąd license-info: {e}")
         return jsonify({"success": False, "message": "Błąd serwera"}), 500
 
-
-@app.route("/api/search", methods=["POST", "GET"])
+@app.route("/api/search", methods=["POST"])
 def api_search():
     try:
-        data = safe_get_json()
-        key = data.get("key") or request.args.get("key") or request.form.get("key")
-        query = (data.get("query") or request.args.get("query") or request.form.get("query") or "").strip()
-        ip = data.get("client_ip") or request.args.get("client_ip") or request.form.get("client_ip") or get_client_ip()
+        data = request.json
+        key = data.get("key")
+        query = data.get("query", "").strip()
+        ip = get_client_ip()
+        
         if not key or not ip:
             return jsonify({"success": False, "message": "Brak klucza lub IP"}), 400
+            
         auth = lic_mgr.validate(key, ip)
         if not auth["success"]:
-            msg = (
-                f"⚠️ **Odrzucone wyszukiwanie**\n"
-                f"🔑 Klucz: `{key[:8]}...`\n"
-                f"🌐 IP: `{ip}`\n"
-                f"🔍 Zapytanie: `{query[:30]}...`\n"
-                f"❌ Powód: `{auth['message']}`"
-            )
-            threading.Thread(target=lambda: send_discord_notification(msg, title="🚫 Odrzucone zapytanie", color=15158332)).start()
             return jsonify(auth), 403
-        if query:
+            
+        try:
+            # Logowanie wyszukiwania
             log_payload = {"key": key, "query": query[:200], "ip": ip}
             requests.post(f"{SUPABASE_URL}/rest/v1/search_logs", headers=SUPABASE_HEADERS, json=log_payload)
-            if len(query) > 3 and not query.isdigit():
-                threading.Thread(target=lambda: send_user_activity_notification(f"Wyszukiwanie danych: {query[:30]}...", {"key": key, "ip": ip, "query": query})).start()
-        params = {"data": f"ilike.%{query}%", "select": "source,data", "limit": 150}
-        r = requests.get(f"{SUPABASE_URL}/rest/v1/leaks", headers=SUPABASE_HEADERS, params=params)
-        if r.status_code == 200:
-            results = r.json()
-            return jsonify({"success": True, "results": results})
-        else:
-            error_msg = f"Błąd wyszukiwania: {r.status_code}"
-            log_activity(error_msg)
-            return jsonify({"success": False, "message": f"Błąd bazy danych: {r.status_code}"}), 500
+        except Exception as e:
+            logger.error(f"Błąd logowania: {e}")
+        
+        # Wyszukiwanie w bazie
+        conn = get_leaks_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT source, data FROM leaks WHERE data LIKE %s LIMIT 150", (f"%{query}%",))
+        results = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        return jsonify({"success": True, "results": results})
     except Exception as e:
-        error_msg = f"Krytyczny błąd /api/search: {str(e)}"
-        log_activity(error_msg)
-        return jsonify({"success": False, "message": "Krytyczny błąd serwera"}), 500
+        logger.error(f"Błąd search: {e}")
+        return jsonify({"success": False, "message": "Błąd bazy danych"}), 500
 
-
-@app.route("/api/status", methods=["GET", "POST"])
+@app.route("/api/status", methods=["GET"])
 def api_status():
-    return jsonify({
-        "success": True,
-        "status": "online",
-        "server_time": datetime.now(timezone.utc).isoformat(),
-        "version": "2.1.1"
-    })
-
-
-# === ENDPOINTY ADMINA ===
-@app.route("/admin")
-def admin_index():
-    if not session.get("logged_in"):
-        return render_template_string(ADMIN_HTML, authenticated=False)
-
     try:
-        # Get statistics from Supabase
-        stats = {"db_count": 0, "active_keys": 0, "total_searches": 0, "unique_ips": 0, "searches_today": 0}
-        
-        # Count total leaks in database
-        try:
-            r = requests.head(f"{SUPABASE_URL}/rest/v1/leaks", headers={**SUPABASE_HEADERS, "Prefer": "count=exact"})
-            if r.status_code == 206:
-                stats["db_count"] = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
-        except:
-            pass
-        
-        # Count active licenses
-        try:
-            r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"active": "eq.true"})
-            if r.status_code == 200:
-                stats["active_keys"] = len(r.json())
-        except:
-            pass
-        
-        # Count total searches
-        try:
-            r = requests.head(f"{SUPABASE_URL}/rest/v1/search_logs", headers={**SUPABASE_HEADERS, "Prefer": "count=exact"})
-            if r.status_code == 206:
-                stats["total_searches"] = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
-        except:
-            pass
-        
-        # Count unique IPs
-        try:
-            r = requests.get(f"{SUPABASE_URL}/rest/v1/search_logs", headers=SUPABASE_HEADERS, params={"select": "ip", "ip": "not.is.null"})
-            if r.status_code == 200:
-                unique_ips_set = {sanitize_ip(item.get("ip")) for item in r.json() if item.get("ip")}
-                stats["unique_ips"] = len(unique_ips_set)
-        except:
-            pass
-        
-        # Count searches today
-        try:
-            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            r = requests.head(f"{SUPABASE_URL}/rest/v1/search_logs", 
-                           headers={**SUPABASE_HEADERS, "Prefer": "count=exact"}, 
-                           params={"timestamp": f"gte.{today}T00:00:00Z"})
-            if r.status_code == 206:
-                stats["searches_today"] = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
-        except:
-            pass
-        
-        # Get active users in last 5 minutes
-        active_users = 0
-        try:
-            five_minutes_ago = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S")
-            r = requests.head(
-                f"{SUPABASE_URL}/rest/v1/search_logs",
-                headers={**SUPABASE_HEADERS, "Prefer": "count=exact"},
-                params={"timestamp": f"gte.{five_minutes_ago}"}
-            )
-            if r.status_code == 206:
-                active_users = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
-        except:
-            pass
-        
-        # Get recent searches with sanitized IPs
-        recent_searches = []
-        try:
-            r = requests.get(f"{SUPABASE_URL}/rest/v1/search_logs", 
-                           headers=SUPABASE_HEADERS, 
-                           params={"order": "timestamp.desc", "limit": 10, "select": "key,query,ip,timestamp"})
-            if r.status_code == 200:
-                for item in r.json():
-                    ts_str = item.get("timestamp", "").replace('Z', '+00:00')
-                    try:
-                        ts = datetime.fromisoformat(ts_str)
-                    except:
-                        ts = datetime.now(timezone.utc)
-                    recent_searches.append({
-                        "key": item.get("key", "—"),
-                        "query": item.get("query", "—"),
-                        "ip": sanitize_ip(item.get("ip", "—")),  # Apply IP sanitization here
-                        "time": ts.strftime("%H:%M:%S")
-                    })
-        except:
-            pass
-        
-        # Get licenses with sanitized IPs
-        licenses = []
-        try:
-            r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", 
-                           headers=SUPABASE_HEADERS, 
-                           params={"order": "created_at.desc", "limit": 50})
-            if r.status_code == 200:
-                for item in r.json():
-                    expiry_str = item.get("expiry", "")
-                    try:
-                        expiry = datetime.fromisoformat(expiry_str.replace('Z', '+00:00'))
-                        is_active = expiry > datetime.now(timezone.utc) and item.get("active", False)
-                    except:
-                        is_active = item.get("active", False)
-                    
-                    licenses.append({
-                        "key": item.get("key", ""),
-                        "active": item.get("active", False),
-                        "is_active": is_active,
-                        "expiry": expiry_str,
-                        "ip": sanitize_ip(item.get("ip", ""))  # Apply IP sanitization here
-                    })
-        except:
-            pass
-        
-        return render_template_string(
-            ADMIN_HTML,
-            authenticated=True,
-            db_count=stats["db_count"],
-            licenses=licenses,
-            active_keys=stats["active_keys"],
-            logs=load_activity_logs(),
-            new_key=session.pop("new_key", None),
-            total_searches=stats["total_searches"],
-            unique_ips=stats["unique_ips"],
-            searches_today=stats["searches_today"],
-            recent_searches=recent_searches,
-            active_users=active_users,
-            total_searches_today=stats["searches_today"]
-        )
+        conn = get_leaks_db_connection()
+        conn.close()
+        return jsonify({"success": True, "status": "online", "version": "2.5.0"})
     except Exception as e:
-        log_activity(f"Błąd w panelu admina: {str(e)}")
-        return render_template_string(ADMIN_HTML, authenticated=False)
+        logger.error(f"Błąd statusu: {e}")
+        return jsonify({"success": False, "status": "offline"})
 
-
+# === PANEL ADMINISTRACYJNY ===
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
     if request.method == "POST":
         if request.form.get("password") == ADMIN_PASSWORD:
             session["logged_in"] = True
-            ip = get_client_ip()
-            log_activity(f"Zalogowano do panelu administracyjnego z IP: {ip}")
-            send_discord_notification(
-                f"🔒 **Administrator zalogował się do panelu kontrolnego**\n⏰ Czas: `{datetime.now().strftime('%H:%M:%S')}`",
-                title="✅ Logowanie Administratora",
-                color=3066993
-            )
+            session["admin_name"] = "Administrator"
             return redirect("/admin")
-        else:
-            log_activity(f"Nieudana próba logowania do panelu z IP: {get_client_ip()}")
-    return redirect("/admin")
+        return render_template_string(ADMIN_HTML, authenticated=False, login_error=True)
+    return render_template_string(ADMIN_HTML, authenticated=False)
 
-
-@app.route("/admin/logout")
+@app.route("/admin/logout", methods=["POST"])
 def admin_logout():
-    ip = get_client_ip()
     session.clear()
-    log_activity(f"Wylogowano z panelu administracyjnego (IP: {ip})")
-    return redirect("/admin")
+    return redirect("/admin/login")
 
-
-@app.route("/admin/generate", methods=["POST"])
-def admin_generate():
-    if not session.get("logged_in"):
-        return redirect("/admin")
-    
+@app.route("/admin")
+@admin_required
+def admin_dashboard():
     try:
-        days = int(request.form.get("days", 30))
-        if days <= 0 or days > 365:
-            raise ValueError("Invalid days value")
-    except (ValueError, TypeError):
-        days = 30
-    
-    key = lic_mgr.generate(days)
-    if key.startswith("Error:"):
-        session["error_msg"] = f"Błąd generowania klucza: {key}"
-        log_activity(f"Błąd generowania klucza: {key}, IP: {get_client_ip()}")
-    else:
-        session["new_key"] = key
-        log_activity(f"Nowy klucz wygenerowany przez administratora: {key} ({days} dni), IP: {get_client_ip()}")
-    
-    return redirect("/admin")
-
-
-@app.route("/admin/import_zip", methods=["POST"])
-def admin_import_zip():
-    if not session.get("logged_in"):
-        return redirect("/admin")
-    
-    url = request.form.get("zip_url")
-    if url and url.startswith("http"):
-        threading.Thread(target=import_leaks_worker, args=(url,), daemon=True).start()
-        log_activity(f"Administrator rozpoczął import z URL: {url}, IP: {get_client_ip()}")
-    else:
-        log_activity(f"Nieprawidłowy URL importu: {url}, IP: {get_client_ip()}")
-    
-    return redirect("/admin")
-
-
-@app.route("/admin/toggle/<key>", methods=["POST"])
-def admin_toggle(key):
-    if not session.get("logged_in"):
-        return redirect("/admin")
-    
-    try:
-        r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
-        if r.status_code == 200 and r.json():
-            current = r.json()[0]["active"]
-            new_state = not current
-            requests.patch(f"{SUPABASE_URL}/rest/v1/licenses?key=eq.{key}", headers=SUPABASE_HEADERS, json={"active": new_state})
-            status_desc = "Aktywowano" if new_state else "Dezaktywowano"
-            log_activity(f"{status_desc} klucz: {key}, IP: {get_client_ip()}")
-            msg = (
-                f"🔑 **{status_desc}**\n"
-                f"🔑 Klucz: `{key}`\n"
-                f"🔄 Nowy status: `{'Aktywny' if new_state else 'Nieaktywny'}`"
-            )
-            send_discord_notification(msg, title="🔄 Zmiana statusu licencji", color=3447003)
-    except Exception as e:
-        log_activity(f"⚠️ Błąd przełączania klucza {key}: {e}, IP: {get_client_ip()}")
-    
-    return redirect("/admin")
-
-
-@app.route("/admin/delete/<key>", methods=["POST"])
-def admin_delete(key):
-    if not session.get("logged_in"):
-        return redirect("/admin")
-    
-    try:
-        requests.delete(f"{SUPABASE_URL}/rest/v1/licenses?key=eq.{key}", headers=SUPABASE_HEADERS)
-        log_activity(f"Usunięto klucz: {key}, IP: {get_client_ip()}")
-        msg = (
-            f"🗑️ **Usunięto licencję**\n"
-            f"🔑 Klucz: `{key}`\n"
-            f"⚠️ Licencja została trwale usunięta z systemu"
-        )
-        send_discord_notification(msg, title="🗑️ Usunięcie licencji", color=15158332)
-    except Exception as e:
-        log_activity(f"⚠️ Błąd usuwania klucza {key}: {e}, IP: {get_client_ip()}")
-    
-    return redirect("/admin")
-
-
-@app.route("/admin/clear_logs", methods=["POST"])
-def admin_clear_logs():
-    if not session.get("logged_in"):
-        return redirect("/admin")
-    
-    try:
-        if LOGS_FILE.exists():
-            LOGS_FILE.unlink()
-        log_activity(f"Wyczyszczono logi systemowe, IP: {get_client_ip()}")
-        send_discord_notification(
-            "🧹 **Wyczyszczono logi systemowe**\n🗂️ Wszystkie logi zostały usunięte z serwera",
-            title="🧹 Czyszczenie logów",
-            color=10181046
-        )
-    except Exception as e:
-        log_activity(f"Błąd czyszczenia logów: {e}, IP: {get_client_ip()}")
-    
-    return redirect("/admin")
-
-
-@app.route("/admin/send_discord_report", methods=["POST"])
-def admin_send_discord_report():
-    if not session.get("logged_in"):
-        return jsonify({"success": False}), 403
-    
-    try:
-        # Get updated statistics for the report
-        stats = {"db_count": 0, "active_keys": 0, "total_searches": 0, "unique_ips": 0, "searches_today": 0}
+        # Liczba rekordów w bazie
+        conn = get_leaks_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) as count FROM leaks")
+        db_count = cursor.fetchone()[0]
+        conn.close()
         
-        # Count total leaks in database
-        try:
-            r = requests.head(f"{SUPABASE_URL}/rest/v1/leaks", headers={**SUPABASE_HEADERS, "Prefer": "count=exact"})
-            if r.status_code == 206:
-                stats["db_count"] = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
-        except:
-            pass
+        # Licencje
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"order": "created_at.desc", "limit": 10})
+        licenses = []
+        if r.status_code == 200:
+            now = datetime.now(timezone.utc)
+            for lic in r.json():
+                expiry = datetime.fromisoformat(lic["expiry"].replace('Z', '+00:00'))
+                licenses.append({
+                    "key": lic["key"],
+                    "ip": lic.get("ip", ""),
+                    "active": lic.get("active", False),
+                    "is_active": lic.get("active", False) and now < expiry,
+                    "license_type": lic.get("license_type", "standard"),
+                    "expiry": expiry.strftime("%Y-%m-%d")
+                })
         
-        # Count active licenses
-        try:
-            r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"active": "eq.true"})
-            if r.status_code == 200:
-                stats["active_keys"] = len(r.json())
-        except:
-            pass
-        
-        # Count total searches
-        try:
-            r = requests.head(f"{SUPABASE_URL}/rest/v1/search_logs", headers={**SUPABASE_HEADERS, "Prefer": "count=exact"})
-            if r.status_code == 206:
-                stats["total_searches"] = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
-        except:
-            pass
-        
-        # Count unique IPs
-        try:
-            r = requests.get(f"{SUPABASE_URL}/rest/v1/search_logs", headers=SUPABASE_HEADERS, params={"select": "ip", "ip": "not.is.null"})
-            if r.status_code == 200:
-                unique_ips_set = {sanitize_ip(item.get("ip")) for item in r.json() if item.get("ip")}
-                stats["unique_ips"] = len(unique_ips_set)
-        except:
-            pass
-        
-        # Count searches today
+        # Statystyki
+        searches_today = 0
         try:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            r = requests.head(f"{SUPABASE_URL}/rest/v1/search_logs", 
-                           headers={**SUPABASE_HEADERS, "Prefer": "count=exact"}, 
-                           params={"timestamp": f"gte.{today}T00:00:00Z"})
+            r = requests.head(f"{SUPABASE_URL}/rest/v1/search_logs", headers={**SUPABASE_HEADERS, "Prefer": "count=exact"},
+                             params={"timestamp": f"gte.{today}T00:00:00Z"})
             if r.status_code == 206:
-                stats["searches_today"] = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
-        except:
-            pass
+                searches_today = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
+        except Exception as e:
+            logger.error(f"Błąd statystyk: {e}")
         
-        report_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        message = (
-            f"📊 **Raport Systemowy - {report_time}**\n"
-            f"📈 **Statystyki Systemu:**\n"
-            f"• Rekordów w bazie: `{stats['db_count']:,}`\n"
-            f"• Aktywnych licencji: `{stats['active_keys']}`\n"
-            f"• Aktywni użytkownicy (ost. 5 min): `0`\n"
-            f"• Wyszukiwań dzisiaj: `{stats['searches_today']:,}`\n"
-            f"• Unikalne IP: `{stats['unique_ips']:,}`\n"
-            f"• Wszystkie wyszukiwania: `{stats['total_searches']:,}`\n"
-            f"\n⚙️ **Stan Serwera:**\n"
-            f"• Serwer: `{os.getenv('ENV', 'production').upper()}`\n"
-            f"• Port: `{os.getenv('PORT', '5000')}`\n"
-            f"✅ Raport wygenerowany ręcznie przez administratora"
+        # Logi
+        logs = []
+        try:
+            if os.path.exists("/tmp/activity.log"):
+                with open("/tmp/activity.log", "r") as f:
+                    logs = f.readlines()[-50:]
+                logs = [log.strip() for log in logs]
+        except Exception as e:
+            logger.error(f"Błąd logów: {e}")
+        
+        # Dane dla panelu
+        stats = {
+            "db_count": db_count,
+            "active_keys": sum(1 for lic in licenses if lic.get("is_active", False)),
+            "searches_today": searches_today,
+            "banned_ips": 3,  # Dla uproszczenia
+            "licenses": licenses,
+            "logs": logs,
+            "new_key": session.pop("new_key", None)
+        }
+        
+        return render_template_string(
+            ADMIN_HTML,
+            authenticated=True,
+            admin_name=session.get("admin_name", "Administrator"),
+            **stats
         )
-        send_discord_notification(message, title="📊 Ręczny Raport Systemowy", color=3066993)
-        log_activity(f"Administrator wysłał ręczny raport do Discorda, IP: {get_client_ip()}")
-        return jsonify({"success": True})
     except Exception as e:
-        log_activity(f"Błąd ręcznego raportu: {str(e)}, IP: {get_client_ip()}")
-        return jsonify({"success": False}), 500
+        logger.error(f"Błąd panelu: {e}")
+        return "Błąd serwera", 500
 
+@app.route("/admin/generate", methods=["POST"])
+@admin_required
+def admin_generate():
+    try:
+        days = int(request.form.get("days", 30))
+        license_type = request.form.get("license_type", "premium")
+        
+        if days < 1 or days > 365:
+            return redirect("/admin")
+            
+        new_key = lic_mgr.generate(days, license_type)
+        if new_key:
+            session["new_key"] = new_key
+    except Exception as e:
+        logger.error(f"Błąd generowania: {e}")
+    return redirect("/admin")
 
-# === ERROR HANDLERS ===
-@app.errorhandler(404)
-def not_found_error(error):
-    return jsonify({"success": False, "error": "Endpoint nie istnieje"}), 404
+@app.route("/admin/import_zip", methods=["POST"])
+@admin_required
+def admin_import_zip():
+    try:
+        zip_url = request.form.get("zip_url", "").strip()
+        if zip_url and zip_url.startswith(("http://", "https://")) and zip_url.endswith(".zip"):
+            def callback(result):
+                pass  # W praktyce można zapisać wynik w sesji
+            threading.Thread(target=import_leaks_worker, args=(zip_url, callback), daemon=True).start()
+    except Exception as e:
+        logger.error(f"Błąd importu: {e}")
+    return redirect("/admin")
 
+@app.route("/admin/toggle_license", methods=["POST"])
+@admin_required
+def admin_toggle_license():
+    try:
+        key = request.form.get("key")
+        if key:
+            r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
+            if r.status_code == 200 and r.json():
+                current = r.json()[0]["active"]
+                requests.patch(f"{SUPABASE_URL}/rest/v1/licenses?key=eq.{key}", headers=SUPABASE_HEADERS, json={"active": not current})
+    except Exception as e:
+        logger.error(f"Błąd przełączania: {e}")
+    return redirect("/admin")
 
-@app.errorhandler(500)
-def internal_error(error):
-    log_activity(f"Błąd serwera 500: {str(error)}")
-    return jsonify({"success": False, "error": "Wewnętrzny błąd serwera"}), 500
+@app.route("/admin/delete_license", methods=["POST"])
+@admin_required
+def admin_delete_license():
+    try:
+        key = request.form.get("key")
+        if key:
+            requests.delete(f"{SUPABASE_URL}/rest/v1/licenses?key=eq.{key}", headers=SUPABASE_HEADERS)
+    except Exception as e:
+        logger.error(f"Błąd usuwania: {e}")
+    return redirect("/admin")
 
+@app.route("/admin/clear_logs", methods=["POST"])
+@admin_required
+def admin_clear_logs():
+    try:
+        if os.path.exists("/tmp/activity.log"):
+            open("/tmp/activity.log", "w").close()
+    except Exception as e:
+        logger.error(f"Błąd czyszczenia logów: {e}")
+    return redirect("/admin")
 
-# === URUCHOMIENIE ===
+# === GŁÓWNY KOD ===
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    try:
-        if DISCORD_WEBHOOK_URL and DISCORD_WEBHOOK_URL.startswith("https://discord.com/api/webhooks/"):
-            threading.Thread(target=send_startup_notification).start()
-        log_activity("✅ Aplikacja została pomyślnie uruchomiona")
-    except Exception as e:
-        print(f"❌ Błąd powiadomienia startowego: {e}")
     app.run(host="0.0.0.0", port=port, debug=False)
