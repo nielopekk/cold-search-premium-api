@@ -264,8 +264,8 @@ def import_leaks_worker(zip_url):
         log_activity(error_msg)
         send_discord_notification(error_msg, title="🚨 Błąd Importu", color=15158332)
 
-# === ENDPOINT: /license-info (DODANY DLA KLIENTA) ===
-@app.route("/license-info", methods=["POST"])
+# === ENDPOINT: /license_info (DODANY DLA KLIENTA) ===
+@app.route("/license_info", methods=["POST"])
 def api_license_info():
     d = safe_get_json()
     key = d.get("key")
@@ -337,7 +337,7 @@ def api_license_info():
         })
 
     except Exception as e:
-        log_activity(f"⚠️ Błąd /license-info: {e}")
+        log_activity(f"⚠️ Błąd /license_info: {e}")
         return jsonify({"success": False, "message": "Błąd serwera"}), 500
 
 # === NOWOCZESNY PANEL ADMINA (REACT-LIKE UI) ===
