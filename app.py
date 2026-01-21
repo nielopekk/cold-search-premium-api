@@ -1447,21 +1447,32 @@ def admin_toggle(key):
                     headers=SUPABASE_HEADERS,
                     json={"active": new_state}
                 )
+                
                 if patch_resp.status_code in [200, 204]:
-                    action = f"{'Aktywowano' if new_state else 'Dezaktywowano'} klucz: {key}"
-                    log_activity(f"{action}, IP: {get_client_ip()}")
-                    # Powiadomienie do Discorda
-                    threading.Thread(target=lambda: send_discord_notification(
-                        f"🔑 **{action}**\n"
+                    status_desc = "Aktywowano" if new_state else "Dezaktywowano"
+                    action_msg = f"{status_desc} klucz: {key}"
+                    
+                    # Logowanie lokalne (bez IP)
+                    log_activity(action_msg)
+                    
+                    # Bezpieczne budowanie treści powiadomienia (fix dla Render/Python 3.13)
+                    notif_text = (
+                        f"🔑 **{status_desc}**\n"
                         f"🔑 Klucz: `{key}`\n"
-                        f"🔄 Nowy status: `{'Aktywny' if new_state else 'Nieaktywny'}`\n"
+                        f"🔄 Nowy status: `{'Aktywny' if new_state else 'Nieaktywny'}`"
+                    )
+
+                    # Powiadomienie do Discorda w osobnym wątku
+                    threading.Thread(target=lambda: send_discord_notification(
+                        message=notif_text,
                         title="🔄 Zmiana statusu licencji",
                         color=3447003
                     )).start()
+                    
     except Exception as e:
-        log_activity(f"⚠️ Błąd przełączania klucza {key}: {e}, IP: {get_client_ip()}")
+        log_activity(f"⚠️ Błąd przełączania klucza {key}: {e}")
+        
     return redirect("/admin")
-
 @app.route("/admin/delete/<key>", methods=["POST"])
 def admin_delete(key):
     """Usuwanie licencji"""
