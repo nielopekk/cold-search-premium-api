@@ -36,8 +36,9 @@ def log_activity(message):
     try:
         with LOGS_FILE.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
-    except:
-        pass
+    except Exception as e:
+        print(f"Błąd zapisu logu: {e}")
+    
     # Wysyłaj ważne logi do Discorda
     if any(keyword in message.lower() for keyword in ["błąd", "error", "niepowodzenie", "wygasł", "usunięto", "nowy klucz"]):
         send_discord_notification(f"🚨 Log systemowy: {message}")
@@ -47,14 +48,16 @@ def load_activity_logs():
         return []
     try:
         return LOGS_FILE.read_text(encoding="utf-8").strip().split("\n")
-    except:
+    except Exception as e:
+        print(f"Błąd wczytywania logów: {e}")
         return []
 
 def safe_get_json():
     try:
         data = request.get_json(force=True)
         return data if isinstance(data, dict) else {}
-    except:
+    except Exception as e:
+        print(f"Błąd parsowania JSON: {e}")
         return {}
 
 def get_active_users_count():
@@ -66,17 +69,23 @@ def get_active_users_count():
             headers={**SUPABASE_HEADERS, "Prefer": "count=exact"},
             params={"timestamp": f"gte.{five_minutes_ago}"}
         )
-        return int(r.headers.get("content-range", "0-0/0").split("/")[-1])
-    except:
+        if r.status_code == 206:  # Partial Content
+            return int(r.headers.get("content-range", "0-0/0").split("/")[-1])
+        return 0
+    except Exception as e:
+        print(f"Błąd pobierania aktywnych użytkowników: {e}")
         return 0
 
 def send_discord_notification(message, title="Cold Search Premium Alert", color=3447003):
     """Wysyła powiadomienie do Discord webhooka"""
     try:
+        if not DISCORD_WEBHOOK_URL or "placeholder" in DISCORD_WEBHOOK_URL:
+            return
+            
         embed = {
             "title": title,
             "description": message,
-            "color": color,  # Domyślny niebieski kolor
+            "color": color,
             "footer": {
                 "text": f"Cold Search Premium | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             }
@@ -90,8 +99,7 @@ def send_discord_notification(message, title="Cold Search Premium Alert", color=
         
         requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)
     except Exception as e:
-        # Nie przerywaj działania aplikacji jeśli Discord jest niedostępny
-        log_activity(f"Błąd wysyłania do Discorda: {str(e)}")
+        print(f"Błąd wysyłania do Discorda: {e}")
 
 def send_user_activity_notification(action, user_data=None):
     """Wysyła szczegółowe powiadomienie o aktywności użytkownika"""
@@ -132,7 +140,7 @@ def send_user_activity_notification(action, user_data=None):
         
         threading.Thread(target=lambda: requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)).start()
     except Exception as e:
-        log_activity(f"Błąd wysyłania szczegółowego powiadomienia: {str(e)}")
+        print(f"Błąd wysyłania szczegółowego powiadomienia: {e}")
 
 def send_startup_notification():
     """Wysyła powiadomienie o uruchomieniu aplikacji"""
@@ -150,9 +158,9 @@ def send_startup_notification():
             f"🌍 Środowisko: `{server_info['environment'].upper()}`"
         )
         
-        send_discord_notification(message, title="✅ System Online", color=3066993)  # Zielony
+        send_discord_notification(message, title="✅ System Online", color=3066993)
     except Exception as e:
-        log_activity(f"Błąd wysyłania powiadomienia startowego: {str(e)}")
+        print(f"Błąd wysyłania powiadomienia startowego: {e}")
 
 # === LICENCJE ===
 class LicenseManager:
@@ -174,25 +182,50 @@ class LicenseManager:
     def validate(self, key, ip):
         try:
             r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
+            if r.status_code != 200:
+                return {"success": False, "message": f"Błąd bazy danych: {r.status_code}"}
+                
             data = r.json()
             if not data:
                 send_user_activity_notification(f"Próba dostępu z nieistniejącym kluczem", {"key": key, "ip": ip})
                 return {"success": False, "message": "Klucz nie istnieje"}
+                
             lic = data[0]
-            expiry = datetime.fromisoformat(lic["expiry"].replace('Z', '+00:00'))
-            if not lic["active"] or datetime.now(timezone.utc) > expiry:
+            expiry_str = lic["expiry"].replace('Z', '+00:00')
+            try:
+                expiry = datetime.fromisoformat(expiry_str)
+            except:
+                # Próba alternatywnego formatu
+                expiry = datetime.strptime(expiry_str.split('.')[0], "%Y-%m-%dT%H:%M:%S")
+                
+            now = datetime.now(timezone.utc)
+            if isinstance(expiry, datetime) and expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+                
+            if not lic["active"] or now > expiry:
                 send_user_activity_notification(f"Próba dostępu z wygasłym kluczem", {"key": key, "ip": ip})
                 return {"success": False, "message": "Klucz wygasł"}
+                
             if not lic.get("ip"):
-                requests.patch(f"{SUPABASE_URL}/rest/v1/licenses?key=eq.{key}", headers=SUPABASE_HEADERS, json={"ip": ip})
+                patch_resp = requests.patch(
+                    f"{SUPABASE_URL}/rest/v1/licenses?key=eq.{key}", 
+                    headers=SUPABASE_HEADERS, 
+                    json={"ip": ip}
+                )
+                if patch_resp.status_code not in [200, 204]:
+                    return {"success": False, "message": "Błąd aktualizacji IP"}
+                    
                 send_user_activity_notification(f"Nowe IP powiązane z kluczem", {"key": key, "ip": ip})
                 return {"success": True, "message": "IP powiązane"}
+                
             if lic["ip"] != ip:
                 send_user_activity_notification(f"Próba dostępu z niepowiązanym IP", {"key": key, "ip": ip, "bound_ip": lic["ip"]})
                 return {"success": False, "message": "Inne IP przypisane"}
+                
             return {"success": True, "message": "OK"}
         except Exception as e:
-            log_activity(f"⚠️ Błąd walidacji: {e}")
+            error_msg = f"Błąd walidacji: {str(e)}"
+            log_activity(error_msg)
             return {"success": False, "message": "Błąd bazy danych"}
 
 lic_mgr = LicenseManager()
@@ -264,7 +297,7 @@ def import_leaks_worker(zip_url):
         log_activity(error_msg)
         send_discord_notification(error_msg, title="🚨 Błąd Importu", color=15158332)
 
-# === ENDPOINT: /license_info (DODANY DLA KLIENTA) ===
+# === ENDPOINT: /license_info (NAPRAWIONY DLA KLIENTA) ===
 @app.route("/license_info", methods=["POST"])
 def api_license_info():
     d = safe_get_json()
@@ -277,7 +310,7 @@ def api_license_info():
     # Walidacja (opcjonalna, ale zalecana)
     auth = lic_mgr.validate(key, ip)
     if not auth["success"]:
-        return jsonify({"success": False, "message": "Nieautoryzowany"}), 403
+        return jsonify({"success": False, "message": auth["message"]}), 403
 
     try:
         # Pobierz dane licencji
@@ -286,6 +319,10 @@ def api_license_info():
             headers=SUPABASE_HEADERS,
             params={"key": f"eq.{key}"}
         )
+        
+        if r.status_code != 200:
+            return jsonify({"success": False, "message": f"Błąd bazy danych: {r.status_code}"}), 500
+            
         data = r.json()
         if not data or len(data) == 0:
             return jsonify({"success": False, "message": "Licencja nie znaleziona"}), 404
@@ -302,8 +339,12 @@ def api_license_info():
                 headers={**SUPABASE_HEADERS, "Prefer": "count=exact"},
                 params={"key": f"eq.{key}"}
             )
-            queries_used = int(count_resp.headers.get("content-range", "0-0/0").split("/")[-1])
-        except:
+            if count_resp.status_code == 206:  # Partial Content
+                queries_used = int(count_resp.headers.get("content-range", "0-0/0").split("/")[-1])
+            else:
+                queries_used = 0
+        except Exception as e:
+            print(f"Błąd liczenia zapytań: {e}")
             queries_used = 0
 
         # Ostatnie wyszukiwanie
@@ -319,13 +360,15 @@ def api_license_info():
                     "select": "timestamp"
                 }
             )
-            logs = search_resp.json()
-            if logs and isinstance(logs, list) and len(logs) > 0:
-                last_search = logs[0].get("timestamp", "Nigdy")
-        except:
-            pass
+            if search_resp.status_code == 200:
+                logs = search_resp.json()
+                if logs and isinstance(logs, list) and len(logs) > 0:
+                    last_search = logs[0].get("timestamp", "Nigdy")
+        except Exception as e:
+            print(f"Błąd pobierania ostatniego wyszukiwania: {e}")
 
-        return jsonify({
+        # Przygotuj odpowiedź w formacie zgodnym z klientem
+        response_data = {
             "success": True,
             "info": {
                 "license_type": "Premium" if active else "Wygasła",
@@ -334,10 +377,13 @@ def api_license_info():
                 "queries_used": queries_used,
                 "last_search": last_search
             }
-        })
+        }
+        
+        return jsonify(response_data)
 
     except Exception as e:
-        log_activity(f"⚠️ Błąd /license_info: {e}")
+        error_msg = f"Błąd /license_info: {str(e)}"
+        log_activity(error_msg)
         return jsonify({"success": False, "message": "Błąd serwera"}), 500
 
 # === NOWOCZESNY PANEL ADMINA (REACT-LIKE UI) ===
@@ -1078,14 +1124,16 @@ def admin_index():
             headers={**SUPABASE_HEADERS, "Prefer": "count=exact"},
             params={"timestamp": f"gte.{today}T00:00:00Z"}
         )
-        total_searches_today = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
+        if r.status_code == 206:
+            total_searches_today = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
     except:
         pass
 
     db_count = 0
     try:
         r = requests.head(f"{SUPABASE_URL}/rest/v1/leaks", headers={**SUPABASE_HEADERS, "Prefer": "count=exact"})
-        db_count = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
+        if r.status_code == 206:
+            db_count = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
     except:
         pass
 
@@ -1093,19 +1141,25 @@ def admin_index():
     active_keys = 0
     try:
         r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"order": "created_at.desc"})
-        now = datetime.now(timezone.utc)
-        for l in r.json():
-            exp = datetime.fromisoformat(l["expiry"].replace('Z', '+00:00'))
-            is_active = l["active"] and now < exp
-            if is_active:
-                active_keys += 1
-            licenses.append({
-                "key": l["key"],
-                "ip": l.get("ip"),
-                "active": l["active"],
-                "is_active": is_active,
-                "time_left": "Aktualny"
-            })
+        if r.status_code == 200:
+            now = datetime.now(timezone.utc)
+            for l in r.json():
+                exp_str = l["expiry"].replace('Z', '+00:00')
+                try:
+                    exp = datetime.fromisoformat(exp_str)
+                except:
+                    exp = datetime.strptime(exp_str.split('.')[0], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+                    
+                is_active = l["active"] and now < exp
+                if is_active:
+                    active_keys += 1
+                licenses.append({
+                    "key": l["key"],
+                    "ip": l.get("ip"),
+                    "active": l["active"],
+                    "is_active": is_active,
+                    "time_left": "Aktualny"
+                })
     except:
         pass
 
@@ -1114,15 +1168,18 @@ def admin_index():
     searches_today = 0
     try:
         r = requests.head(f"{SUPABASE_URL}/rest/v1/search_logs", headers={**SUPABASE_HEADERS, "Prefer": "count=exact"})
-        total_searches = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
+        if r.status_code == 206:
+            total_searches = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
 
         r = requests.get(f"{SUPABASE_URL}/rest/v1/search_logs", headers=SUPABASE_HEADERS, params={"select": "ip"})
-        data = r.json()
-        unique_ips = len(set(item.get("ip") for item in data if item.get("ip")))
+        if r.status_code == 200:
+            data = r.json()
+            unique_ips = len(set(item.get("ip") for item in data if item.get("ip")))
 
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         r = requests.head(f"{SUPABASE_URL}/rest/v1/search_logs", headers={**SUPABASE_HEADERS, "Prefer": "count=exact"}, params={"timestamp": f"gte.{today}T00:00:00Z"})
-        searches_today = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
+        if r.status_code == 206:
+            searches_today = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
     except:
         pass
 
@@ -1133,19 +1190,24 @@ def admin_index():
             headers=SUPABASE_HEADERS,
             params={"order": "timestamp.desc", "limit": 10, "select": "key,query,ip,timestamp"}
         )
-        data = r.json()
-        if isinstance(data, list):
-            for item in data:
-                if isinstance(item, dict) and "timestamp" in item:
-                    ts = datetime.fromisoformat(item["timestamp"].replace('Z', '+00:00'))
-                    recent_searches.append({
-                        "key": item.get("key", "—"),
-                        "query": item.get("query", "—"),
-                        "ip": item.get("ip", "—"),
-                        "time": ts.strftime("%H:%M:%S")
-                    })
-    except:
-        pass
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and "timestamp" in item:
+                        ts_str = item["timestamp"].replace('Z', '+00:00')
+                        try:
+                            ts = datetime.fromisoformat(ts_str)
+                        except:
+                            ts = datetime.strptime(ts_str.split('.')[0], "%Y-%m-%dT%H:%M:%S")
+                        recent_searches.append({
+                            "key": item.get("key", "—"),
+                            "query": item.get("query", "—"),
+                            "ip": item.get("ip", "—"),
+                            "time": ts.strftime("%H:%M:%S")
+                        })
+    except Exception as e:
+        print(f"Błąd pobierania ostatnich wyszukiwań: {e}")
 
     return render_template_string(
         ADMIN_HTML,
@@ -1207,25 +1269,27 @@ def admin_toggle(key):
         return redirect("/admin")
     try:
         r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
-        data = r.json()
-        if data:
-            current = data[0]["active"]
-            new_state = not current
-            requests.patch(
-                f"{SUPABASE_URL}/rest/v1/licenses?key=eq.{key}",
-                headers=SUPABASE_HEADERS,
-                json={"active": new_state}
-            )
-            action = f"{'Aktywowano' if new_state else 'Dezaktywowano'} klucz: {key}"
-            log_activity(action)
-            # Powiadomienie do Discorda
-            threading.Thread(target=lambda: send_discord_notification(
-                f"🔑 **{action}**\n"
-                f"🔑 Klucz: `{key}`\n"
-                f"🔄 Nowy status: `{'Aktywny' if new_state else 'Nieaktywny'}`",
-                title="🔄 Zmiana statusu licencji",
-                color=3447003
-            )).start()
+        if r.status_code == 200:
+            data = r.json()
+            if data:
+                current = data[0]["active"]
+                new_state = not current
+                patch_resp = requests.patch(
+                    f"{SUPABASE_URL}/rest/v1/licenses?key=eq.{key}",
+                    headers=SUPABASE_HEADERS,
+                    json={"active": new_state}
+                )
+                if patch_resp.status_code in [200, 204]:
+                    action = f"{'Aktywowano' if new_state else 'Dezaktywowano'} klucz: {key}"
+                    log_activity(action)
+                    # Powiadomienie do Discorda
+                    threading.Thread(target=lambda: send_discord_notification(
+                        f"🔑 **{action}**\n"
+                        f"🔑 Klucz: `{key}`\n"
+                        f"🔄 Nowy status: `{'Aktywny' if new_state else 'Nieaktywny'}`",
+                        title="🔄 Zmiana statusu licencji",
+                        color=3447003
+                    )).start()
     except Exception as e:
         log_activity(f"⚠️ Błąd przełączania klucza: {e}")
     return redirect("/admin")
@@ -1235,20 +1299,21 @@ def admin_delete(key):
     if not session.get("logged_in"):
         return redirect("/admin")
     try:
-        requests.delete(
+        delete_resp = requests.delete(
             f"{SUPABASE_URL}/rest/v1/licenses?key=eq.{key}",
             headers=SUPABASE_HEADERS
         )
-        action = f"Usunięto klucz: {key}"
-        log_activity(action)
-        # Powiadomienie do Discorda
-        threading.Thread(target=lambda: send_discord_notification(
-            f"🗑️ **Usunięto licencję**\n"
-            f"🔑 Klucz: `{key}`\n"
-            f"⚠️ Licencja została trwale usunięta z systemu",
-            title="🗑️ Usunięcie licencji",
-            color=15158332
-        )).start()
+        if delete_resp.status_code in [200, 204]:
+            action = f"Usunięto klucz: {key}"
+            log_activity(action)
+            # Powiadomienie do Discorda
+            threading.Thread(target=lambda: send_discord_notification(
+                f"🗑️ **Usunięto licencję**\n"
+                f"🔑 Klucz: `{key}`\n"
+                f"⚠️ Licencja została trwale usunięta z systemu",
+                title="🗑️ Usunięcie licencji",
+                color=15158332
+            )).start()
     except Exception as e:
         log_activity(f"⚠️ Błąd usuwania klucza: {e}")
     return redirect("/admin")
@@ -1269,7 +1334,7 @@ def admin_clear_logs():
             color=10181046
         )).start()
     except Exception as e:
-        pass
+        print(f"Błąd czyszczenia logów: {e}")
     return redirect("/admin")
 
 # === NOWY ENDPOINT: RĘCZNE WYSŁANIE RAPORTU DO DISCORDA ===
@@ -1283,7 +1348,8 @@ def admin_send_discord_report():
         db_count = 0
         try:
             r = requests.head(f"{SUPABASE_URL}/rest/v1/leaks", headers={**SUPABASE_HEADERS, "Prefer": "count=exact"})
-            db_count = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
+            if r.status_code == 206:
+                db_count = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
         except:
             pass
             
@@ -1297,7 +1363,8 @@ def admin_send_discord_report():
                 headers={**SUPABASE_HEADERS, "Prefer": "count=exact"},
                 params={"timestamp": f"gte.{today}T00:00:00Z"}
             )
-            total_searches_today = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
+            if r.status_code == 206:
+                total_searches_today = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
         except:
             pass
         
@@ -1369,7 +1436,7 @@ def api_search():
 
     try:
         log_payload = {"key": key, "query": str(query)[:200], "ip": str(ip)}
-        requests.post(f"{SUPABASE_URL}/rest/v1/search_logs", headers=SUPABASE_HEADERS, json=log_payload)
+        log_resp = requests.post(f"{SUPABASE_URL}/rest/v1/search_logs", headers=SUPABASE_HEADERS, json=log_payload)
         
         # Powiadomienie o wyszukiwaniu (tylko dla ważnych zapytań)
         if len(query) > 3 and not query.isdigit():  # Ignoruj krótkie i numeryczne zapytania
@@ -1377,18 +1444,25 @@ def api_search():
                 f"Wyszukiwanie danych",
                 {"key": key, "ip": ip, "query": query}
             )).start()
-    except:
-        pass
+    except Exception as e:
+        print(f"Błąd logowania wyszukiwania: {e}")
 
     params = {"data": f"ilike.%{query}%", "select": "source,data", "limit": 150}
     r = requests.get(f"{SUPABASE_URL}/rest/v1/leaks", headers=SUPABASE_HEADERS, params=params)
-    return jsonify({"success": True, "results": r.json()})
+    
+    if r.status_code == 200:
+        return jsonify({"success": True, "results": r.json()})
+    else:
+        return jsonify({"success": False, "message": f"Błąd bazy danych: {r.status_code}"}), 500
 
 # === URUCHOMIENIE APLIKACJI ===
 if __name__ == "__main__":
     # Wyślij powiadomienie o uruchomieniu aplikacji
-    threading.Thread(target=send_startup_notification).start()
-    log_activity("Aplikacja została uruchomiona")
+    try:
+        threading.Thread(target=send_startup_notification).start()
+        log_activity("Aplikacja została uruchomiona")
+    except Exception as e:
+        print(f"Błąd powiadomienia startowego: {e}")
     
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
