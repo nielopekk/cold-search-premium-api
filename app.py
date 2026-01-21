@@ -5,6 +5,8 @@ import zipfile
 import tempfile
 import threading
 import logging
+import time
+import contextlib
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, render_template_string, redirect, session, url_for, flash
 from functools import wraps
@@ -20,7 +22,10 @@ DB_CONFIG = {
     "password": os.getenv("LEAKS_DB_PASS", "Wyciek12"),
     "database": os.getenv("LEAKS_DB_NAME", "cold_search_db"),
     "charset": "utf8mb4",
-    "autocommit": True
+    "autocommit": True,
+    "connection_timeout": 30,  # 30 sekund timeoutu połączenia
+    "pool_size": 30,  # Zwiększenie puli do 30 połączeń
+    "pool_reset_session": True
 }
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://wcshypmsurncfufbojvp.supabase.co").strip()
@@ -42,26 +47,76 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "cold_search_ultra_2026_fixed")
 
-# === POOL POŁĄCZEŃ MARIADB ===
-try:
-    db_pool = mysql.connector.pooling.MySQLConnectionPool(
-        pool_name="cold_pool", 
-        pool_size=20,
-        pool_reset_session=True,
-        **DB_CONFIG
-    )
-    logger.info("✅ Pula połączeń z MariaDB została pomyślnie utworzona")
-except Exception as e:
-    logger.error(f"❌ Krytyczny błąd połączenia z MariaDB: {e}")
+# === POOL POŁĄCZEŃ MARIADB Z MECHANIZMEM ODZYSKIWANIA ===
+db_pool = None
+
+def initialize_db_pool():
+    """Inicjalizuje pulę połączeń z mechanizmem ponownych prób"""
+    global db_pool
+    max_attempts = 5
+    attempt = 0
+    
+    while attempt < max_attempts:
+        try:
+            if db_pool is None:
+                logger.info(f"🚀 Próba połączenia z MariaDB (próba {attempt + 1}/{max_attempts})")
+                db_pool = mysql.connector.pooling.MySQLConnectionPool(**DB_CONFIG)
+                logger.info("✅ Pula połączeń z MariaDB została pomyślnie utworzona")
+                return True
+            return True
+        except Exception as e:
+            logger.error(f"❌ Błąd połączenia z MariaDB (próba {attempt + 1}): {e}")
+            attempt += 1
+            if attempt < max_attempts:
+                time.sleep(2 * attempt)  # Wykładnicze opóźnienie
+    
+    logger.error("❌ Krytyczny błąd: nie udało się połączyć z MariaDB po wielu próbach")
     raise SystemExit("Nie można kontynuować bez połączenia z bazą danych leaków")
 
-def get_db():
-    """Pobiera połączenie z puli z obsługą błędów"""
+def get_db_connection():
+    """Bezpiecznie pobiera połączenie z puli z timeoutem i odzyskiwaniem"""
+    global db_pool
+    
+    if db_pool is None:
+        initialize_db_pool()
+    
     try:
-        return db_pool.get_connection()
-    except Exception as e:
-        logger.error(f"❌ Błąd pobierania połączenia z puli: {e}")
-        raise
+        # Próba pobrania połączenia z timeoutem
+        conn = db_pool.get_connection()
+        logger.debug(f"🔌 Uzyskano połączenie z puli. Aktywne połączenia: {db_pool._cnx_queue.qsize()}/{db_pool._pool_size}")
+        return conn
+    except mysql.connector.Error as e:
+        logger.error(f"❌ Błąd pobierania połączenia: {e}")
+        
+        # Spróbuj odzyskać połączenia
+        if "pool exhausted" in str(e):
+            logger.warning("⚠️ Pula połączeń wyczerpana. Próba odzyskania...")
+            time.sleep(1)
+            
+            # Spróbuj ponownie z mniejszym timeoutem
+            try:
+                conn = db_pool.get_connection()
+                logger.info("✅ Połączenie odzyskane po timeout")
+                return conn
+            except:
+                pass
+        
+        # Jeśli wszystko zawiedzie, zrestartuj pulę
+        logger.warning("🔄 Restart puli połączeń...")
+        initialize_db_pool()
+        return get_db_connection()
+
+@contextlib.contextmanager
+def get_db():
+    """Context manager do bezpiecznego zarządzania połączeniami"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        yield conn
+    finally:
+        if conn is not None and conn.is_connected():
+            conn.close()
+            logger.debug(f"🔌 Połączenie zamknięte. Pozostałe w puli: {db_pool._cnx_queue.qsize()}/{db_pool._pool_size}")
 
 # === FUNKCJE POMOCNICZE ===
 def log_activity(action, details=None):
@@ -76,7 +131,7 @@ def log_activity(action, details=None):
     
     # Wysłanie do Discorda jeśli skonfigurowano
     if DISCORD_WEBHOOK_URL:
-        threading.Thread(target=send_discord_notification, args=(action, details)).start()
+        threading.Thread(target=send_discord_notification, args=(action, details), daemon=True).start()
 
 def send_discord_notification(action, details=None):
     """Wysyła powiadomienie do Discorda o aktywności administratora"""
@@ -421,23 +476,21 @@ def admin_dashboard():
     """Główny dashboard panelu administracyjnego"""
     try:
         # Statystyki z MariaDB dla leaków
-        conn = get_db()
-        cursor = conn.cursor(dictionary=True)
-        
-        # Liczba rekordów w bazie leaków
-        cursor.execute("SELECT COUNT(*) as total FROM leaks")
-        total_leaks = cursor.fetchone()['total']
-        
-        # Liczba plików źródłowych
-        cursor.execute("SELECT COUNT(DISTINCT source) as sources FROM leaks")
-        source_count = cursor.fetchone()['sources']
-        
-        # Ostatnie 5 dodanych rekordów
-        cursor.execute("SELECT data, source, created_at FROM leaks ORDER BY created_at DESC LIMIT 5")
-        recent_leaks = cursor.fetchall()
-        
-        conn.close()
-        
+        with get_db() as conn:
+            cursor = conn.cursor(dictionary=True)
+            
+            # Liczba rekordów w bazie leaków
+            cursor.execute("SELECT COUNT(*) as total FROM leaks")
+            total_leaks = cursor.fetchone()['total']
+            
+            # Liczba plików źródłowych
+            cursor.execute("SELECT COUNT(DISTINCT source) as sources FROM leaks")
+            source_count = cursor.fetchone()['sources']
+            
+            # Ostatnie 5 dodanych rekordów
+            cursor.execute("SELECT data, source, created_at FROM leaks ORDER BY created_at DESC LIMIT 5")
+            recent_leaks = cursor.fetchall()
+
         # Statystyki z Supabase
         licenses = sb_query("licenses", "order=created_at.desc")
         active_licenses = len([lic for lic in licenses if lic.get('active', False)])
@@ -728,47 +781,46 @@ def import_worker(url):
             with zipfile.ZipFile(tmp_path, 'r') as zip_ref:
                 zip_ref.extractall(tmp_dir)
             
-            # Połącz się z bazą
-            conn = get_db()
-            cursor = conn.cursor()
-            
-            # Przetwórz każdy plik
-            for root, _, files in os.walk(tmp_dir):
-                for filename in files:
-                    if filename.endswith(('.txt', '.csv', '.log')):
-                        file_path = os.path.join(root, filename)
-                        source_name = os.path.basename(file_path)
-                        
-                        try:
-                            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                                batch = []
-                                for line in f:
-                                    clean_line = line.strip()
-                                    if clean_line and len(clean_line) > 5 and len(clean_line) <= 1000:
-                                        batch.append((clean_line, source_name))
+            # Połącz się z bazą - użyj context managera do automatycznego zamknięcia
+            with get_db() as conn:
+                cursor = conn.cursor()
+                
+                # Przetwórz każdy plik
+                for root, _, files in os.walk(tmp_dir):
+                    for filename in files:
+                        if filename.endswith(('.txt', '.csv', '.log')):
+                            file_path = os.path.join(root, filename)
+                            source_name = os.path.basename(file_path)
+                            
+                            try:
+                                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                    batch = []
+                                    for line in f:
+                                        clean_line = line.strip()
+                                        if clean_line and len(clean_line) > 5 and len(clean_line) <= 1000:
+                                            batch.append((clean_line, source_name))
+                                        
+                                        if len(batch) >= 1000:
+                                            cursor.executemany(
+                                                "INSERT IGNORE INTO leaks (data, source) VALUES (%s, %s)",
+                                                batch
+                                            )
+                                            total_added += len(batch)
+                                            batch = []
                                     
-                                    if len(batch) >= 1000:
+                                    # Wstaw pozostałe rekordy
+                                    if batch:
                                         cursor.executemany(
                                             "INSERT IGNORE INTO leaks (data, source) VALUES (%s, %s)",
                                             batch
                                         )
                                         total_added += len(batch)
-                                        batch = []
-                                
-                                # Wstaw pozostałe rekordy
-                                if batch:
-                                    cursor.executemany(
-                                        "INSERT IGNORE INTO leaks (data, source) VALUES (%s, %s)",
-                                        batch
-                                    )
-                                    total_added += len(batch)
-                        
-                        except Exception as e:
-                            logger.error(f"❌ Błąd przetwarzania pliku {source_name}: {e}")
-                            log_activity("Błąd przetwarzania pliku podczas importu", f"Plik: {source_name}, błąd: {str(e)}")
-            
-            conn.commit()
-            conn.close()
+                            
+                            except Exception as e:
+                                logger.error(f"❌ Błąd przetwarzania pliku {source_name}: {e}")
+                                log_activity("Błąd przetwarzania pliku podczas importu", f"Plik: {source_name}, błąd: {str(e)}")
+                
+                conn.commit()
         
         # Usuń plik tymczasowy
         os.unlink(tmp_path)
@@ -1481,7 +1533,7 @@ admin_licenses_template = '''
             color: white;
             font-family: 'Inter', sans-serif;
             appearance: none;
-            background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23aaa' d='M7 10l5 5 5-5z'/%3E%3C/svg%3E");
+            background-image: url("image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23aaa' d='M7 10l5 5 5-5z'/%3E%3C/svg%3E");
             background-repeat: no-repeat;
             background-position: right 10px center;
             background-size: 16px;
@@ -3279,10 +3331,22 @@ def truncate_string(value, length=30):
 # === URUCHOMIENIE APLIKACJI ===
 
 if __name__ == "__main__":
+    # Inicjalizacja puli połączeń przed uruchomieniem serwera
+    initialize_db_pool()
+    
     # Logowanie uruchomienia aplikacji
     logger.info("🚀 Cold Search Premium Admin Panel został uruchomiony")
     logger.info(f"🔧 Konfiguracja MariaDB: {DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}")
     logger.info(f"🔧 Konfiguracja Supabase: {SUPABASE_URL}")
+    
+    # Sprawdź połączenie z bazą na starcie
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1")
+            logger.info("✅ Testowe połączenie z bazą danych zakończone pomyślnie")
+    except Exception as e:
+        logger.error(f"❌ Błąd testowego połączenia z bazą: {e}")
     
     # Uruchomienie serwera
     port = int(os.environ.get('PORT', 5000))
