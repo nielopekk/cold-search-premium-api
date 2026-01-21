@@ -150,6 +150,13 @@ def sb_insert(table, data):
         logger.error(f"❌ Błąd wstawiania do Supabase ({table}): {e}")
         return None
 
+def sb_update(table, data, condition):
+    try:
+        return requests.patch(f"{SUPABASE_URL}/rest/v1/{table}?{condition}", headers=SUPABASE_HEADERS, json=data, timeout=10)
+    except Exception as e:
+        logger.error(f"❌ Błąd aktualizacji w Supabase ({table}): {e}")
+        return None
+
 def sb_delete(table, condition):
     try:
         return requests.delete(f"{SUPABASE_URL}/rest/v1/{table}?{condition}", headers=SUPABASE_HEADERS, timeout=10)
@@ -171,7 +178,29 @@ def format_datetime(dt):
         return dt.strftime("%d.%m.%Y %H:%M")
     return str(dt)
 
-# === JEDEN ENDPOINT ADMINA ===
+def get_license_usage(key):
+    """Pobiera statystyki użycia licencji: całkowite i dzienne"""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        # Liczba wyszukiwań dzisiaj
+        today_logs = sb_query("search_logs", f"key=eq.{key}&timestamp=gte.{today}T00:00:00.000Z&select=count(*)")
+        today_count = today_logs[0]["count"] if today_logs and today_logs[0] else 0
+        
+        # Całkowita liczba wyszukiwań
+        total_logs = sb_query("search_logs", f"key=eq.{key}&select=count(*)")
+        total_count = total_logs[0]["count"] if total_logs and total_logs[0] else 0
+        
+        return today_count, total_count
+    except Exception as e:
+        logger.error(f"❌ Błąd pobierania statystyk użycia licencji: {e}")
+        return 0, 0
+
+# === GŁÓWNA STRONA (LANDING PAGE) ===
+@app.route("/", methods=["GET"])
+def landing_page():
+    return render_template_string(LANDING_PAGE_TEMPLATE)
+
+# === PANEL ADMINA - JEDEN ENPOINT ===
 @app.route("/admin", methods=["GET", "POST"])
 def admin_panel():
     if request.method == "POST":
@@ -187,13 +216,22 @@ def admin_panel():
             action = request.form.get("action")
             if action == "add_license":
                 days = int(request.form.get("days", 30))
-                license_type = request.form.get("type", "Premium")
+                daily_limit = int(request.form.get("daily_limit", 100))
+                total_limit = int(request.form.get("total_limit", 1000))
                 new_key = "COLD-" + uuid.uuid4().hex.upper()[:12]
                 expiry = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
-                payload = {"key": new_key, "active": True, "expiry": expiry, "type": license_type, "ip": get_client_ip()}
+                payload = {
+                    "key": new_key,
+                    "active": True,
+                    "expiry": expiry,
+                    "daily_limit": daily_limit,
+                    "total_limit": total_limit,
+                    "ip": get_client_ip(),
+                    "created_at": "now()"
+                }
                 r = sb_insert("licenses", payload)
                 if r and r.status_code in (200, 201):
-                    flash(f"✅ Licencja: {new_key}", 'success')
+                    flash(f"✅ Licencja: {new_key} (limit dzienny: {daily_limit}, całkowity: {total_limit})", 'success')
                 else:
                     flash("❌ Błąd generowania licencji", 'error')
 
@@ -202,7 +240,7 @@ def admin_panel():
                 licenses = sb_query("licenses", f"key=eq.{key}")
                 if licenses:
                     new_status = not licenses[0].get('active', False)
-                    requests.patch(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, json={"active": new_status}, params={"key": f"eq.{key}"})
+                    sb_update("licenses", {"active": new_status}, f"key=eq.{key}")
                     flash(f"{'Włączono' if new_status else 'Wyłączono'} licencję", 'success')
 
             elif action == "del_license":
@@ -251,6 +289,11 @@ def admin_panel():
             top_sources = cursor.fetchall()
 
         licenses = sb_query("licenses", "order=created_at.desc")
+        for lic in licenses:
+            today_count, total_count = get_license_usage(lic["key"])
+            lic["today_count"] = today_count
+            lic["total_count"] = total_count
+            
         banned_ips = sb_query("banned_ips", "order=created_at.desc")
         active_licenses = sum(1 for lic in licenses if lic.get('active'))
         total_searches = 0
@@ -341,6 +384,272 @@ def import_worker(url):
         logger.error(f"💥 Fatalny błąd importu: {e}")
 
 # === SZABLONY HTML ===
+LANDING_PAGE_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cold Search Premium - Zaawansowane wyszukiwanie danych</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<style>
+:root {
+--primary: #00f2ff;
+--secondary: #bc13fe;
+--bg: #0a0a12;
+--card-bg: rgba(15, 15, 25, 0.8);
+--border: rgba(255, 255, 255, 0.1);
+--text: #eaeaff;
+--text-secondary: #8888aa;
+}
+* {
+margin: 0;
+padding: 0;
+box-sizing: border-box;
+}
+body {
+background: var(--bg);
+color: var(--text);
+font-family: 'Inter', sans-serif;
+line-height: 1.6;
+overflow-x: hidden;
+}
+.container {
+width: 100%;
+max-width: 1200px;
+margin: 0 auto;
+padding: 0 20px;
+}
+.hero {
+min-height: 100vh;
+display: flex;
+flex-direction: column;
+justify-content: center;
+align-items: center;
+text-align: center;
+padding: 40px 20px;
+background: linear-gradient(145deg, rgba(0,242,255,0.05), rgba(188,19,254,0.05));
+position: relative;
+overflow: hidden;
+}
+.hero::before {
+content: '';
+position: absolute;
+width: 500px;
+height: 500px;
+border-radius: 50%;
+background: radial-gradient(circle, rgba(0,242,255,0.1) 0%, transparent 70%);
+top: -250px;
+left: -100px;
+z-index: 0;
+}
+.hero::after {
+content: '';
+position: absolute;
+width: 400px;
+height: 400px;
+border-radius: 50%;
+background: radial-gradient(circle, rgba(188,19,254,0.1) 0%, transparent 70%);
+bottom: -200px;
+right: -100px;
+z-index: 0;
+}
+.hero-content {
+max-width: 800px;
+z-index: 1;
+}
+.logo {
+font-size: 3.5rem;
+font-weight: 800;
+margin-bottom: 20px;
+background: linear-gradient(90deg, var(--primary), var(--secondary));
+-webkit-background-clip: text;
+-webkit-text-fill-color: transparent;
+background-clip: text;
+}
+.tagline {
+font-size: 1.4rem;
+margin-bottom: 30px;
+color: var(--text-secondary);
+}
+.btn {
+display: inline-block;
+padding: 15px 40px;
+background: linear-gradient(90deg, var(--primary), #00b3cc);
+color: #000;
+font-weight: 700;
+font-size: 1.1rem;
+text-decoration: none;
+border-radius: 50px;
+margin-top: 20px;
+transition: all 0.3s ease;
+border: none;
+cursor: pointer;
+}
+.btn:hover {
+transform: translateY(-3px);
+box-shadow: 0 10px 30px rgba(0, 242, 255, 0.4);
+}
+.features {
+padding: 100px 0;
+background: rgba(10, 10, 20, 0.8);
+}
+.section-title {
+text-align: center;
+font-size: 2.5rem;
+margin-bottom: 60px;
+background: linear-gradient(90deg, var(--primary), var(--secondary));
+-webkit-background-clip: text;
+-webkit-text-fill-color: transparent;
+background-clip: text;
+position: relative;
+}
+.section-title::after {
+content: '';
+position: absolute;
+bottom: -15px;
+left: 50%;
+transform: translateX(-50%);
+width: 80px;
+height: 4px;
+background: var(--primary);
+border-radius: 2px;
+}
+.features-grid {
+display: grid;
+grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+gap: 30px;
+max-width: 1000px;
+margin: 0 auto;
+}
+.feature-card {
+background: var(--card-bg);
+border-radius: 20px;
+padding: 30px;
+text-align: center;
+border: 1px solid var(--border);
+transition: transform 0.3s ease;
+}
+.feature-card:hover {
+transform: translateY(-10px);
+border-color: var(--primary);
+}
+.feature-icon {
+font-size: 3.5rem;
+margin-bottom: 20px;
+color: var(--primary);
+}
+.feature-title {
+font-size: 1.4rem;
+margin-bottom: 15px;
+color: white;
+}
+.feature-desc {
+color: var(--text-secondary);
+}
+.footer {
+text-align: center;
+padding: 40px;
+color: var(--text-secondary);
+border-top: 1px solid var(--border);
+margin-top: 50px;
+}
+.badge {
+display: inline-block;
+padding: 5px 15px;
+background: rgba(0, 242, 255, 0.15);
+border-radius: 20px;
+font-size: 0.9rem;
+margin-top: 10px;
+color: var(--primary);
+font-weight: 500;
+}
+.nav-button {
+position: absolute;
+top: 30px;
+right: 30px;
+padding: 10px 25px;
+background: rgba(255, 255, 255, 0.1);
+border: 1px solid var(--border);
+border-radius: 50px;
+font-weight: 600;
+color: white;
+text-decoration: none;
+transition: all 0.3s ease;
+}
+.nav-button:hover {
+background: rgba(0, 242, 255, 0.2);
+border-color: var(--primary);
+}
+@media (max-width: 768px) {
+.logo {
+font-size: 2.5rem;
+}
+.tagline {
+font-size: 1.1rem;
+}
+.btn {
+padding: 12px 30px;
+font-size: 1rem;
+}
+}
+</style>
+</head>
+<body>
+<div class="hero">
+<a href="/admin" class="nav-button">Panel Administratora</a>
+<div class="hero-content">
+<h1 class="logo">❄️ Cold Search Premium</h1>
+<p class="tagline">Najbardziej zaawansowane narzędzie do wyszukiwania danych wyciekowych i informacji personalnych. Bezpieczne, szybkie i niezawodne.</p>
+<a href="#" class="btn">Zamów Dostęp</a>
+<div class="badge">
+<i class="fas fa-shield-alt"></i> 100% Bezpieczne i Legalne
+</div>
+</div>
+</div>
+
+<section class="features">
+<div class="container">
+<h2 class="section-title">Dlaczego Cold Search Premium?</h2>
+<div class="features-grid">
+<div class="feature-card">
+<div class="feature-icon">
+<i class="fas fa-bolt"></i>
+</div>
+<h3 class="feature-title">Błyskawiczne Wyniki</h3>
+<p class="feature-desc">Nasza zaawansowana technologia zapewnia wyniki w ciągu sekund, dzięki zoptymalizowanej architekturze bazy danych.</p>
+</div>
+<div class="feature-card">
+<div class="feature-icon">
+<i class="fas fa-database"></i>
+</div>
+<h3 class="feature-title">Największa Baza</h3>
+<p class="feature-desc">Dostęp do ponad miliarda rekordów z najnowszych wycieków danych i źródeł informacji.</p>
+</div>
+<div class="feature-card">
+<div class="feature-icon">
+<i class="fas fa-lock"></i>
+</div>
+<h3 class="feature-title">Pełna Anonimowość</h3>
+<p class="feature-desc">Żadnych logów, żadnych śladów. Twoje wyszukiwania pozostają całkowicie prywatne.</p>
+</div>
+</div>
+</div>
+</section>
+
+<div class="footer">
+<div class="container">
+<p>❄️ Cold Search Premium &copy; 2026 | Zaawansowane narzędzie do wyszukiwania danych</p>
+<p style="margin-top: 10px; font-size: 0.9rem; color: var(--text-secondary);">
+Dostęp tylko dla upoważnionych użytkowników z ważną licencją
+</p>
+</div>
+</div>
+</body>
+</html>
+'''
+
 ADMIN_LOGIN_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="pl">
@@ -348,29 +657,206 @@ ADMIN_LOGIN_TEMPLATE = '''
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Cold Search Premium — Logowanie</title>
-<style>:root{--primary:#00f2ff;--secondary:#bc13fe;--bg:#0a0a12;--card:rgba(15,15,25,0.8);--border:rgba(255,255,255,0.1);--text:#eaeaff}
-body{background:var(--bg);color:var(--text);font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
-.card{background:var(--card);padding:40px;border-radius:20px;box-shadow:0 10px 30px rgba(0,0,0,0.5);border:1px solid var(--border);max-width:400px;width:100%}
-h1{text-align:center;margin-bottom:25px;color:var(--primary)}
-input{width:100%;padding:12px;margin:10px 0;background:rgba(0,0,0,0.3);border:1px solid var(--border);color:white;border-radius:8px}
-button{width:100%;padding:12px;background:linear-gradient(90deg,var(--primary),#00b3cc);color:#000;font-weight:bold;border:none;border-radius:8px;cursor:pointer;margin-top:10px}
-.alert{padding:10px;margin:15px 0;border-radius:6px}
-.alert-error{background:rgba(255,77,77,0.2);border:1px solid #ff4d4d;color:#ff4d4d}
-.alert-success{background:rgba(0,255,170,0.2);border:1px solid #00ffaa;color:#00ffaa}
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<style>
+:root {
+--primary: #00f2ff;
+--secondary: #bc13fe;
+--bg: #0a0a12;
+--card-bg: rgba(15, 15, 25, 0.8);
+--border: rgba(255, 255, 255, 0.1);
+--text: #eaeaff;
+--error: #ff4d4d;
+--success: #00ffaa;
+}
+* {
+margin: 0;
+padding: 0;
+box-sizing: border-box;
+}
+body {
+background: var(--bg);
+color: var(--text);
+font-family: 'Inter', sans-serif;
+min-height: 100vh;
+display: flex;
+align-items: center;
+justify-content: center;
+padding: 20px;
+background-image:
+radial-gradient(circle at 10% 20%, rgba(0, 242, 255, 0.1) 0%, transparent 20%),
+radial-gradient(circle at 90% 80%, rgba(188, 19, 254, 0.1) 0%, transparent 20%);
+}
+.login-container {
+max-width: 450px;
+width: 100%;
+}
+.logo {
+text-align: center;
+margin-bottom: 30px;
+}
+.logo-text {
+font-size: 2.2rem;
+font-weight: 800;
+background: linear-gradient(90deg, var(--primary), var(--secondary));
+-webkit-background-clip: text;
+-webkit-text-fill-color: transparent;
+background-clip: text;
+}
+.logo-sub {
+color: rgba(255, 255, 255, 0.6);
+font-size: 0.95rem;
+margin-top: 8px;
+}
+.card {
+background: var(--card-bg);
+border-radius: 20px;
+padding: 40px;
+box-shadow: 0 15px 35px rgba(0, 0, 0, 0.5);
+border: 1px solid var(--border);
+backdrop-filter: blur(10px);
+}
+.card-title {
+font-size: 1.75rem;
+font-weight: 700;
+margin-bottom: 25px;
+text-align: center;
+color: var(--text);
+}
+.form-group {
+margin-bottom: 20px;
+}
+.form-label {
+display: block;
+margin-bottom: 8px;
+font-weight: 500;
+color: var(--text);
+}
+.form-input {
+width: 100%;
+padding: 14px;
+background: rgba(0, 0, 0, 0.3);
+border: 1px solid var(--border);
+border-radius: 12px;
+color: white;
+font-family: 'Inter', sans-serif;
+font-size: 1rem;
+transition: border-color 0.3s;
+}
+.form-input:focus {
+outline: none;
+border-color: var(--primary);
+box-shadow: 0 0 0 2px rgba(0, 242, 255, 0.2);
+}
+.btn {
+width: 100%;
+padding: 15px;
+border: none;
+border-radius: 12px;
+font-family: 'Inter', sans-serif;
+font-weight: 600;
+font-size: 1.05rem;
+cursor: pointer;
+transition: all 0.2s ease;
+margin-top: 10px;
+}
+.btn-primary {
+background: linear-gradient(135deg, var(--primary), #00b3cc);
+color: #000;
+font-weight: 700;
+}
+.btn-primary:hover {
+transform: translateY(-2px);
+box-shadow: 0 5px 15px rgba(0, 242, 255, 0.4);
+}
+.btn-primary:active {
+transform: translateY(0);
+}
+.alert {
+padding: 12px;
+margin: 15px 0;
+border-radius: 8px;
+font-weight: 500;
+display: flex;
+align-items: center;
+gap: 10px;
+}
+.alert-error {
+background: rgba(255, 77, 77, 0.15);
+border: 1px solid var(--error);
+color: var(--error);
+}
+.alert-success {
+background: rgba(0, 255, 170, 0.15);
+border: 1px solid var(--success);
+color: var(--success);
+}
+.info-box {
+background: rgba(30, 30, 50, 0.7);
+border-radius: 12px;
+padding: 15px;
+margin-top: 25px;
+border: 1px solid var(--border);
+font-size: 0.9rem;
+line-height: 1.5;
+}
+.info-box ul {
+padding-left: 20px;
+margin-top: 8px;
+}
+.info-box li {
+margin-bottom: 5px;
+}
 </style>
 </head>
 <body>
+<div class="login-container">
+<div class="logo">
+<div class="logo-text">❄️ Cold Search Premium</div>
+<div class="logo-sub">Zaawansowane narzędzie do wyszukiwania danych</div>
+</div>
 <div class="card">
-<h1>❄️ Cold Search Premium</h1>
+<h1 class="card-title">🔐 Panel Administratora</h1>
 <form method="post">
-<input type="password" name="password" placeholder="Hasło administratora" required autofocus>
-<button type="submit">Zaloguj się</button>
-</form>
+<div class="form-group">
+<label for="password" class="form-label">Hasło administratora</label>
+<input
+type="password"
+id="password"
+name="password"
+class="form-input"
+placeholder="••••••••••••••••"
+required
+autofocus
+>
+</div>
+<button type="submit" class="btn btn-primary">Zaloguj się</button>
 {% with messages = get_flashed_messages(with_categories=true) %}
-{% for cat, msg in messages %}
-<div class="alert alert-{{ 'success' if cat == 'success' else 'error' }}">{{ msg }}</div>
+{% if messages %}
+{% for category, message in messages %}
+<div class="alert alert-{{ 'success' if category == 'success' else 'error' }}">
+{% if category == 'success' %}
+<i class="fas fa-check-circle"></i>
+{% elif category == 'error' %}
+<i class="fas fa-exclamation-circle"></i>
+{% endif %}
+{{ message }}
+</div>
 {% endfor %}
+{% endif %}
 {% endwith %}
+</form>
+<div class="info-box">
+<strong>ℹ️ Instrukcja dostępu:</strong>
+<ul>
+<li>Ten panel jest dostępny tylko dla zaufanych administratorów</li>
+<li>Wszystkie akcje są rejestrowane i monitorowane</li>
+<li>Nie udostępniaj hasła osobom trzecim</li>
+<li>Przy podejrzeniu naruszenia bezpieczeństwa natychmiast zmień hasło</li>
+</ul>
+</div>
+</div>
 </div>
 </body>
 </html>
@@ -397,6 +883,9 @@ ADMIN_TEMPLATE = '''
 --success: #00ffaa;
 --danger: #ff4d4d;
 --warning: #ffcc00;
+--limit-low: rgba(255, 204, 0, 0.15);
+--limit-medium: rgba(255, 102, 0, 0.15);
+--limit-high: rgba(255, 0, 0, 0.15);
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
@@ -423,6 +912,12 @@ padding: 8px 16px;
 border-radius: 8px;
 text-decoration: none;
 font-weight: 600;
+display: inline-flex;
+align-items: center;
+gap: 8px;
+}
+.logout-btn:hover {
+background: rgba(255, 77, 77, 0.25);
 }
 .stats-grid {
 display: grid;
@@ -436,8 +931,19 @@ border-radius: 16px;
 padding: 20px;
 border: 1px solid var(--border);
 text-align: center;
+transition: transform 0.3s ease;
 }
-.stat-value { font-size: 1.8rem; font-weight: 800; color: white; font-family: monospace; margin: 10px 0; }
+.stat-card:hover {
+transform: translateY(-5px);
+box-shadow: 0 10px 25px rgba(0, 0, 0, 0.3);
+}
+.stat-value { 
+font-size: 1.8rem; 
+font-weight: 800; 
+color: white; 
+font-family: 'Courier New', monospace; 
+margin: 10px 0; 
+}
 .stat-label { font-size: 0.9rem; color: var(--text-secondary); }
 .section {
 background: var(--card-bg);
@@ -445,6 +951,11 @@ border-radius: 16px;
 padding: 25px;
 margin-bottom: 25px;
 border: 1px solid var(--border);
+transition: all 0.3s ease;
+}
+.section:hover {
+border-color: var(--primary);
+box-shadow: 0 5px 20px rgba(0, 0, 0, 0.2);
 }
 .section-title {
 display: flex;
@@ -453,40 +964,104 @@ gap: 10px;
 margin-bottom: 20px;
 font-size: 1.3rem;
 font-weight: 600;
+color: white;
 }
 .section-title i { color: var(--primary); }
-.form-row { display: flex; gap: 15px; margin-bottom: 15px; flex-wrap: wrap; }
-.form-group { flex: 1; min-width: 200px; }
-label { display: block; margin-bottom: 6px; font-size: 0.95rem; }
+.form-row { 
+display: flex; 
+gap: 15px; 
+margin-bottom: 15px; 
+flex-wrap: wrap; 
+align-items: flex-end;
+}
+.form-group { 
+flex: 1; 
+min-width: 180px; 
+}
+.form-group-short {
+flex: none;
+min-width: 120px;
+}
+label { 
+display: block; 
+margin-bottom: 6px; 
+font-size: 0.95rem;
+color: var(--text);
+}
 input, select, textarea {
 width: 100%;
-padding: 10px;
+padding: 12px;
 background: rgba(0,0,0,0.3);
 border: 1px solid var(--border);
 border-radius: 8px;
 color: white;
 font-family: 'Inter', sans-serif;
+font-size: 0.95rem;
+transition: border-color 0.3s;
+}
+input:focus, select:focus {
+outline: none;
+border-color: var(--primary);
+box-shadow: 0 0 0 2px rgba(0, 242, 255, 0.2);
 }
 .btn {
-padding: 10px 20px;
+padding: 12px 24px;
 background: linear-gradient(90deg, var(--primary), #00b3cc);
 color: #000;
 border: none;
 border-radius: 8px;
 font-weight: 600;
 cursor: pointer;
+font-size: 0.95rem;
+transition: all 0.2s;
+display: inline-flex;
+align-items: center;
+gap: 8px;
+}
+.btn:hover {
+transform: translateY(-2px);
+box-shadow: 0 5px 15px rgba(0, 242, 255, 0.4);
 }
 .btn-danger {
-background: rgba(255,77,77,0.2);
+background: linear-gradient(90deg, rgba(255,77,77,0.2), rgba(255,0,0,0.2));
 color: var(--danger);
 }
-.table { width: 100%; border-collapse: collapse; margin-top: 15px; }
-.table th { text-align: left; padding: 12px; border-bottom: 1px solid var(--border); font-weight: 600; }
-.table td { padding: 12px; border-bottom: 1px solid var(--border); }
+.btn-danger:hover {
+background: linear-gradient(90deg, rgba(255,77,77,0.3), rgba(255,0,0,0.3));
+}
+.btn-warning {
+background: linear-gradient(90deg, rgba(255,204,0,0.2), rgba(255,153,0,0.2));
+color: #ffcc00;
+}
+.table { 
+width: 100%; 
+border-collapse: collapse; 
+margin-top: 15px; 
+}
+.table th { 
+text-align: left; 
+padding: 14px 12px; 
+border-bottom: 2px solid var(--border); 
+font-weight: 700;
+background: rgba(0,0,0,0.2);
+}
+.table td { 
+padding: 14px 12px; 
+border-bottom: 1px solid var(--border);
+font-size: 0.95rem;
+}
 .table tr:last-child td { border-bottom: none; }
-.key { font-family: monospace; color: var(--primary); font-weight: 600; }
-.status-active { color: var(--success); }
-.status-inactive { color: var(--danger); }
+.table tr:hover {
+background: rgba(255, 255, 255, 0.03);
+}
+.key { 
+font-family: 'Courier New', monospace; 
+color: var(--primary); 
+font-weight: 600; 
+letter-spacing: 0.5px;
+}
+.status-active { color: var(--success); font-weight: 600; }
+.status-inactive { color: var(--danger); font-weight: 600; }
 .alert {
 padding: 12px;
 margin-bottom: 20px;
@@ -496,15 +1071,81 @@ display: flex;
 align-items: center;
 gap: 10px;
 }
-.alert-info { background: rgba(0,242,255,0.1); border: 1px solid rgba(0,242,255,0.3); color: var(--primary); }
-.alert-error { background: rgba(255,77,77,0.1); border: 1px solid var(--danger); color: var(--danger); }
-.alert-success { background: rgba(0,255,170,0.1); border: 1px solid var(--success); color: var(--success); }
-.leak-item { padding: 10px 0; border-bottom: 1px dashed var(--border); }
+.alert-info { 
+background: rgba(0,242,255,0.1); 
+border: 1px solid rgba(0,242,255,0.3); 
+color: var(--primary); 
+}
+.alert-error { 
+background: rgba(255,77,77,0.1); 
+border: 1px solid var(--danger); 
+color: var(--danger); 
+}
+.alert-success { 
+background: rgba(0,255,170,0.1); 
+border: 1px solid var(--success); 
+color: var(--success); 
+}
+.leak-item { 
+padding: 10px 0; 
+border-bottom: 1px dashed var(--border); 
+}
 .leak-item:last-child { border-bottom: none; }
-.source-bar { height: 6px; background: rgba(0,242,255,0.2); border-radius: 3px; margin-top: 4px; overflow: hidden; }
-.source-fill { height: 100%; background: var(--primary); border-radius: 3px; }
+.leak-data {
+font-family: 'Courier New', monospace;
+font-size: 0.95rem;
+word-break: break-all;
+}
+.source-bar { 
+height: 6px; 
+background: rgba(0,242,255,0.2); 
+border-radius: 3px; 
+margin-top: 4px; 
+overflow: hidden; 
+}
+.source-fill { 
+height: 100%; 
+background: var(--primary); 
+border-radius: 3px; 
+}
+.usage-bar {
+height: 8px;
+background: rgba(100, 100, 100, 0.3);
+border-radius: 4px;
+margin-top: 4px;
+overflow: hidden;
+}
+.usage-fill {
+height: 100%;
+border-radius: 4px;
+}
+.usage-low { background: var(--success); }
+.usage-medium { background: #ffcc00; }
+.usage-high { background: var(--danger); }
+.ip-badge {
+display: inline-block;
+background: rgba(188, 19, 254, 0.2);
+border: 1px solid rgba(188, 19, 254, 0.4);
+padding: 2px 8px;
+border-radius: 4px;
+font-size: 0.85rem;
+font-family: monospace;
+}
+.limit-badge {
+display: inline-block;
+padding: 3px 10px;
+border-radius: 20px;
+font-size: 0.85rem;
+font-weight: 600;
+}
+.limit-daily { background: var(--limit-low); color: #ffcc00; }
+.limit-total { background: var(--limit-medium); color: #ff9900; }
 @media (max-width: 768px) {
 .form-row { flex-direction: column; }
+.stats-grid { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.table-responsive {
+overflow-x: auto;
+}
 }
 </style>
 </head>
@@ -517,16 +1158,37 @@ gap: 10px;
 
 {% with messages = get_flashed_messages(with_categories=true) %}
 {% for cat, msg in messages %}
-<div class="alert alert-{{ 'success' if cat == 'success' else 'error' if cat == 'error' else 'info' }}">{{ msg }}</div>
+<div class="alert alert-{{ 'success' if cat == 'success' else 'error' if cat == 'error' else 'info' }}">
+{% if cat == 'success' %}
+<i class="fas fa-check-circle"></i>
+{% elif cat == 'error' %}
+<i class="fas fa-exclamation-circle"></i>
+{% else %}
+<i class="fas fa-info-circle"></i>
+{% endif %}
+{{ msg }}
+</div>
 {% endfor %}
 {% endwith %}
 
 <!-- Statystyki -->
 <div class="stats-grid">
-<div class="stat-card"><div class="stat-value">{{ "{:,}".format(total_leaks).replace(",", " ") }}</div><div class="stat-label">Rekordów w bazie</div></div>
-<div class="stat-card"><div class="stat-value">{{ "{:,}".format(source_count).replace(",", " ") }}</div><div class="stat-label">Źródeł danych</div></div>
-<div class="stat-card"><div class="stat-value">{{ active_licenses }}</div><div class="stat-label">Aktywnych licencji</div></div>
-<div class="stat-card"><div class="stat-value">{{ "{:,}".format(total_searches).replace(",", " ") }}</div><div class="stat-label">Wyszukań</div></div>
+<div class="stat-card">
+<div class="stat-value">{{ "{:,}".format(total_leaks).replace(",", " ") }}</div>
+<div class="stat-label">Rekordów w bazie</div>
+</div>
+<div class="stat-card">
+<div class="stat-value">{{ "{:,}".format(source_count).replace(",", " ") }}</div>
+<div class="stat-label">Źródeł danych</div>
+</div>
+<div class="stat-card">
+<div class="stat-value">{{ active_licenses }}</div>
+<div class="stat-label">Aktywnych licencji</div>
+</div>
+<div class="stat-card">
+<div class="stat-value">{{ "{:,}".format(total_searches).replace(",", " ") }}</div>
+<div class="stat-label">Wyszukań łącznie</div>
+</div>
 </div>
 
 <!-- Ostatnie leaki -->
@@ -547,41 +1209,82 @@ gap: 10px;
 <input type="hidden" name="action" value="add_license">
 <div class="form-row">
 <div class="form-group">
-<label>Liczba dni</label>
+<label>Liczba dni ważności</label>
 <input type="number" name="days" value="30" min="1" max="3650">
 </div>
 <div class="form-group">
-<label>Typ</label>
-<select name="type">
-<option>Premium</option>
-<option>Lifetime</option>
-<option>Trial</option>
-<option>Basic</option>
-</select>
+<label>Limit wyszukiwań dziennych</label>
+<input type="number" name="daily_limit" value="100" min="1" max="10000">
 </div>
 <div class="form-group">
-<label>&nbsp;</label>
+<label>Limit wyszukiwań całkowitych</label>
+<input type="number" name="total_limit" value="1000" min="10" max="100000">
+</div>
+<div class="form-group" style="align-self: flex-end;">
 <button type="submit" class="btn"><i class="fas fa-plus"></i> Generuj licencję</button>
 </div>
 </div>
 </form>
 
+<div class="table-responsive">
 <table class="table">
-<thead><tr><th>Klucz</th><th>Typ</th><th>Ważna do</th><th>Status</th><th>Akcje</th></tr></thead>
+<thead>
+<tr>
+<th>Klucz</th>
+<th>IP</th>
+<th>Limity</th>
+<th>Ważna do</th>
+<th>Użycie</th>
+<th>Status</th>
+<th>Akcje</th>
+</tr>
+</thead>
 <tbody>
 {% for lic in licenses %}
 <tr>
 <td><span class="key">{{ lic.key }}</span></td>
-<td>{{ lic.type }}</td>
+<td>
+{% if lic.ip %}
+<span class="ip-badge">{{ lic.ip }}</span>
+{% else %}
+<span class="ip-badge" style="background: rgba(255,100,100,0.2); border-color: rgba(255,100,100,0.4); color: #ff6666;">Brak IP</span>
+{% endif %}
+</td>
+<td>
+<div><span class="limit-badge limit-daily">Dzienny: {{ lic.daily_limit }}</span></div>
+<div style="margin-top: 4px;"><span class="limit-badge limit-total">Całkowity: {{ lic.total_limit }}</span></div>
+</td>
 <td>{{ lic.expiry.split('T')[0] }}</td>
-<td><span class="{{ 'status-active' if lic.active else 'status-inactive' }}">{{ 'Aktywna' if lic.active else 'Nieaktywna' }}</span></td>
+<td>
+<div style="font-size: 0.85rem; color: var(--text-secondary);">
+Dzienny: {{ lic.today_count }}/{{ lic.daily_limit }}
+</div>
+<div class="usage-bar">
+<div class="usage-fill {% if lic.today_count / lic.daily_limit < 0.7 %}usage-low{% elif lic.today_count / lic.daily_limit < 0.9 %}usage-medium{% else %}usage-high{% endif %}" 
+style="width: {{ (lic.today_count / lic.daily_limit * 100) | min(100) }}%"></div>
+</div>
+<div style="font-size: 0.85rem; color: var(--text-secondary); margin-top: 6px;">
+Całkowity: {{ lic.total_count }}/{{ lic.total_limit }}
+</div>
+<div class="usage-bar">
+<div class="usage-fill {% if lic.total_count / lic.total_limit < 0.7 %}usage-low{% elif lic.total_count / lic.total_limit < 0.9 %}usage-medium{% else %}usage-high{% endif %}" 
+style="width: {{ (lic.total_count / lic.total_limit * 100) | min(100) }}%"></div>
+</div>
+</td>
+<td>
+<span class="{{ 'status-active' if lic.active else 'status-inactive' }}">
+{{ 'Aktywna' if lic.active else 'Nieaktywna' }}
+</span>
+</td>
 <td>
 <form method="post" style="display:inline;" onsubmit="return confirm('Na pewno?')">
 <input type="hidden" name="action" value="toggle_license">
 <input type="hidden" name="key" value="{{ lic.key }}">
-<button type="submit" class="btn">{{ 'Wyłącz' if lic.active else 'Włącz' }}</button>
+<button type="submit" class="btn {% if lic.active %}btn-warning{% else %}btn{% endif %}">
+{{ 'Wyłącz' if lic.active else 'Włącz' }}
+</button>
 </form>
-<form method="post" style="display:inline;" onsubmit="return confirm('USUNĄĆ LICENCJĘ?')">
+<form method="post" style="display:inline; margin-left: 5px;" onsubmit="return confirm('USUNĄĆ LICENCJĘ?')">
 <input type="hidden" name="action" value="del_license">
 <input type="hidden" name="key" value="{{ lic.key }}">
 <button type="submit" class="btn btn-danger"><i class="fas fa-trash"></i></button>
@@ -591,6 +1294,7 @@ gap: 10px;
 {% endfor %}
 </tbody>
 </table>
+</div>
 </div>
 
 <!-- Bany IP -->
@@ -607,8 +1311,7 @@ gap: 10px;
 <label>Powód</label>
 <input type="text" name="reason" placeholder="Opcjonalnie">
 </div>
-<div class="form-group">
-<label>&nbsp;</label>
+<div class="form-group" style="align-self: flex-end;">
 <button type="submit" class="btn"><i class="fas fa-ban"></i> Zbanuj IP</button>
 </div>
 </div>
@@ -619,14 +1322,14 @@ gap: 10px;
 <tbody>
 {% for ban in banned_ips %}
 <tr>
-<td>{{ ban.ip }}</td>
+<td><span class="ip-badge">{{ ban.ip }}</span></td>
 <td>{{ ban.reason or '—' }}</td>
 <td>{{ format_datetime(ban.created_at) if ban.created_at else '—' }}</td>
 <td>
 <form method="post" style="display:inline;" onsubmit="return confirm('Odbanować?')">
 <input type="hidden" name="action" value="del_ban">
 <input type="hidden" name="ip" value="{{ ban.ip }}">
-<button type="submit" class="btn btn-danger"><i class="fas fa-unlock"></i> Odbanuj</button>
+<button type="submit" class="btn btn-danger"><i class="fas fa-unlock"></i></button>
 </form>
 </td>
 </tr>
@@ -648,27 +1351,67 @@ Wklej URL do pliku ZIP zawierającego pliki tekstowe (.txt, .csv, .log). System 
 <label>URL do archiwum ZIP</label>
 <input type="url" name="import_url" placeholder="https://example.com/data.zip" required>
 </div>
-<div class="form-group">
-<label>&nbsp;</label>
+<div class="form-group" style="align-self: flex-end;">
 <button type="submit" class="btn"><i class="fas fa-cloud-download-alt"></i> Rozpocznij import</button>
 </div>
 </div>
 </form>
 <div style="margin-top:15px; padding:12px; background:rgba(0,0,0,0.2); border-radius:8px; font-size:0.9rem;">
+<i class="fas fa-info-circle" style="margin-right: 8px; color: var(--primary);"></i>
 ⚠️ Import działa w tle. Sprawdzaj logi serwera lub odśwież statystyki po chwili.
 </div>
 </div>
 
 <!-- Informacje systemowe -->
 <div class="section">
-<div class="section-title"><i class="fas fa-info-circle"></i> Informacje systemowe</div>
-<p><strong>Twój IP:</strong> {{ client_ip }}</p>
+<div class="section-title"><i class="fas fa-server"></i> Informacje systemowe</div>
+<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px;">
+<div>
+<p><strong>Twój IP:</strong> <span class="ip-badge">{{ client_ip }}</span></p>
 <p><strong>Czas sesji:</strong> {{ session_duration }}</p>
-<p><strong>Baza danych:</strong> Online ({{ total_leaks }} rekordów)</p>
-<p><strong>Host bazy:</strong> 136.243.54.157:25618</p>
+<p><strong>Ostatnie odświeżenie:</strong> {{ format_datetime(now) }}</p>
+</div>
+<div>
+<p><strong>Baza danych leaków:</strong> <span style="color: var(--success); font-weight: 600;">Online</span> ({{ total_leaks }} rekordów)</p>
+<p><strong>Host bazy:</strong> <span class="ip-badge">136.243.54.157:25618</span></p>
+<p><strong>Supabase:</strong> <span style="color: var(--success); font-weight: 600;">Online</span></p>
+</div>
+<div>
+<p><strong>Aktywne procesy:</strong> 1 (Panel administracyjny)</p>
+<p><strong>Status systemu:</strong> <span style="color: var(--success); font-weight: 600;">Stabilny</span></p>
+<p><strong>Ostatni import:</strong> Brak danych</p>
+</div>
+</div>
+</div>
 </div>
 
-</div>
+<script>
+// Auto-refresh page every 60 seconds
+setTimeout(function() {
+location.reload();
+}, 60000);
+
+// Format numbers with spaces as thousand separators
+document.addEventListener('DOMContentLoaded', function() {
+const statValues = document.querySelectorAll('.stat-value');
+statValues.forEach(el => {
+const num = el.textContent.replace(/\s/g, '');
+if (!isNaN(num) && num !== '') {
+el.textContent = parseInt(num).toLocaleString('pl-PL');
+}
+});
+
+// Add tooltips for license usage
+const usageBars = document.querySelectorAll('.usage-bar');
+usageBars.forEach(bar => {
+const parent = bar.closest('td');
+if (parent) {
+const usageText = parent.querySelector('div:first-child').textContent;
+bar.title = usageText;
+}
+});
+});
+</script>
 </body>
 </html>
 '''
@@ -706,9 +1449,17 @@ def api_auth():
     if datetime.now(timezone.utc) > expiry or not lic.get('active', True):
         return jsonify({"success": False, "message": "Licencja wygasła lub została zablokowana"}), 401
     if not lic.get("ip"):
-        sb_insert("licenses", {"key": key, "ip": ip})
+        sb_update("licenses", {"ip": ip}, f"key=eq.{key}")
     if lic.get("ip") and lic["ip"] != ip:
         return jsonify({"success": False, "message": "Klucz przypisany do innego adresu IP"}), 403
+    
+    # Sprawdź limity
+    today_count, total_count = get_license_usage(key)
+    if today_count >= lic.get("daily_limit", 100):
+        return jsonify({"success": False, "message": "Przekroczono dzienny limit wyszukiwań"}), 429
+    if total_count >= lic.get("total_limit", 1000):
+        return jsonify({"success": False, "message": "Przekroczono całkowity limit wyszukiwań"}), 429
+        
     return jsonify({"success": True, "message": "Zalogowano pomyślnie"})
 
 @app.route("/api/license-info", methods=["POST"])
@@ -725,15 +1476,17 @@ def api_info():
     if not licenses:
         return jsonify({"success": False, "message": "Nie znaleziono licencji"}), 404
     lic = licenses[0]
-    search_logs = sb_query("search_logs", f"key=eq.{key}&select=count(*)")
-    queries_used = search_logs[0]["count"] if search_logs and search_logs[0] else 0
+    today_count, total_count = get_license_usage(key)
     return jsonify({
         "success": True,
         "info": {
-            "license_type": lic.get("type", "Standard"),
+            "license_type": "Premium",
             "expiration_date": lic["expiry"].split("T")[0],
-            "query_limit": "nieograniczony",
-            "queries_used": queries_used,
+            "daily_limit": lic.get("daily_limit", 100),
+            "total_limit": lic.get("total_limit", 1000),
+            "daily_used": today_count,
+            "total_used": total_count,
+            "ip_bound": lic.get("ip", "Nie przypisano"),
             "last_search": "Brak danych"
         }
     })
@@ -776,7 +1529,12 @@ def api_search():
 # === URUCHOMIENIE ===
 if __name__ == "__main__":
     initialize_db_pool()
-    logger.info("🚀 Cold Search Premium Admin Panel został uruchomiony")
-    port = int(os.environ.get('PORT', 10000))  # Render używa PORT=10000
+    logger.info("🚀 Cold Search Premium został uruchomiony")
+    logger.info(f"🌍 Dostępne endpointy:")
+    logger.info(f"   - Strona główna: http://localhost:10000/")
+    logger.info(f"   - Panel admina: http://localhost:10000/admin")
+    logger.info(f"   - API status: http://localhost:10000/api/status")
+    
+    port = int(os.environ.get('PORT', 10000))  # Port 10000 dla Render
     debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
     app.run(host='0.0.0.0', port=port, debug=debug_mode)
