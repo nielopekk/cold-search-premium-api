@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, render_template_string, redirect, session
+from import_db import import_db
 
 # === KONFIGURACJA ===
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://wcshypmsurncfufbojvp.supabase.co").strip()
@@ -87,16 +88,84 @@ def send_discord_notification(message, title="Cold Search Premium Alert", color=
     try:
         if not DISCORD_WEBHOOK_URL or not DISCORD_WEBHOOK_URL.startswith("https://discord.com/api/webhooks/"):
             return
-        payload = {
-            "username": "Cold Search System",
-            "avatar_url": "https://i.imgur.com/8Y6XJpC.png",
-            "embeds": [{
-                "title": title,
-                "description": message,
-                "color": color,
-                "footer": {"text": f"Cold Search Premium | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"}
-            }]
-        }
+        
+        # Parse message for structured content if needed
+        if "🔗" in message or "📈" in message or "⏰" in message:
+            # Break down message into fields
+            lines = message.split('\n')
+            fields = []
+            description = ""
+            
+            for line in lines:
+                if "🔗 URL:" in line:
+                    fields.append({
+                        "name": "🔗 URL Importu",
+                        "value": line.split("🔗 URL:")[-1].strip(),
+                        "inline": False
+                    })
+                elif "📈 Dodano rekordów:" in line:
+                    fields.append({
+                        "name": "📊 Rekordy dodane",
+                        "value": line.split("📈 Dodano rekordów:")[-1].strip(),
+                        "inline": True
+                    })
+                elif "⏰" in line:
+                    fields.append({
+                        "name": "⏰ Czas",
+                        "value": line.split("⏰")[-1].strip(),
+                        "inline": True
+                    })
+                elif "**" in line:
+                    # Extract bold text as field names
+                    clean_line = line.replace("**", "")
+                    if ":" in clean_line:
+                        parts = clean_line.split(":", 1)
+                        fields.append({
+                            "name": parts[0].strip(),
+                            "value": parts[1].strip(),
+                            "inline": False
+                        })
+                else:
+                    if line.strip():
+                        description += line + "\n"
+            
+            if not fields and description:
+                # Fallback to simple description
+                payload = {
+                    "username": "Cold Search System",
+                    "avatar_url": "https://i.imgur.com/8Y6XJpC.png",
+                    "embeds": [{
+                        "title": title,
+                        "description": description.strip(),
+                        "color": color,
+                        "footer": {"text": f"Cold Search Premium | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"}
+                    }]
+                }
+            else:
+                payload = {
+                    "username": "Cold Search System",
+                    "avatar_url": "https://i.imgur.com/8Y6XJpC.png",
+                    "embeds": [{
+                        "title": title,
+                        "description": description.strip() if description.strip() else "Szczegóły zdarzenia:",
+                        "color": color,
+                        "fields": fields,
+                        "footer": {"text": f"Cold Search Premium | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"}
+                    }]
+                }
+        else:
+            # Original simple message handling
+            payload = {
+                "username": "Cold Search System",
+                "avatar_url": "https://i.imgur.com/8Y6XJpC.png",
+                "embeds": [{
+                    "title": title,
+                    "description": message,
+                    "color": color,
+                    "footer": {"text": f"Cold Search Premium | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"}
+                }]
+            }
+        
         requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)
     except Exception as e:
         print(f"Błąd wysyłania do Discorda: {e}")
@@ -248,6 +317,10 @@ lic_mgr = LicenseManager()
 def import_leaks_worker(zip_url):
     log_activity(f"📥 Start importu: {zip_url}")
     try:
+        # Use the separate import database connection instead of Supabase
+        if not import_db.connect():
+            raise Exception("Nie można połączyć z bazą importu")
+        
         response = requests.get(zip_url, stream=True, timeout=60)
         response.raise_for_status()
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -259,7 +332,6 @@ def import_leaks_worker(zip_url):
                 zip_ref.extractall(tmp_dir)
             total_added = 0
             batch = []
-            import_headers = {**SUPABASE_HEADERS, "Prefer": "resolution=ignore-duplicates"}
             for file_path in Path(tmp_dir).rglob("*"):
                 if not file_path.is_file() or file_path.suffix.lower() not in {".txt", ".csv", ".log"}:
                     continue
@@ -270,26 +342,19 @@ def import_leaks_worker(zip_url):
                             clean_line = line.strip()
                             if clean_line and len(clean_line) <= 1000:
                                 batch.append({"data": clean_line, "source": source_name})
-                                if len(batch) >= 500:
-                                    resp = requests.post(
-                                        f"{SUPABASE_URL}/rest/v1/leaks",
-                                        headers=import_headers,
-                                        json=batch
-                                    )
-                                    if resp.status_code in (200, 201, 204):
-                                        total_added += len(batch)
-                                    batch = []
+                                # Process in batches to avoid memory issues
+                                if len(batch) >= 1000:
+                                    inserted_count = import_db.bulk_insert_leaks(batch)
+                                    total_added += inserted_count
+                                    batch = []  # Reset batch
                 except Exception as e:
                     log_activity(f"⚠️ Błąd pliku {source_name}: {e}")
                     continue
+            # Process remaining items in batch
             if batch:
-                resp = requests.post(
-                    f"{SUPABASE_URL}/rest/v1/leaks",
-                    headers=import_headers,
-                    json=batch
-                )
-                if resp.status_code in (200, 201, 204):
-                    total_added += len(batch)
+                inserted_count = import_db.bulk_insert_leaks(batch)
+                total_added += inserted_count
+            
             log_activity(f"✅ Import zakończony. Dodano: {total_added} rekordów.")
             send_discord_notification(
                 f"✅ Import zakończony pomyślnie\n🔗 URL: {zip_url[:50]}...\n📈 Dodano rekordów: {total_added}",
@@ -300,6 +365,8 @@ def import_leaks_worker(zip_url):
         error_msg = f"❌ Błąd importu: {str(e)}"
         log_activity(error_msg)
         send_discord_notification(error_msg, title="🚨 Błąd Importu", color=15158332)
+    finally:
+        import_db.disconnect()
 
 
 # === PANEL ADMINA HTML ===
@@ -1153,45 +1220,133 @@ def admin_index():
     if not session.get("logged_in"):
         return render_template_string(ADMIN_HTML, authenticated=False)
 
-    # ... [reszta logiki admina bez zmian — tylko pamiętaj o sanitize_ip() przy wyświetlaniu IP] ...
-
-    # Przykład: w recent_searches, dodaj sanitize_ip(item.get("ip"))
-    recent_searches = []
     try:
-        r = requests.get(f"{SUPABASE_URL}/rest/v1/search_logs", headers=SUPABASE_HEADERS, params={"order": "timestamp.desc", "limit": 10, "select": "key,query,ip,timestamp"})
-        if r.status_code == 200:
-            for item in r.json():
-                ts_str = item.get("timestamp", "").replace('Z', '+00:00')
-                try:
-                    ts = datetime.fromisoformat(ts_str)
-                except:
-                    ts = datetime.now(timezone.utc)
-                recent_searches.append({
-                    "key": item.get("key", "—"),
-                    "query": item.get("query", "—"),
-                    "ip": sanitize_ip(item.get("ip", "—")),
-                    "time": ts.strftime("%H:%M:%S")
-                })
-    except:
-        pass
-
-    # ... [pozostałe statystyki bez zmian] ...
-
-    return render_template_string(
-        ADMIN_HTML,
-        authenticated=True,
-        db_count=0,  # uzupełnij zgodnie z Twoją logiką
-        licenses=[],
-        active_keys=0,
-        logs=load_activity_logs(),
-        new_key=session.pop("new_key", None),
-        total_searches=0,
-        unique_ips=0,
-        searches_today=0,
-        recent_searches=recent_searches,
-        active_users=0,
-        total_searches_today=0
-    )
+        # Get statistics from Supabase
+        stats = {"db_count": 0, "active_keys": 0, "total_searches": 0, "unique_ips": 0, "searches_today": 0}
+        
+        # Count total leaks in database
+        try:
+            r = requests.head(f"{SUPABASE_URL}/rest/v1/leaks", headers={**SUPABASE_HEADERS, "Prefer": "count=exact"})
+            if r.status_code == 206:
+                stats["db_count"] = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
+        except:
+            pass
+        
+        # Count active licenses
+        try:
+            r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"active": "eq.true"})
+            if r.status_code == 200:
+                stats["active_keys"] = len(r.json())
+        except:
+            pass
+        
+        # Count total searches
+        try:
+            r = requests.head(f"{SUPABASE_URL}/rest/v1/search_logs", headers={**SUPABASE_HEADERS, "Prefer": "count=exact"})
+            if r.status_code == 206:
+                stats["total_searches"] = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
+        except:
+            pass
+        
+        # Count unique IPs
+        try:
+            r = requests.get(f"{SUPABASE_URL}/rest/v1/search_logs", headers=SUPABASE_HEADERS, params={"select": "ip", "ip": "not.is.null"})
+            if r.status_code == 200:
+                unique_ips_set = {sanitize_ip(item.get("ip")) for item in r.json() if item.get("ip")}
+                stats["unique_ips"] = len(unique_ips_set)
+        except:
+            pass
+        
+        # Count searches today
+        try:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            r = requests.head(f"{SUPABASE_URL}/rest/v1/search_logs", 
+                           headers={**SUPABASE_HEADERS, "Prefer": "count=exact"}, 
+                           params={"timestamp": f"gte.{today}T00:00:00Z"})
+            if r.status_code == 206:
+                stats["searches_today"] = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
+        except:
+            pass
+        
+        # Get active users in last 5 minutes
+        active_users = 0
+        try:
+            five_minutes_ago = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S")
+            r = requests.head(
+                f"{SUPABASE_URL}/rest/v1/search_logs",
+                headers={**SUPABASE_HEADERS, "Prefer": "count=exact"},
+                params={"timestamp": f"gte.{five_minutes_ago}"}
+            )
+            if r.status_code == 206:
+                active_users = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
+        except:
+            pass
+        
+        # Get recent searches with sanitized IPs
+        recent_searches = []
+        try:
+            r = requests.get(f"{SUPABASE_URL}/rest/v1/search_logs", 
+                           headers=SUPABASE_HEADERS, 
+                           params={"order": "timestamp.desc", "limit": 10, "select": "key,query,ip,timestamp"})
+            if r.status_code == 200:
+                for item in r.json():
+                    ts_str = item.get("timestamp", "").replace('Z', '+00:00')
+                    try:
+                        ts = datetime.fromisoformat(ts_str)
+                    except:
+                        ts = datetime.now(timezone.utc)
+                    recent_searches.append({
+                        "key": item.get("key", "—"),
+                        "query": item.get("query", "—"),
+                        "ip": sanitize_ip(item.get("ip", "—")),  # Apply IP sanitization here
+                        "time": ts.strftime("%H:%M:%S")
+                    })
+        except:
+            pass
+        
+        # Get licenses with sanitized IPs
+        licenses = []
+        try:
+            r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", 
+                           headers=SUPABASE_HEADERS, 
+                           params={"order": "created_at.desc", "limit": 50})
+            if r.status_code == 200:
+                for item in r.json():
+                    expiry_str = item.get("expiry", "")
+                    try:
+                        expiry = datetime.fromisoformat(expiry_str.replace('Z', '+00:00'))
+                        is_active = expiry > datetime.now(timezone.utc) and item.get("active", False)
+                    except:
+                        is_active = item.get("active", False)
+                    
+                    licenses.append({
+                        "key": item.get("key", ""),
+                        "active": item.get("active", False),
+                        "is_active": is_active,
+                        "expiry": expiry_str,
+                        "ip": sanitize_ip(item.get("ip", ""))  # Apply IP sanitization here
+                    })
+        except:
+            pass
+        
+        return render_template_string(
+            ADMIN_HTML,
+            authenticated=True,
+            db_count=stats["db_count"],
+            licenses=licenses,
+            active_keys=stats["active_keys"],
+            logs=load_activity_logs(),
+            new_key=session.pop("new_key", None),
+            total_searches=stats["total_searches"],
+            unique_ips=stats["unique_ips"],
+            searches_today=stats["searches_today"],
+            recent_searches=recent_searches,
+            active_users=active_users,
+            total_searches_today=stats["searches_today"]
+        )
+    except Exception as e:
+        log_activity(f"Błąd w panelu admina: {str(e)}")
+        return render_template_string(ADMIN_HTML, authenticated=False)
 
 
 @app.route("/admin/login", methods=["GET", "POST"])
@@ -1224,10 +1379,22 @@ def admin_logout():
 def admin_generate():
     if not session.get("logged_in"):
         return redirect("/admin")
-    days = int(request.form.get("days", 30))
+    
+    try:
+        days = int(request.form.get("days", 30))
+        if days <= 0 or days > 365:
+            raise ValueError("Invalid days value")
+    except (ValueError, TypeError):
+        days = 30
+    
     key = lic_mgr.generate(days)
-    session["new_key"] = key
-    log_activity(f"Nowy klucz wygenerowany przez administratora: {key} ({days} dni), IP: {get_client_ip()}")
+    if key.startswith("Error:"):
+        session["error_msg"] = f"Błąd generowania klucza: {key}"
+        log_activity(f"Błąd generowania klucza: {key}, IP: {get_client_ip()}")
+    else:
+        session["new_key"] = key
+        log_activity(f"Nowy klucz wygenerowany przez administratora: {key} ({days} dni), IP: {get_client_ip()}")
+    
     return redirect("/admin")
 
 
@@ -1235,10 +1402,14 @@ def admin_generate():
 def admin_import_zip():
     if not session.get("logged_in"):
         return redirect("/admin")
+    
     url = request.form.get("zip_url")
     if url and url.startswith("http"):
         threading.Thread(target=import_leaks_worker, args=(url,), daemon=True).start()
         log_activity(f"Administrator rozpoczął import z URL: {url}, IP: {get_client_ip()}")
+    else:
+        log_activity(f"Nieprawidłowy URL importu: {url}, IP: {get_client_ip()}")
+    
     return redirect("/admin")
 
 
@@ -1246,6 +1417,7 @@ def admin_import_zip():
 def admin_toggle(key):
     if not session.get("logged_in"):
         return redirect("/admin")
+    
     try:
         r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"key": f"eq.{key}"})
         if r.status_code == 200 and r.json():
@@ -1253,7 +1425,7 @@ def admin_toggle(key):
             new_state = not current
             requests.patch(f"{SUPABASE_URL}/rest/v1/licenses?key=eq.{key}", headers=SUPABASE_HEADERS, json={"active": new_state})
             status_desc = "Aktywowano" if new_state else "Dezaktywowano"
-            log_activity(f"{status_desc} klucz: {key}")
+            log_activity(f"{status_desc} klucz: {key}, IP: {get_client_ip()}")
             msg = (
                 f"🔑 **{status_desc}**\n"
                 f"🔑 Klucz: `{key}`\n"
@@ -1261,7 +1433,8 @@ def admin_toggle(key):
             )
             send_discord_notification(msg, title="🔄 Zmiana statusu licencji", color=3447003)
     except Exception as e:
-        log_activity(f"⚠️ Błąd przełączania klucza {key}: {e}")
+        log_activity(f"⚠️ Błąd przełączania klucza {key}: {e}, IP: {get_client_ip()}")
+    
     return redirect("/admin")
 
 
@@ -1269,6 +1442,7 @@ def admin_toggle(key):
 def admin_delete(key):
     if not session.get("logged_in"):
         return redirect("/admin")
+    
     try:
         requests.delete(f"{SUPABASE_URL}/rest/v1/licenses?key=eq.{key}", headers=SUPABASE_HEADERS)
         log_activity(f"Usunięto klucz: {key}, IP: {get_client_ip()}")
@@ -1280,6 +1454,7 @@ def admin_delete(key):
         send_discord_notification(msg, title="🗑️ Usunięcie licencji", color=15158332)
     except Exception as e:
         log_activity(f"⚠️ Błąd usuwania klucza {key}: {e}, IP: {get_client_ip()}")
+    
     return redirect("/admin")
 
 
@@ -1287,6 +1462,7 @@ def admin_delete(key):
 def admin_clear_logs():
     if not session.get("logged_in"):
         return redirect("/admin")
+    
     try:
         if LOGS_FILE.exists():
             LOGS_FILE.unlink()
@@ -1297,7 +1473,8 @@ def admin_clear_logs():
             color=10181046
         )
     except Exception as e:
-        print(f"Błąd czyszczenia logów: {e}")
+        log_activity(f"Błąd czyszczenia logów: {e}, IP: {get_client_ip()}")
+    
     return redirect("/admin")
 
 
@@ -1305,16 +1482,66 @@ def admin_clear_logs():
 def admin_send_discord_report():
     if not session.get("logged_in"):
         return jsonify({"success": False}), 403
+    
     try:
-        # ... [logika raportu bez zmian] ...
+        # Get updated statistics for the report
+        stats = {"db_count": 0, "active_keys": 0, "total_searches": 0, "unique_ips": 0, "searches_today": 0}
+        
+        # Count total leaks in database
+        try:
+            r = requests.head(f"{SUPABASE_URL}/rest/v1/leaks", headers={**SUPABASE_HEADERS, "Prefer": "count=exact"})
+            if r.status_code == 206:
+                stats["db_count"] = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
+        except:
+            pass
+        
+        # Count active licenses
+        try:
+            r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses", headers=SUPABASE_HEADERS, params={"active": "eq.true"})
+            if r.status_code == 200:
+                stats["active_keys"] = len(r.json())
+        except:
+            pass
+        
+        # Count total searches
+        try:
+            r = requests.head(f"{SUPABASE_URL}/rest/v1/search_logs", headers={**SUPABASE_HEADERS, "Prefer": "count=exact"})
+            if r.status_code == 206:
+                stats["total_searches"] = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
+        except:
+            pass
+        
+        # Count unique IPs
+        try:
+            r = requests.get(f"{SUPABASE_URL}/rest/v1/search_logs", headers=SUPABASE_HEADERS, params={"select": "ip", "ip": "not.is.null"})
+            if r.status_code == 200:
+                unique_ips_set = {sanitize_ip(item.get("ip")) for item in r.json() if item.get("ip")}
+                stats["unique_ips"] = len(unique_ips_set)
+        except:
+            pass
+        
+        # Count searches today
+        try:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            r = requests.head(f"{SUPABASE_URL}/rest/v1/search_logs", 
+                           headers={**SUPABASE_HEADERS, "Prefer": "count=exact"}, 
+                           params={"timestamp": f"gte.{today}T00:00:00Z"})
+            if r.status_code == 206:
+                stats["searches_today"] = int(r.headers.get("content-range", "0-0/0").split("/")[-1])
+        except:
+            pass
+        
         report_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         message = (
             f"📊 **Raport Systemowy - {report_time}**\n"
             f"📈 **Statystyki Systemu:**\n"
-            f"• Rekordów w bazie: `0`\n"
+            f"• Rekordów w bazie: `{stats['db_count']:,}`\n"
+            f"• Aktywnych licencji: `{stats['active_keys']}`\n"
             f"• Aktywni użytkownicy (ost. 5 min): `0`\n"
-            f"• Wyszukiwań dzisiaj: `0`\n"
-            f"⚙️ **Stan Serwera:**\n"
+            f"• Wyszukiwań dzisiaj: `{stats['searches_today']:,}`\n"
+            f"• Unikalne IP: `{stats['unique_ips']:,}`\n"
+            f"• Wszystkie wyszukiwania: `{stats['total_searches']:,}`\n"
+            f"\n⚙️ **Stan Serwera:**\n"
             f"• Serwer: `{os.getenv('ENV', 'production').upper()}`\n"
             f"• Port: `{os.getenv('PORT', '5000')}`\n"
             f"✅ Raport wygenerowany ręcznie przez administratora"
@@ -1323,7 +1550,7 @@ def admin_send_discord_report():
         log_activity(f"Administrator wysłał ręczny raport do Discorda, IP: {get_client_ip()}")
         return jsonify({"success": True})
     except Exception as e:
-        log_activity(f"Błąd ręcznego raportu: {str(e)}")
+        log_activity(f"Błąd ręcznego raportu: {str(e)}, IP: {get_client_ip()}")
         return jsonify({"success": False}), 500
 
 
