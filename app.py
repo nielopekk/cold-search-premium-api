@@ -7,13 +7,13 @@ import threading
 import logging
 import time
 import contextlib
+import json
+import re
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, render_template_string, redirect, session, url_for, flash
 import mysql.connector
 from mysql.connector import pooling
-import re
-import json
-from collections import defaultdict
+from werkzeug.exceptions import InternalServerError
 
 # === KONFIGURACJA ŚRODOWISKOWA ===
 DB_CONFIG = {
@@ -29,7 +29,7 @@ DB_CONFIG = {
     "pool_reset_session": True
 }
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://wcshypmsurncfufbojvp.supabase.co").strip()
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "sb_secret_Ci0yyib3FCJW3GMivhX3XA_D2vHmhpP").strip()
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Indjc2h5cG1zdXJuY2Z1ZmJvanZwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjkwNzIwOTEsImV4cCI6MjA4NDY0ODA5MX0.Hs9j4wXZ6yLwz8k3y9Xy6Qw5n6z7J7xZ3Y2y1X1Y2Z3").strip()
 SUPABASE_HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -41,6 +41,78 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "cold_search_ultra_2026_fixed")
+app.config['PROPAGATE_EXCEPTIONS'] = True  # Ważne dla Render
+
+# === AUTOMATYCZNA INICJALIZACJA TABEL ===
+def initialize_tables():
+    """Tworzy wszystkie potrzebne tabele w bazach danych przy starcie aplikacji"""
+    # Inicjalizacja tabel w MariaDB
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        
+        # Tabela search_logs
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS search_logs (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            query VARCHAR(255) NOT NULL,
+            ip VARCHAR(45) NOT NULL,
+            `key` VARCHAR(50) NOT NULL,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_ip (ip),
+            INDEX idx_key (key),
+            INDEX idx_timestamp (timestamp),
+            INDEX idx_query (query),
+            INDEX idx_key_timestamp (key, timestamp)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """)
+        
+        # Tabela leaks z unikalnym kluczem
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS leaks (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            data VARCHAR(1000) NOT NULL,
+            source VARCHAR(255) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY unique_data_source (data(255), source),
+            FULLTEXT INDEX ft_data (data),
+            INDEX idx_source (source),
+            INDEX idx_created_at (created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """)
+        
+        # Dodanie przykładowych danych jeśli tabela jest pusta
+        cursor.execute("SELECT COUNT(*) as count FROM leaks")
+        result = cursor.fetchone()
+        if result and result[0] == 0:
+            cursor.execute("""
+            INSERT INTO leaks (data, source) VALUES
+            ('test@example.com', 'test_data'),
+            ('admin123', 'test_data'),
+            ('user_2024', 'test_data')
+            ON DUPLICATE KEY UPDATE updated_at = CURRENT_TIMESTAMP
+            """)
+            logger.info("✅ Dodano przykładowe dane do tabeli 'leaks'")
+        
+        conn.commit()
+        logger.info("✅ Tabele w MariaDB zostały pomyślnie zainicjalizowane")
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        logger.error(f"❌ Błąd podczas inicjalizacji tabel w MariaDB: {e}")
+    
+    # Inicjalizacja tabel w Supabase
+    try:
+        # Sprawdzenie czy tabela licenses istnieje
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses?limit=1", headers=SUPABASE_HEADERS, timeout=10)
+        if r.status_code == 404:
+            # Tabela nie istnieje - utworzenie
+            logger.info("🔧 Tworzenie tabel w Supabase...")
+            # Tabele są tworzone przez skrypt SQL powyżej
+            logger.info("✅ Tabele w Supabase wymagają ręcznej inicjalizacji przez SQL Editor")
+    except Exception as e:
+        logger.error(f"❌ Błąd podczas inicjalizacji tabel w Supabase: {e}")
 
 # === POOL POŁĄCZEŃ MARIADB ===
 db_pool = None
@@ -55,7 +127,7 @@ def initialize_db_pool():
                 logger.info(f"🚀 Próba połączenia z MariaDB (próba {attempt + 1}/{max_attempts})")
                 db_pool = mysql.connector.pooling.MySQLConnectionPool(**DB_CONFIG)
                 logger.info("✅ Pula połączeń z MariaDB została pomyślnie utworzona")
-                ensure_leaks_table_exists()
+                initialize_tables()  # Inicjalizacja tabel przy starcie
             return True
         except Exception as e:
             logger.error(f"❌ Błąd połączenia z MariaDB (próba {attempt + 1}): {e}")
@@ -65,70 +137,13 @@ def initialize_db_pool():
     logger.error("❌ Krytyczny błąd: nie udało się połączyć z MariaDB po wielu próbach")
     raise SystemExit("Nie można kontynuować bez połączenia z bazą danych leaków")
 
-def ensure_leaks_table_exists():
-    try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SHOW TABLES LIKE 'leaks'")
-            if cursor.fetchone() is None:
-                logger.info("🔧 Tworzenie tabeli 'leaks' z unikalnym kluczem...")
-                create_table_query = """
-                CREATE TABLE leaks (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    data VARCHAR(1000) NOT NULL,
-                    source VARCHAR(255) NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    UNIQUE KEY unique_data_source (data(255), source),
-                    FULLTEXT INDEX ft_data (data),
-                    INDEX idx_source (source),
-                    INDEX idx_created_at (created_at)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-                """
-                cursor.execute(create_table_query)
-                cursor.execute("""
-                INSERT INTO leaks (data, source) VALUES
-                ('test@example.com', 'test_data'),
-                ('admin123', 'test_data'),
-                ('user_2024', 'test_data')
-                ON DUPLICATE KEY UPDATE updated_at = CURRENT_TIMESTAMP
-                """)
-                logger.info("✅ Tabela 'leaks' gotowa")
-            else:
-                cursor.execute("SHOW CREATE TABLE leaks")
-                create_stmt = cursor.fetchone()[1]
-                if "unique_data_source" not in create_stmt:
-                    logger.warning("🔧 Dodawanie unikalnego klucza...")
-                    cursor.execute("ALTER TABLE leaks ADD UNIQUE KEY unique_data_source (data(255), source)")
-    except Exception as e:
-        logger.error(f"❌ Błąd struktury tabeli: {e}")
-        raise
-
-def get_db_connection():
-    global db_pool
-    if db_pool is None:
-        initialize_db_pool()
-    try:
-        conn = db_pool.get_connection()
-        return conn
-    except mysql.connector.Error as e:
-        logger.error(f"❌ Błąd pobierania połączenia: {e}")
-        if "pool exhausted" in str(e):
-            time.sleep(1)
-            try:
-                conn = db_pool.get_connection()
-                return conn
-            except:
-                pass
-        logger.warning("🔄 Reset puli połączeń...")
-        initialize_db_pool()
-        return get_db_connection()
-
 @contextlib.contextmanager
 def get_db():
     conn = None
     try:
-        conn = get_db_connection()
+        if db_pool is None:
+            initialize_db_pool()
+        conn = db_pool.get_connection()
         yield conn
     finally:
         if conn and conn.is_connected():
@@ -136,17 +151,23 @@ def get_db():
 
 # === FUNKCJE POMOCNICZE ===
 def sb_query(table, params=""):
+    """Bezpieczne zapytanie do Supabase"""
     try:
         r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}?{params}", headers=SUPABASE_HEADERS, timeout=10)
         if r.status_code == 200:
             return r.json()
-        logger.error(f"❌ Błąd Supabase ({r.status_code}): {r.text}")
-        return []
+        elif r.status_code == 404:
+            logger.warning(f"⚠️ Tabela '{table}' nie istnieje w Supabase")
+            return []
+        else:
+            logger.error(f"❌ Błąd Supabase ({r.status_code}): {r.text}")
+            return []
     except Exception as e:
         logger.error(f"❌ Błąd zapytania do Supabase ({table}): {e}")
         return []
 
 def sb_insert(table, data):
+    """Bezpieczne wstawianie do Supabase"""
     try:
         return requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=SUPABASE_HEADERS, json=data, timeout=10)
     except Exception as e:
@@ -154,6 +175,7 @@ def sb_insert(table, data):
         return None
 
 def sb_update(table, data, condition):
+    """Bezpieczna aktualizacja w Supabase"""
     try:
         return requests.patch(f"{SUPABASE_URL}/rest/v1/{table}?{condition}", headers=SUPABASE_HEADERS, json=data, timeout=10)
     except Exception as e:
@@ -161,6 +183,7 @@ def sb_update(table, data, condition):
         return None
 
 def sb_delete(table, condition):
+    """Bezpieczne usuwanie z Supabase"""
     try:
         return requests.delete(f"{SUPABASE_URL}/rest/v1/{table}?{condition}", headers=SUPABASE_HEADERS, timeout=10)
     except Exception as e:
@@ -168,38 +191,25 @@ def sb_delete(table, condition):
         return None
 
 def get_client_ip():
+    """Pobranie klienta IP z nagłówków"""
     if request.headers.get('X-Forwarded-For'):
         return request.headers.get('X-Forwarded-For').split(',')[0].strip()
     return request.remote_addr or '127.0.0.1'
 
 def is_valid_ip(ip):
+    """Walidacja adresu IP"""
     pattern = re.compile(r'^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$')
     return pattern.match(ip) is not None
 
 def format_datetime(dt):
+    """Formatowanie daty do czytelnej postaci"""
     if isinstance(dt, datetime):
         return dt.strftime("%d.%m.%Y %H:%M")
-    elif isinstance(dt, str):
-        try:
-            # Próba parsowania różnych formatów daty
-            formats = [
-                "%Y-%m-%dT%H:%M:%S.%fZ",
-                "%Y-%m-%dT%H:%M:%SZ",
-                "%Y-%m-%d %H:%M:%S"
-            ]
-            for fmt in formats:
-                try:
-                    parsed = datetime.strptime(dt, fmt)
-                    return parsed.strftime("%d.%m.%Y %H:%M")
-                except ValueError:
-                    continue
-            return dt
-        except:
-            return dt
     return str(dt)
 
 # === IMPORT WORKER ===
 def import_worker(url):
+    """Wątek importujący dane z archiwum ZIP"""
     try:
         logger.info(f"📥 Rozpoczęto import z: {url}")
         response = requests.get(url, stream=True, timeout=300)
@@ -248,9 +258,10 @@ def import_worker(url):
     except Exception as e:
         logger.error(f"💥 Fatalny błąd importu: {e}")
 
-# === GŁÓWNY ENDPOINT: / (panel admina) ===
+# === GŁÓWNE ENDPOINTY ===
 @app.route("/", methods=["GET", "POST"])
 def admin_panel():
+    """Główny panel administracyjny"""
     if request.method == "POST" and not session.get('is_admin'):
         if request.form.get("password") == ADMIN_PASSWORD:
             session['is_admin'] = True
@@ -258,74 +269,99 @@ def admin_panel():
             flash('✅ Zalogowano pomyślnie!', 'success')
         else:
             flash('❌ Nieprawidłowe hasło!', 'error')
-        return redirect("/")
+        return redirect(url_for('admin_panel'))
     
     if not session.get('is_admin'):
         return render_template_string(ADMIN_LOGIN_TEMPLATE)
     
     action = request.form.get("action")
     if action == "add_license":
-        days = int(request.form.get("days", 30))
-        daily_limit = int(request.form.get("daily_limit", 100))
-        total_limit = int(request.form.get("total_limit", 1000))
-        license_type = request.form.get("license_type", "standard")
-        
-        new_key = "COLD-" + uuid.uuid4().hex.upper()[:12]
-        expiry = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
-        payload = {
-            "key": new_key,
-            "active": True,
-            "expiry": expiry,
-            "daily_limit": daily_limit,
-            "total_limit": total_limit,
-            "license_type": license_type,
-            "ip": get_client_ip(),
-            "created_at": datetime.now(timezone.utc).isoformat()
-        }
-        r = sb_insert("licenses", payload)
-        if r and r.status_code in (200, 201):
-            flash(f"✅ Licencja: {new_key} (limit dzienny: {daily_limit}, całkowity: {total_limit})", 'success')
-        else:
-            flash(f"❌ Błąd generowania licencji: {r.text if r else 'unknown'}", 'error')
-    elif action == "toggle_license":
-        key = request.form.get("key")
-        licenses = sb_query("licenses", f"key=eq.{key}")
-        if licenses:
-            new_status = not licenses[0].get('active', False)
-            sb_update("licenses", {"active": new_status}, f"key=eq.{key}")
-            flash(f"{'Włączono' if new_status else 'Wyłączono'} licencję", 'success')
-    elif action == "del_license":
-        key = request.form.get("key")
-        sb_delete("licenses", f"key=eq.{key}")
-        flash("✅ Licencja usunięta", 'success')
-    elif action == "add_ban":
-        ip = request.form.get("ip", "").strip()
-        if is_valid_ip(ip):
-            if not sb_query("banned_ips", f"ip=eq.{ip}"):
-                sb_insert("banned_ips", {
-                    "ip": ip, 
-                    "reason": request.form.get("reason", "—"), 
-                    "admin_ip": get_client_ip(),
-                    "created_at": datetime.now(timezone.utc).isoformat()
-                })
-                flash(f"✅ Zbanowano IP: {ip}", 'success')
+        try:
+            days = int(request.form.get("days", 30))
+            daily_limit = int(request.form.get("daily_limit", 100))
+            total_limit = int(request.form.get("total_limit", 1000))
+            license_type = request.form.get("license_type", "standard")
+            
+            new_key = "COLD-" + uuid.uuid4().hex.upper()[:12]
+            expiry = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+            payload = {
+                "key": new_key,
+                "active": True,
+                "expiry": expiry,
+                "daily_limit": daily_limit,
+                "total_limit": total_limit,
+                "license_type": license_type,
+                "ip": None,
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }
+            r = sb_insert("licenses", payload)
+            if r and r.status_code in (200, 201):
+                flash(f"✅ Licencja: {new_key} (limit dzienny: {daily_limit}, całkowity: {total_limit})", 'success')
             else:
-                flash("❌ IP już zbanowane", 'error')
-        else:
-            flash("❌ Nieprawidłowe IP", 'error')
+                flash(f"❌ Błąd generowania licencji: {r.text if r else 'Błąd połączenia'}", 'error')
+        except Exception as e:
+            logger.error(f"❌ Błąd generowania licencji: {e}")
+            flash(f"❌ Błąd generowania licencji: {str(e)}", 'error')
+    elif action == "toggle_license":
+        try:
+            key = request.form.get("key")
+            licenses = sb_query("licenses", f"key=eq.{key}")
+            if licenses:
+                new_status = not licenses[0].get('active', False)
+                sb_update("licenses", {"active": new_status}, f"key=eq.{key}")
+                flash(f"{'Włączono' if new_status else 'Wyłączono'} licencję", 'success')
+        except Exception as e:
+            logger.error(f"❌ Błąd przełączania licencji: {e}")
+            flash("❌ Błąd przełączania licencji", 'error')
+    elif action == "del_license":
+        try:
+            key = request.form.get("key")
+            sb_delete("licenses", f"key=eq.{key}")
+            flash("✅ Licencja usunięta", 'success')
+        except Exception as e:
+            logger.error(f"❌ Błąd usuwania licencji: {e}")
+            flash("❌ Błąd usuwania licencji", 'error')
+    elif action == "add_ban":
+        try:
+            ip = request.form.get("ip", "").strip()
+            if is_valid_ip(ip):
+                existing = sb_query("banned_ips", f"ip=eq.{ip}")
+                if not existing:
+                    sb_insert("banned_ips", {
+                        "ip": ip, 
+                        "reason": request.form.get("reason", "—"), 
+                        "admin_ip": get_client_ip(),
+                        "created_at": datetime.now(timezone.utc).isoformat()
+                    })
+                    flash(f"✅ Zbanowano IP: {ip}", 'success')
+                else:
+                    flash("❌ IP już zbanowane", 'error')
+            else:
+                flash("❌ Nieprawidłowe IP", 'error')
+        except Exception as e:
+            logger.error(f"❌ Błąd banowania IP: {e}")
+            flash("❌ Błąd banowania IP", 'error')
     elif action == "del_ban":
-        ip = request.form.get("ip")
-        sb_delete("banned_ips", f"ip=eq.{ip}")
-        flash("✅ Odbanowano IP", 'success')
+        try:
+            ip = request.form.get("ip")
+            sb_delete("banned_ips", f"ip=eq.{ip}")
+            flash("✅ Odbanowano IP", 'success')
+        except Exception as e:
+            logger.error(f"❌ Błąd odbanowywania IP: {e}")
+            flash("❌ Błąd odbanowywania IP", 'error')
     elif action == "import_start":
-        url = request.form.get("import_url")
-        if url and url.startswith(('http://', 'https://')):
-            threading.Thread(target=import_worker, args=(url,), daemon=True).start()
-            flash("✅ Import uruchomiony w tle", 'info')
-        else:
-            flash("❌ Nieprawidłowy URL", 'error')
+        try:
+            url = request.form.get("import_url")
+            if url and url.startswith(('http://', 'https://')):
+                threading.Thread(target=import_worker, args=(url,), daemon=True).start()
+                flash("✅ Import uruchomiony w tle", 'info')
+            else:
+                flash("❌ Nieprawidłowy URL", 'error')
+        except Exception as e:
+            logger.error(f"❌ Błąd uruchamiania importu: {e}")
+            flash("❌ Błąd uruchamiania importu", 'error')
     
-    # Ładowanie danych
+    # Ładowanie danych do panelu
     try:
         with get_db() as conn:
             cursor = conn.cursor(dictionary=True)
@@ -352,58 +388,26 @@ def admin_panel():
             daily_stats = cursor.fetchall()
             max_count = max([stat['count'] for stat in daily_stats]) if daily_stats else 1
             
-            # Użytkownicy i wyszukiwania
-            cursor.execute("""
-            SELECT COUNT(DISTINCT ip) as active_users
-            FROM search_logs
-            WHERE timestamp >= NOW() - INTERVAL 1 DAY
-            """)
-            active_users_24h = cursor.fetchone()['active_users']
+            # Statystyki użytkowników i wyszukiwań
+            total_searches = 0
+            active_users_24h = 0
+            try:
+                logs = sb_query("search_logs", "select=count(*)")
+                total_searches = logs[0]['count'] if logs and logs[0] else 0
+                
+                yesterday = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+                active_users = sb_query("search_logs", f"timestamp=gte.{yesterday}&select=count(distinct ip)")
+                active_users_24h = active_users[0]['count'] if active_users and active_users[0] else 0
+            except Exception as e:
+                logger.error(f"❌ Błąd pobierania statystyk: {e}")
             
-            cursor.execute("SELECT COUNT(*) as total_searches FROM search_logs")
-            total_searches = cursor.fetchone()['total_searches']
-            
-            # Licencje
             licenses = sb_query("licenses", "order=created_at.desc")
-            active_licenses = sum(1 for lic in licenses if lic.get('active'))
-            
-            # Zbanowane IP
             banned_ips = sb_query("banned_ips", "order=created_at.desc")
-            
-            # Statystyki dla wykresu (aktywność użytkowników)
-            cursor.execute("""
-            SELECT DATE(timestamp) as date, COUNT(*) as count
-            FROM search_logs
-            WHERE timestamp >= NOW() - INTERVAL 7 DAY
-            GROUP BY DATE(timestamp)
-            ORDER BY date ASC
-            """)
-            user_activity = cursor.fetchall()
-            
-            # Top wyszukiwania
-            cursor.execute("""
-            SELECT query, COUNT(*) as count
-            FROM search_logs
-            GROUP BY query
-            ORDER BY count DESC
-            LIMIT 10
-            """)
-            top_searches = cursor.fetchall()
-            
-            # Wydajność bazy
-            db_performance = {
-                "avg_query_time": 45,
-                "cpu_usage": 23,
-                "memory_usage": 42
-            }
+            active_licenses = sum(1 for lic in licenses if lic.get('active', True))
             
             login_time = datetime.fromisoformat(session['login_time'])
             session_duration = str(datetime.now(timezone.utc) - login_time).split('.')[0]
-            
-            # Aktualna data i czas
             now = datetime.now(timezone.utc)
-            
-            # Aktywna zakładka
             tab = request.args.get('tab', 'dashboard')
             
             return render_template_string(
@@ -419,9 +423,6 @@ def admin_panel():
                 active_licenses=active_licenses,
                 total_searches=total_searches,
                 active_users_24h=active_users_24h,
-                user_activity=user_activity,
-                top_searches=top_searches,
-                db_performance=db_performance,
                 session_duration=session_duration,
                 client_ip=get_client_ip(),
                 format_datetime=format_datetime,
@@ -430,120 +431,15 @@ def admin_panel():
             )
     except Exception as e:
         logger.error(f"💥 Błąd ładowania panelu: {e}")
-        flash("❌ Błąd serwera", 'error')
-        return redirect("/")
+        flash(f"❌ Błąd serwera: {str(e)}", 'error')
+        return redirect(url_for('admin_panel'))
 
 @app.route("/logout")
 def admin_logout():
     session.clear()
     flash("✅ Wylogowano", 'success')
-    return redirect("/")
+    return redirect(url_for('admin_panel'))
 
-@app.route("/api/users")
-def api_users():
-    if not session.get('is_admin'):
-        return jsonify({"success": False, "message": "Brak dostępu"}), 401
-    
-    search_query = request.args.get('search', '').strip()
-    page = int(request.args.get('page', 1))
-    per_page = int(request.args.get('per_page', 10))
-    
-    with get_db() as conn:
-        cursor = conn.cursor(dictionary=True)
-        
-        # Pobranie unikalnych IP z search_logs
-        if search_query:
-            cursor.execute("""
-                SELECT DISTINCT ip, MIN(timestamp) as first_seen, MAX(timestamp) as last_seen,
-                COUNT(*) as total_searches
-                FROM search_logs
-                WHERE ip LIKE %s OR query LIKE %s
-                GROUP BY ip
-                ORDER BY last_seen DESC
-                LIMIT %s OFFSET %s
-                """, (f'%{search_query}%', f'%{search_query}%', per_page, (page-1)*per_page))
-        else:
-            cursor.execute("""
-                SELECT DISTINCT ip, MIN(timestamp) as first_seen, MAX(timestamp) as last_seen,
-                COUNT(*) as total_searches
-                FROM search_logs
-                GROUP BY ip
-                ORDER BY last_seen DESC
-                LIMIT %s OFFSET %s
-                """, (per_page, (page-1)*per_page))
-        
-        users = cursor.fetchall()
-        
-        # Pobranie ogólnego statystyk
-        if search_query:
-            cursor.execute("""
-                SELECT COUNT(DISTINCT ip) as total_count
-                FROM search_logs
-                WHERE ip LIKE %s OR query LIKE %s
-                """, (f'%{search_query}%', f'%{search_query}%'))
-        else:
-            cursor.execute("SELECT COUNT(DISTINCT ip) as total_count FROM search_logs")
-        
-        total_count = cursor.fetchone()['total_count']
-        
-        # Pobieranie szczegółów dla każdej licencji
-        license_details = {}
-        if users:
-            ip_list = [user['ip'] for user in users]
-            for ip in ip_list:
-                licenses = sb_query("licenses", f"ip=eq.{ip}")
-                if licenses:
-                    license_details[ip] = licenses[0]
-        
-        return jsonify({
-            "success": True,
-            "users": users,
-            "license_details": license_details,
-            "total_count": total_count,
-            "page": page,
-            "per_page": per_page,
-            "pages": (total_count + per_page - 1) // per_page
-        })
-
-@app.route("/api/license-activity")
-def api_license_activity():
-    if not session.get('is_admin'):
-        return jsonify({"success": False, "message": "Brak dostępu"}), 401
-    
-    license_key = request.args.get('key', '').strip()
-    if not license_key:
-        return jsonify({"success": False, "message": "Brak klucza licencji"}), 400
-    
-    with get_db() as conn:
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT query, timestamp, ip
-            FROM search_logs
-            WHERE key = %s
-            ORDER BY timestamp DESC
-            LIMIT 50
-        """, (license_key,))
-        
-        activity = cursor.fetchall()
-        
-        # Liczba wyszukiwań według dni
-        cursor.execute("""
-            SELECT DATE(timestamp) as date, COUNT(*) as count
-            FROM search_logs
-            WHERE key = %s
-            GROUP BY DATE(timestamp)
-            ORDER BY date ASC
-        """, (license_key,))
-        
-        daily_usage = cursor.fetchall()
-        
-        return jsonify({
-            "success": True,
-            "activity": activity,
-            "daily_usage": daily_usage
-        })
-
-# === API ENDPOINTS ===
 @app.route("/api/status", methods=["GET"])
 def api_status():
     try:
@@ -551,13 +447,14 @@ def api_status():
             cursor = conn.cursor()
             cursor.execute("SELECT 1")
             db_status = cursor.fetchone()[0] == 1
-    except:
+    except Exception as e:
+        logger.error(f"❌ Błąd połączenia z bazą: {e}")
         db_status = False
     
     return jsonify({
         "success": True,
         "status": "online",
-        "version": "3.1.1",
+        "version": "3.1.2",
         "server_time": datetime.now(timezone.utc).isoformat(),
         "database_status": db_status
     })
@@ -572,26 +469,20 @@ def api_auth():
         return jsonify({"success": False, "message": "Brak klucza"}), 400
     
     licenses = sb_query("licenses", f"key=eq.{key}")
-    if not licenses or (isinstance(licenses, list) and len(licenses) == 0):
+    if not licenses or len(licenses) == 0:
         return jsonify({"success": False, "message": "Nieprawidłowy klucz licencyjny"}), 401
     
-    lic = licenses[0] if isinstance(licenses, list) else licenses
-    expiry_str = lic.get('expiry')
-    
-    if expiry_str:
-        expiry = datetime.fromisoformat(expiry_str.replace('Z', '+00:00'))
-    else:
-        expiry = datetime.now(timezone.utc) + timedelta(days=30)
+    lic = licenses[0]
+    expiry = datetime.fromisoformat(lic['expiry'].replace('Z', '+00:00'))
     
     if datetime.now(timezone.utc) > expiry or not lic.get('active', True):
         return jsonify({"success": False, "message": "Licencja wygasła lub została zablokowana"}), 401
     
-    lic_ip = lic.get("ip")
-    if lic_ip and lic_ip != ip:
+    if lic.get("ip") and lic["ip"].strip() != "" and lic["ip"].strip() != ip.strip():
         return jsonify({"success": False, "message": "Klucz przypisany do innego adresu IP"}), 403
     
     # Jeśli IP nie jest ustawione, aktualizuj je
-    if not lic_ip:
+    if not lic.get("ip"):
         sb_update("licenses", {"ip": ip}, f"key=eq.{key}")
     
     return jsonify({"success": True, "message": "Zalogowano pomyślnie"})
@@ -611,10 +502,10 @@ def api_info():
         return auth_response
     
     licenses = sb_query("licenses", f"key=eq.{key}")
-    if not licenses or (isinstance(licenses, list) and len(licenses) == 0):
+    if not licenses or len(licenses) == 0:
         return jsonify({"success": False, "message": "Nie znaleziono licencji"}), 404
     
-    lic = licenses[0] if isinstance(licenses, list) else licenses
+    lic = licenses[0]
     
     # Pobierz statystyki użycia
     today_count, total_count = 0, 0
@@ -635,19 +526,11 @@ def api_info():
     except Exception as e:
         logger.error(f"Błąd pobierania statystyk użycia: {e}")
     
-    # Formatowanie daty ważności
-    expiry_date = "Nieznana"
-    if lic.get("expiry"):
-        try:
-            expiry_date = lic["expiry"].split("T")[0]
-        except:
-            expiry_date = str(lic["expiry"])
-    
     return jsonify({
         "success": True,
         "info": {
             "license_type": lic.get("license_type", "Standard").capitalize(),
-            "expiration_date": expiry_date,
+            "expiration_date": lic["expiry"].split("T")[0],
             "daily_limit": lic.get("daily_limit", 100),
             "daily_used": today_count,
             "total_limit": lic.get("total_limit", 1000),
@@ -671,18 +554,18 @@ def api_search():
     if not query:
         return jsonify({"success": False, "message": "Puste zapytanie"}), 400
     
-    # Sprawdzenie limitów licencji
+    # Sprawdzenie autoryzacji
     auth_response = api_auth()
     if auth_response.status_code != 200:
         return auth_response
     
     try:
-        # Pobranie licencji do sprawdzenia limitów
+        # Pobranie licencji
         licenses = sb_query("licenses", f"key=eq.{key}")
-        if not licenses:
+        if not licenses or len(licenses) == 0:
             return jsonify({"success": False, "message": "Nieprawidłowa licencja"}), 401
         
-        lic = licenses[0] if isinstance(licenses, list) else licenses
+        lic = licenses[0]
         
         # Sprawdzenie dziennego limitu
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -718,11 +601,6 @@ def api_search():
             """, (f"+{query}*", limit))
             results = cursor.fetchall()
             
-            # Formatowanie timestamp dla klienta
-            for result in results:
-                if 'timestamp' in result and result['timestamp']:
-                    result['timestamp'] = result['timestamp'].strftime("%Y-%m-%d %H:%M:%S")
-            
             return jsonify({"success": True, "results": results})
     
     except Exception as e:
@@ -730,8 +608,7 @@ def api_search():
         return jsonify({"success": False, "message": f"Błąd bazy danych: {str(e)}"}), 500
 
 # === SZABLONY HTML ===
-ADMIN_LOGIN_TEMPLATE = '''
-<!DOCTYPE html>
+ADMIN_LOGIN_TEMPLATE = '''<!DOCTYPE html>
 <html lang="pl">
 <head>
     <meta charset="UTF-8">
@@ -907,7 +784,7 @@ ADMIN_LOGIN_TEMPLATE = '''
         </div>
         <div class="card">
             <h1 class="card-title">🔐 Logowanie Administratora</h1>
-            <form method="post">
+            <form method="POST" action="/">
                 <div class="form-group">
                     <label for="password" class="form-label">Hasło dostępu</label>
                     <input type="password" id="password" name="password" class="form-input" placeholder="••••••••••••••••" required autofocus>
@@ -929,11 +806,9 @@ ADMIN_LOGIN_TEMPLATE = '''
         </div>
     </div>
 </body>
-</html>
-'''
+</html>'''
 
-ADMIN_TEMPLATE = '''
-<!DOCTYPE html>
+ADMIN_TEMPLATE = '''<!DOCTYPE html>
 <html lang="pl">
 <head>
     <meta charset="UTF-8">
@@ -1493,10 +1368,6 @@ ADMIN_TEMPLATE = '''
             margin-top: 20px;
             position: relative;
         }
-        .chart-container canvas {
-            width: 100% !important;
-            height: 100% !important;
-        }
         .endpoint-card {
             background: rgba(15, 23, 42, 0.7);
             border-radius: 16px;
@@ -1574,94 +1445,6 @@ ADMIN_TEMPLATE = '''
             background: rgba(239, 68, 68, 0.2);
             color: #fca5a5;
         }
-        .user-card {
-            background: var(--card-bg);
-            border-radius: 16px;
-            padding: 20px;
-            margin-bottom: 20px;
-            border: 1px solid var(--border);
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
-            transition: all 0.3s ease;
-        }
-        .user-card:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
-        }
-        .user-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 15px;
-            padding-bottom: 10px;
-            border-bottom: 1px solid var(--border);
-        }
-        .user-ip {
-            font-family: 'JetBrains Mono', monospace;
-            font-weight: 600;
-            color: var(--primary);
-        }
-        .user-stats {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-            gap: 15px;
-        }
-        .stat-box {
-            background: rgba(15, 23, 42, 0.5);
-            border-radius: 12px;
-            padding: 12px;
-            text-align: center;
-        }
-        .stat-value {
-            font-size: 1.4rem;
-            font-weight: 700;
-            margin: 8px 0 4px;
-        }
-        .stat-label {
-            font-size: 0.85rem;
-            color: var(--text-secondary);
-        }
-        .license-badge {
-            display: inline-block;
-            padding: 3px 8px;
-            border-radius: 10px;
-            font-size: 0.8rem;
-            font-weight: 600;
-        }
-        .license-active {
-            background: rgba(16, 185, 129, 0.2);
-            color: #6ee7b7;
-        }
-        .license-inactive {
-            background: rgba(239, 68, 68, 0.2);
-            color: #fca5a5;
-        }
-        .action-buttons {
-            display: flex;
-            gap: 10px;
-            margin-top: 15px;
-        }
-        .pagination {
-            display: flex;
-            justify-content: center;
-            margin-top: 20px;
-            gap: 5px;
-        }
-        .page-item {
-            background: rgba(99, 102, 241, 0.15);
-            border: 1px solid var(--border);
-            color: white;
-            padding: 6px 12px;
-            border-radius: 6px;
-            cursor: pointer;
-            transition: all 0.2s;
-        }
-        .page-item.active {
-            background: var(--primary);
-            border-color: var(--primary);
-        }
-        .page-item:hover:not(.active) {
-            background: rgba(99, 102, 241, 0.3);
-        }
         @media (max-width: 992px) {
             .container {
                 grid-template-columns: 1fr;
@@ -1699,16 +1482,6 @@ ADMIN_TEMPLATE = '''
                 padding: 10px 12px;
             }
         }
-        .search-container {
-            display: flex;
-            gap: 15px;
-            margin-bottom: 20px;
-            flex-wrap: wrap;
-        }
-        .search-input-wrapper {
-            flex: 1;
-            min-width: 200px;
-        }
     </style>
 </head>
 <body>
@@ -1719,36 +1492,32 @@ ADMIN_TEMPLATE = '''
                 <div class="logo-text">❄ COLD SEARCH</div>
             </div>
             <div class="nav-links">
-                <a href="/?tab=dashboard" class="nav-item {% if active_tab == 'dashboard' %}active{% endif %}">
+                <a href="{{ url_for('admin_panel', tab='dashboard') }}" class="nav-item {% if active_tab == 'dashboard' %}active{% endif %}">
                     <i class="fas fa-home nav-icon"></i>
                     <span class="nav-text">Dashboard</span>
                 </a>
-                <a href="/?tab=licenses" class="nav-item {% if active_tab == 'licenses' %}active{% endif %}">
+                <a href="{{ url_for('admin_panel', tab='licenses') }}" class="nav-item {% if active_tab == 'licenses' %}active{% endif %}">
                     <i class="fas fa-key nav-icon"></i>
                     <span class="nav-text">Licencje</span>
                 </a>
-                <a href="/?tab=users" class="nav-item {% if active_tab == 'users' %}active{% endif %}">
-                    <i class="fas fa-users nav-icon"></i>
-                    <span class="nav-text">Użytkownicy</span>
-                </a>
-                <a href="/?tab=imports" class="nav-item {% if active_tab == 'imports' %}active{% endif %}">
+                <a href="{{ url_for('admin_panel', tab='imports') }}" class="nav-item {% if active_tab == 'imports' %}active{% endif %}">
                     <i class="fas fa-file-import nav-icon"></i>
                     <span class="nav-text">Import danych</span>
                 </a>
-                <a href="/?tab=bans" class="nav-item {% if active_tab == 'bans' %}active{% endif %}">
+                <a href="{{ url_for('admin_panel', tab='bans') }}" class="nav-item {% if active_tab == 'bans' %}active{% endif %}">
                     <i class="fas fa-ban nav-icon"></i>
                     <span class="nav-text">Bany IP</span>
                 </a>
-                <a href="/?tab=stats" class="nav-item {% if active_tab == 'stats' %}active{% endif %}">
+                <a href="{{ url_for('admin_panel', tab='stats') }}" class="nav-item {% if active_tab == 'stats' %}active{% endif %}">
                     <i class="fas fa-chart-bar nav-icon"></i>
                     <span class="nav-text">Statystyki</span>
                 </a>
-                <a href="/?tab=help" class="nav-item {% if active_tab == 'help' %}active{% endif %}">
+                <a href="{{ url_for('admin_panel', tab='help') }}" class="nav-item {% if active_tab == 'help' %}active{% endif %}">
                     <i class="fas fa-question-circle nav-icon"></i>
                     <span class="nav-text">Dokumentacja API</span>
                 </a>
             </div>
-            <button class="logout-btn" onclick="location.href='/logout'">
+            <button class="logout-btn" onclick="location.href='{{ url_for('admin_logout') }}'">
                 <i class="fas fa-sign-out-alt logout-icon"></i>
                 <span>Wyloguj się</span>
             </button>
@@ -1761,7 +1530,7 @@ ADMIN_TEMPLATE = '''
                     <i class="fas fa-snowflake" style="font-size: 1.8rem; color: var(--primary);"></i>
                     <div class="logo-text-main">COLD SEARCH ADMIN</div>
                 </div>
-                <a href="/logout" class="logout-btn-header">
+                <a href="{{ url_for('admin_logout') }}" class="logout-btn-header">
                     <i class="fas fa-sign-out-alt"></i> Wyloguj
                 </a>
             </div>
@@ -1818,27 +1587,6 @@ ADMIN_TEMPLATE = '''
                     </div>
                 </div>
                 
-                <!-- Wykresy -->
-                <div class="section">
-                    <div class="section-title">
-                        <i class="fas fa-chart-line"></i> Wykresy aktywności
-                    </div>
-                    <div class="system-grid">
-                        <div class="system-card">
-                            <h4><i class="fas fa-database"></i> Nowe dane (ostatnie 7 dni)</h4>
-                            <div class="chart-container">
-                                <canvas id="dataChart"></canvas>
-                            </div>
-                        </div>
-                        <div class="system-card">
-                            <h4><i class="fas fa-search"></i> Aktywność wyszukiwań (ostatnie 7 dni)</h4>
-                            <div class="chart-container">
-                                <canvas id="searchChart"></canvas>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                
                 <!-- Ostatnie leaki -->
                 <div class="section">
                     <div class="section-title">
@@ -1852,20 +1600,31 @@ ADMIN_TEMPLATE = '''
                                 <span style="color: var(--text-secondary); margin-left: 10px;">• {{ format_datetime(leak.created_at) }}</span>
                             </small>
                         </div>
+                    {% else %}
+                        <div style="text-align: center; padding: 20px; color: var(--text-secondary);">
+                            Brak danych wyciekowych w bazie
+                        </div>
                     {% endfor %}
                 </div>
                 
-                <!-- Najczęstsze wyszukiwania -->
+                <!-- Najczęstsze źródła -->
                 <div class="section">
                     <div class="section-title">
-                        <i class="fas fa-search"></i> Najczęstsze wyszukiwania
+                        <i class="fas fa-layer-group"></i> Najczęstsze źródła danych
                     </div>
-                    {% for search in top_searches %}
-                        <div class="leak-item">
-                            <div class="leak-data">{{ search.query }}</div>
-                            <small style="color: var(--text-secondary); margin-left: 10px;">
-                                • Liczba wystąpień: {{ search.count }}
-                            </small>
+                    {% for source in top_sources %}
+                        <div style="margin-bottom: 15px;">
+                            <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+                                <span style="font-weight: 500;">{{ source.source }}</span>
+                                <span style="color: var(--text-secondary);">{{ source.count }}</span>
+                            </div>
+                            <div class="source-bar">
+                                <div class="source-fill" style="width: {{ (source.count / total_leaks * 100) | int }}%;"></div>
+                            </div>
+                        </div>
+                    {% else %}
+                        <div style="text-align: center; padding: 20px; color: var(--text-secondary);">
+                            Brak źródeł danych w bazie
                         </div>
                     {% endfor %}
                 </div>
@@ -1890,19 +1649,40 @@ ADMIN_TEMPLATE = '''
                             </div>
                         </div>
                         <div class="system-card">
-                            <h4><i class="fas fa-database"></i> Wydajność bazy</h4>
+                            <h4><i class="fas fa-database"></i> Baza danych leaków</h4>
                             <div class="system-info">
                                 <div class="system-info-item">
-                                    <div class="system-info-label">Średni czas zapytania</div>
-                                    <div class="system-info-value">{{ db_performance.avg_query_time }} ms</div>
+                                    <div class="system-info-label">Status</div>
+                                    <div class="system-info-value" style="color: var(--success);">
+                                        <i class="fas fa-circle" style="font-size: 0.6rem; margin-right: 6px;"></i> Online
+                                    </div>
                                 </div>
                                 <div class="system-info-item">
-                                    <div class="system-info-label">Wykorzystanie CPU</div>
-                                    <div class="system-info-value">{{ db_performance.cpu_usage }}%</div>
+                                    <div class="system-info-label">Liczba rekordów</div>
+                                    <div class="system-info-value">{{ "{:,}".format(total_leaks).replace(",", " ") }} rekordów</div>
                                 </div>
                                 <div class="system-info-item">
-                                    <div class="system-info-label">Wykorzystanie pamięci</div>
-                                    <div class="system-info-value">{{ db_performance.memory_usage }}%</div>
+                                    <div class="system-info-label">Ostatnia aktualizacja</div>
+                                    <div class="system-info-value">{{ format_datetime(now) }}</div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="system-card">
+                            <h4><i class="fas fa-cloud"></i> Supabase API</h4>
+                            <div class="system-info">
+                                <div class="system-info-item">
+                                    <div class="system-info-label">Status</div>
+                                    <div class="system-info-value" style="color: var(--success);">
+                                        <i class="fas fa-circle" style="font-size: 0.6rem; margin-right: 6px;"></i> Online
+                                    </div>
+                                </div>
+                                <div class="system-info-item">
+                                    <div class="system-info-label">Aktywne licencje</div>
+                                    <div class="system-info-value">{{ active_licenses }}</div>
+                                </div>
+                                <div class="system-info-item">
+                                    <div class="system-info-label">Zbanowane IP</div>
+                                    <div class="system-info-value">{{ banned_ips|length }}</div>
                                 </div>
                             </div>
                         </div>
@@ -1917,22 +1697,7 @@ ADMIN_TEMPLATE = '''
                         <i class="fas fa-key"></i> Zarządzanie licencjami ({{ licenses|length }})
                     </div>
                     
-                    <div class="search-container">
-                        <div class="search-input-wrapper">
-                            <label class="form-label">Wyszukaj licencję</label>
-                            <div class="search-box">
-                                <i class="fas fa-search"></i>
-                                <input type="text" id="licenseSearch" class="search-input-field" placeholder="Wpisz klucz licencji, IP lub typ...">
-                            </div>
-                        </div>
-                        <div style="align-self: flex-end;">
-                            <button class="btn" onclick="resetFilters()">
-                                <i class="fas fa-filter-circle-xmark"></i> Reset filtrów
-                            </button>
-                        </div>
-                    </div>
-                    
-                    <form method="post" style="margin-bottom:25px;">
+                    <form method="post">
                         <input type="hidden" name="action" value="add_license">
                         <div class="form-row">
                             <div class="form-group">
@@ -1964,7 +1729,7 @@ ADMIN_TEMPLATE = '''
                     </form>
                     
                     <div class="table-container">
-                        <table class="table" id="licensesTable">
+                        <table class="table">
                             <thead>
                                 <tr>
                                     <th>Klucz dostępu</th>
@@ -1983,7 +1748,7 @@ ADMIN_TEMPLATE = '''
                                     <td>
                                         <span class="key">{{ lic.key }}</span>
                                         <div style="font-size: 0.8rem; color: var(--text-secondary); margin-top: 4px;">
-                                            {% if lic.ip %}
+                                            {% if lic.ip and lic.ip.strip() != "" %}
                                             <i class="fas fa-lock" style="margin-right: 4px;"></i>Przypisany do: {{ lic.ip }}
                                             {% else %}
                                             <i class="fas fa-unlock" style="margin-right: 4px; color: var(--warning);"></i>Bez ograniczeń IP
@@ -1992,7 +1757,7 @@ ADMIN_TEMPLATE = '''
                                     </td>
                                     <td>{{ lic.expiry.split('T')[0] }}</td>
                                     <td>
-                                        {% if lic.ip %}
+                                        {% if lic.ip and lic.ip.strip() != "" %}
                                         <span class="ip-badge">{{ lic.ip }}</span>
                                         {% else %}
                                         <span style="color: var(--warning);">Brak ograniczeń</span>
@@ -2012,9 +1777,6 @@ ADMIN_TEMPLATE = '''
                                     <td>{{ format_datetime(lic.created_at) if lic.created_at else '—' }}</td>
                                     <td>
                                         <div style="display: flex; gap: 8px;">
-                                            <button class="btn btn-secondary" style="padding: 6px 12px; font-size: 0.85rem;" onclick="showLicenseDetails('{{ lic.key }}')">
-                                                <i class="fas fa-chart-line"></i> Aktywność
-                                            </button>
                                             <form method="post" style="display:inline;" onsubmit="return confirm('Na pewno chcesz {{ '' if lic.active else 'w' }}yłączyć tę licencję?')">
                                                 <input type="hidden" name="action" value="toggle_license">
                                                 <input type="hidden" name="key" value="{{ lic.key }}">
@@ -2032,77 +1794,17 @@ ADMIN_TEMPLATE = '''
                                         </div>
                                     </td>
                                 </tr>
+                                {% else %}
+                                <tr>
+                                    <td colspan="8" style="text-align: center; padding: 30px; color: var(--text-secondary);">
+                                        <i class="fas fa-database" style="font-size: 2rem; margin-bottom: 10px; opacity: 0.5;"></i>
+                                        <div>Brak licencji w systemie</div>
+                                        <div style="font-size: 0.9rem; margin-top: 8px;">Wygeneruj pierwszą licencję za pomocą formularza powyżej</div>
+                                    </td>
+                                </tr>
                                 {% endfor %}
                             </tbody>
                         </table>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- Zawartość dla zakładki Użytkownicy -->
-            <div class="tab-content {% if active_tab == 'users' %}active{% endif %}" id="users-tab">
-                <div class="section">
-                    <div class="section-title">
-                        <i class="fas fa-users"></i> Aktywni użytkownicy
-                    </div>
-                    
-                    <div class="search-container">
-                        <div class="search-input-wrapper">
-                            <label class="form-label">Wyszukaj użytkownika</label>
-                            <div class="search-box">
-                                <i class="fas fa-search"></i>
-                                <input type="text" id="userSearch" class="search-input-field" placeholder="Wpisz adres IP lub frazę wyszukiwania...">
-                            </div>
-                        </div>
-                        <div style="align-self: flex-end;">
-                            <button class="btn" onclick="refreshUsers()">
-                                <i class="fas fa-sync-alt"></i> Odśwież
-                            </button>
-                        </div>
-                    </div>
-                    
-                    <div id="usersContainer">
-                        <!-- Dane użytkowników zostaną załadowane przez JavaScript -->
-                        <div style="text-align: center; padding: 40px; color: var(--text-secondary);">
-                            <i class="fas fa-spinner fa-spin" style="font-size: 2rem; margin-bottom: 15px;"></i>
-                            <div>Ładowanie danych użytkowników...</div>
-                        </div>
-                    </div>
-                    
-                    <div id="pagination" class="pagination" style="display: none;">
-                        <!-- Paginacja zostanie wygenerowana przez JavaScript -->
-                    </div>
-                </div>
-                
-                <!-- Szczegóły aktywności licencji -->
-                <div class="section" id="licenseDetailsSection" style="display: none;">
-                    <div class="section-title">
-                        <i class="fas fa-chart-line"></i> Aktywność licencji <span id="licenseDetailsKey"></span>
-                    </div>
-                    <div class="system-grid">
-                        <div class="system-card">
-                            <h4><i class="fas fa-search"></i> Wyszukiwania (ostatnie 50)</h4>
-                            <div style="max-height: 400px; overflow-y: auto;">
-                                <table class="table">
-                                    <thead>
-                                        <tr>
-                                            <th>Data</th>
-                                            <th>Zapytanie</th>
-                                            <th>IP klienta</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody id="licenseActivityTable">
-                                        <!-- Dane zostaną załadowane przez JavaScript -->
-                                    </tbody>
-                                </table>
-                            </div>
-                        </div>
-                        <div class="system-card">
-                            <h4><i class="fas fa-chart-bar"></i> Użycie według dni</h4>
-                            <div class="chart-container">
-                                <canvas id="licenseUsageChart"></canvas>
-                            </div>
-                        </div>
                     </div>
                 </div>
             </div>
@@ -2160,7 +1862,7 @@ ADMIN_TEMPLATE = '''
                     <div class="section-title">
                         <i class="fas fa-ban"></i> Zbanowane adresy IP ({{ banned_ips|length }})
                     </div>
-                    <form method="post" style="margin-bottom:25px;">
+                    <form method="post">
                         <input type="hidden" name="action" value="add_ban">
                         <div class="form-row">
                             <div class="form-group">
@@ -2205,6 +1907,14 @@ ADMIN_TEMPLATE = '''
                                                 <i class="fas fa-user-check"></i> Odbanuj
                                             </button>
                                         </form>
+                                    </td>
+                                </tr>
+                                {% else %}
+                                <tr>
+                                    <td colspan="5" style="text-align: center; padding: 30px; color: var(--text-secondary);">
+                                        <i class="fas fa-user-slash" style="font-size: 2rem; margin-bottom: 10px; opacity: 0.5;"></i>
+                                        <div>Brak zbanowanych adresów IP</div>
+                                        <div style="font-size: 0.9rem; margin-top: 8px;">Dodaj pierwszy zbanowany adres IP za pomocą formularza powyżej</div>
                                     </td>
                                 </tr>
                                 {% endfor %}
@@ -2297,7 +2007,7 @@ ADMIN_TEMPLATE = '''
                                     <td>{{ client_ip }}</td>
                                 </tr>
                                 <tr>
-                                    <td>{{ format_datetime(now) }</td>
+                                    <td>{{ format_datetime(now) }}</td>
                                     <td>Odwiedziny</td>
                                     <td>Wyświetlono dashboard</td>
                                     <td>{{ client_ip }}</td>
@@ -2549,7 +2259,7 @@ Content-Type: application/json
             </div>
             
             <div class="footer">
-                <p>❄️ Cold Search Premium Admin Panel &copy; {{ now.year }} | Wersja 3.1.1</p>
+                <p>❄️ Cold Search Premium Admin Panel &copy; {{ now.year }} | Wersja 3.1.2</p>
                 <p style="margin-top: 6px; font-size: 0.85rem; color: var(--text-secondary);">
                     Panel jest chroniony hasłem i dostępny wyłącznie dla upoważnionych administratorów
                 </p>
@@ -2562,17 +2272,11 @@ Content-Type: application/json
     <script src="https://cdn.datatables.net/1.13.6/js/dataTables.bootstrap5.min.js"></script>
     <script>
         $(document).ready(function() {
-            // Inicjalizacja DataTables
-            $('#licensesTable').DataTable({
+            $('table').DataTable({
                 "language": {
                     "url": "//cdn.datatables.net/plug-ins/1.13.6/i18n/pl.json"
                 },
                 "pageLength": 10
-            });
-            
-            // Wyszukiwanie w DataTable
-            $('#licenseSearch').on('keyup', function() {
-                $('#licensesTable').DataTable().search(this.value).draw();
             });
             
             // Formatowanie liczb
@@ -2583,417 +2287,6 @@ Content-Type: application/json
                     const num = parseInt(numStr.replace(/[^0-9]/g, ''));
                     if (!isNaN(num)) {
                         el.textContent = num.toLocaleString('pl-PL');
-                    }
-                });
-                
-                // Inicjalizacja wykresów
-                initCharts();
-                
-                // Załaduj dane użytkowników
-                if (document.getElementById('users-tab').classList.contains('active')) {
-                    loadUsers(1);
-                }
-            });
-            
-            function initCharts() {
-                // Wykres danych
-                const ctx1 = document.getElementById('dataChart').getContext('2d');
-                new Chart(ctx1, {
-                    type: 'bar',
-                    data: {
-                        labels: [{% for stat in daily_stats %}'{{ stat.date.strftime("%d.%m") }}',{% endfor %}],
-                        datasets: [{
-                            label: 'Nowe rekordy',
-                            data: [{% for stat in daily_stats %}{{ stat.count }},{% endfor %}],
-                            backgroundColor: 'rgba(99, 102, 241, 0.7)',
-                            borderColor: 'rgba(99, 102, 241, 1)',
-                            borderWidth: 1
-                        }]
-                    },
-                    options: {
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        scales: {
-                            y: {
-                                beginAtZero: true,
-                                grid: {
-                                    color: 'rgba(51, 65, 85, 0.5)'
-                                },
-                                ticks: {
-                                    color: '#94a3b8'
-                                }
-                            },
-                            x: {
-                                grid: {
-                                    color: 'rgba(51, 65, 85, 0.5)'
-                                },
-                                ticks: {
-                                    color: '#94a3b8'
-                                }
-                            }
-                        },
-                        plugins: {
-                            legend: {
-                                labels: {
-                                    color: '#f1f5f9'
-                                }
-                            }
-                        }
-                    }
-                });
-                
-                // Wykres wyszukiwań
-                const ctx2 = document.getElementById('searchChart').getContext('2d');
-                new Chart(ctx2, {
-                    type: 'line',
-                    data: {
-                        labels: [{% for stat in user_activity %}'{{ stat.date.strftime("%d.%m") }}',{% endfor %}],
-                        datasets: [{
-                            label: 'Wyszukiwania',
-                            data: [{% for stat in user_activity %}{{ stat.count }},{% endfor %}],
-                            fill: true,
-                            backgroundColor: 'rgba(16, 185, 129, 0.2)',
-                            borderColor: 'rgba(16, 185, 129, 1)',
-                            borderWidth: 2,
-                            tension: 0.3
-                        }]
-                    },
-                    options: {
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        scales: {
-                            y: {
-                                beginAtZero: true,
-                                grid: {
-                                    color: 'rgba(51, 65, 85, 0.5)'
-                                },
-                                ticks: {
-                                    color: '#94a3b8'
-                                }
-                            },
-                            x: {
-                                grid: {
-                                    color: 'rgba(51, 65, 85, 0.5)'
-                                },
-                                ticks: {
-                                    color: '#94a3b8'
-                                }
-                            }
-                        },
-                        plugins: {
-                            legend: {
-                                labels: {
-                                    color: '#f1f5f9'
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-            
-            function resetFilters() {
-                $('#licenseSearch').val('');
-                $('#licensesTable').DataTable().search('').draw();
-            }
-            
-            function loadUsers(page = 1) {
-                const searchQuery = document.getElementById('userSearch')?.value || '';
-                
-                fetch(`/api/users?page=${page}&search=${encodeURIComponent(searchQuery)}`)
-                    .then(response => response.json())
-                    .then(data => {
-                        if (!data.success) {
-                            document.getElementById('usersContainer').innerHTML = `
-                                <div style="text-align: center; padding: 40px; color: var(--danger);">
-                                    <i class="fas fa-exclamation-triangle" style="font-size: 2rem; margin-bottom: 15px;"></i>
-                                    <div>Błąd ładowania danych użytkowników</div>
-                                </div>
-                            `;
-                            return;
-                        }
-                        
-                        // Generowanie kart użytkowników
-                        let usersHTML = '';
-                        
-                        if (data.users.length === 0) {
-                            usersHTML = `
-                                <div style="text-align: center; padding: 40px; color: var(--text-secondary);">
-                                    <i class="fas fa-users" style="font-size: 3rem; margin-bottom: 15px; opacity: 0.5;"></i>
-                                    <div style="font-size: 1.1rem; margin-bottom: 10px;">Brak użytkowników</div>
-                                    <div>Nie znaleziono użytkowników spełniających kryteria wyszukiwania</div>
-                                </div>
-                            `;
-                        } else {
-                            data.users.forEach(user => {
-                                const license = data.license_details[user.ip] || null;
-                                const usagePercent = license ? Math.min(100, Math.round((license.daily_used / license.daily_limit) * 100)) : 0;
-                                const usageClass = usagePercent > 90 ? 'usage-critical' : 
-                                                  usagePercent > 70 ? 'usage-high' : 
-                                                  usagePercent > 40 ? 'usage-medium' : 'usage-low';
-                                
-                                usersHTML += `
-                                    <div class="user-card">
-                                        <div class="user-header">
-                                            <div>
-                                                <div class="user-ip">${user.ip}</div>
-                                                <div style="color: var(--text-secondary); font-size: 0.9rem;">
-                                                    Pierwsze wyszukiwanie: ${user.first_seen ? new Date(user.first_seen).toLocaleString('pl-PL') : 'N/A'}<br>
-                                                    Ostatnie wyszukiwanie: ${user.last_seen ? new Date(user.last_seen).toLocaleString('pl-PL') : 'N/A'}
-                                                </div>
-                                            </div>
-                                            <div>
-                                                ${license ? `
-                                                    <span class="license-badge ${license.active ? 'license-active' : 'license-inactive'}">
-                                                        ${license.active ? 'Aktywna' : 'Nieaktywna'}
-                                                    </span>
-                                                ` : `
-                                                    <span style="color: var(--warning);">Brak licencji</span>
-                                                `}
-                                            </div>
-                                        </div>
-                                        
-                                        <div class="user-stats">
-                                            <div class="stat-box">
-                                                <div class="stat-label">Wyszukiwania</div>
-                                                <div class="stat-value">${user.total_searches}</div>
-                                            </div>
-                                            
-                                            ${license ? `
-                                                <div class="stat-box">
-                                                    <div class="stat-label">Limit dzienny</div>
-                                                    <div class="stat-value">${license.daily_used}/${license.daily_limit}</div>
-                                                </div>
-                                                <div class="stat-box">
-                                                    <div class="stat-label">Limit całkowity</div>
-                                                    <div class="stat-value">${license.total_used}/${license.total_limit}</div>
-                                                </div>
-                                                <div class="stat-box">
-                                                    <div class="stat-label">Typ licencji</div>
-                                                    <div class="stat-value">
-                                                        <span class="license-type type-${license.license_type?.toLowerCase() || 'standard'}">
-                                                            ${license.license_type?.charAt(0).toUpperCase() + license.license_type?.slice(1) || 'Standard'}
-                                                        </span>
-                                                    </div>
-                                                </div>
-                                            ` : ''}
-                                        </div>
-                                        
-                                        ${license ? `
-                                            <div style="margin-top: 15px;">
-                                                <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
-                                                    <span>Wykorzystanie dziennego limitu</span>
-                                                    <span>${usagePercent}%</span>
-                                                </div>
-                                                <div class="usage-bar">
-                                                    <div class="usage-fill ${usageClass}" style="width: ${usagePercent}%"></div>
-                                                </div>
-                                            </div>
-                                        ` : ''}
-                                        
-                                        <div class="action-buttons">
-                                            <button class="btn" onclick="showLicenseDetails('${license?.key || ''}')">
-                                                <i class="fas fa-chart-line"></i> Szczegóły aktywności
-                                            </button>
-                                        </div>
-                                    </div>
-                                `;
-                            });
-                        }
-                        
-                        document.getElementById('usersContainer').innerHTML = usersHTML;
-                        
-                        // Aktualizacja paginacji
-                        updatePagination(data.page, data.pages, data.total_count);
-                    })
-                    .catch(error => {
-                        console.error('Błąd ładowania użytkowników:', error);
-                        document.getElementById('usersContainer').innerHTML = `
-                            <div style="text-align: center; padding: 40px; color: var(--danger);">
-                                <i class="fas fa-exclamation-triangle" style="font-size: 2rem; margin-bottom: 15px;"></i>
-                                <div>Błąd połączenia z serwerem</div>
-                            </div>
-                        `;
-                    });
-            }
-            
-            function updatePagination(currentPage, totalPages, totalCount) {
-                const paginationEl = document.getElementById('pagination');
-                if (totalPages <= 1) {
-                    paginationEl.style.display = 'none';
-                    return;
-                }
-                
-                paginationEl.style.display = 'flex';
-                let html = '';
-                
-                // Przycisk poprzedniej strony
-                if (currentPage > 1) {
-                    html += `<div class="page-item" onclick="loadUsers(${currentPage - 1})">❮</div>`;
-                }
-                
-                // Generowanie numerów stron
-                const maxPagesToShow = 5;
-                let startPage = Math.max(1, currentPage - Math.floor(maxPagesToShow / 2));
-                let endPage = Math.min(totalPages, startPage + maxPagesToShow - 1);
-                
-                if (endPage - startPage + 1 < maxPagesToShow) {
-                    startPage = Math.max(1, endPage - maxPagesToShow + 1);
-                }
-                
-                for (let i = startPage; i <= endPage; i++) {
-                    html += `<div class="page-item ${i === currentPage ? 'active' : ''}" onclick="loadUsers(${i})">${i}</div>`;
-                }
-                
-                // Przycisk następnej strony
-                if (currentPage < totalPages) {
-                    html += `<div class="page-item" onclick="loadUsers(${currentPage + 1})">❯</div>`;
-                }
-                
-                paginationEl.innerHTML = html;
-            }
-            
-            function refreshUsers() {
-                loadUsers(1);
-            }
-            
-            function showLicenseDetails(licenseKey) {
-                if (!licenseKey) {
-                    alert('Brak klucza licencji');
-                    return;
-                }
-                
-                // Pokaż sekcję z detalami
-                document.getElementById('licenseDetailsSection').style.display = 'block';
-                document.getElementById('licenseDetailsKey').textContent = licenseKey;
-                
-                // Załaduj dane aktywności
-                fetch(`/api/license-activity?key=${encodeURIComponent(licenseKey)}`)
-                    .then(response => response.json())
-                    .then(data => {
-                        if (!data.success) {
-                            document.getElementById('licenseActivityTable').innerHTML = `
-                                <tr>
-                                    <td colspan="3" style="text-align: center; color: var(--danger);">
-                                        <i class="fas fa-exclamation-triangle"></i> Brak danych aktywności
-                                    </td>
-                                </tr>
-                            `;
-                            return;
-                        }
-                        
-                        // Wypełnij tabelę aktywności
-                        let tableHTML = '';
-                        if (data.activity.length === 0) {
-                            tableHTML = `
-                                <tr>
-                                    <td colspan="3" style="text-align: center; color: var(--text-secondary);">
-                                        <i class="fas fa-info-circle"></i> Brak aktywności dla tej licencji
-                                    </td>
-                                </tr>
-                            `;
-                        } else {
-                            data.activity.forEach(activity => {
-                                tableHTML += `
-                                    <tr>
-                                        <td>${activity.timestamp ? new Date(activity.timestamp).toLocaleString('pl-PL') : 'N/A'}</td>
-                                        <td>${activity.query || 'Brak zapytania'}</td>
-                                        <td>${activity.ip || 'N/A'}</td>
-                                    </tr>
-                                `;
-                            });
-                        }
-                        
-                        document.getElementById('licenseActivityTable').innerHTML = tableHTML;
-                        
-                        // Aktualizacja wykresu użycia
-                        updateLicenseUsageChart(data.daily_usage);
-                    })
-                    .catch(error => {
-                        console.error('Błąd ładowania aktywności licencji:', error);
-                        document.getElementById('licenseActivityTable').innerHTML = `
-                            <tr>
-                                <td colspan="3" style="text-align: center; color: var(--danger);">
-                                    <i class="fas fa-exclamation-triangle"></i> Błąd ładowania danych
-                                </td>
-                            </tr>
-                        `;
-                    });
-            }
-            
-            function updateLicenseUsageChart(dailyUsage) {
-                const ctx = document.getElementById('licenseUsageChart').getContext('2d');
-                
-                // Destrukcja istniejącego wykresu jeśli istnieje
-                if (window.licenseUsageChart) {
-                    window.licenseUsageChart.destroy();
-                }
-                
-                // Przygotowanie danych
-                const labels = dailyUsage.map(item => {
-                    const date = new Date(item.date);
-                    return date.toLocaleDateString('pl-PL', { day: '2-digit', month: '2-digit' });
-                });
-                
-                const dataValues = dailyUsage.map(item => item.count);
-                
-                // Tworzenie nowego wykresu
-                window.licenseUsageChart = new Chart(ctx, {
-                    type: 'bar',
-                    data: {
-                        labels: labels,
-                        datasets: [{
-                            label: 'Wyszukiwania dziennie',
-                            data: dataValues,
-                            backgroundColor: 'rgba(59, 130, 246, 0.7)',
-                            borderColor: 'rgba(59, 130, 246, 1)',
-                            borderWidth: 1
-                        }]
-                    },
-                    options: {
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        scales: {
-                            y: {
-                                beginAtZero: true,
-                                grid: {
-                                    color: 'rgba(51, 65, 85, 0.5)'
-                                },
-                                ticks: {
-                                    color: '#94a3b8'
-                                }
-                            },
-                            x: {
-                                grid: {
-                                    color: 'rgba(51, 65, 85, 0.5)'
-                                },
-                                ticks: {
-                                    color: '#94a3b8'
-                                }
-                            }
-                        },
-                        plugins: {
-                            legend: {
-                                labels: {
-                                    color: '#f1f5f9'
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-            
-            // Obsługa aktywnej zakładki
-            document.querySelectorAll('.nav-item').forEach(item => {
-                item.addEventListener('click', function() {
-                    const tab = this.getAttribute('href').split('=')[1];
-                    document.querySelectorAll('.tab-content').forEach(content => {
-                        content.classList.remove('active');
-                    });
-                    document.getElementById(`${tab}-tab`).classList.add('active');
-                    
-                    // Załaduj dane użytkowników jeśli otworzono zakładkę użytkowników
-                    if (tab === 'users') {
-                        loadUsers(1);
                     }
                 });
             });
@@ -3009,16 +2302,13 @@ Content-Type: application/json
         });
     </script>
 </body>
-</html>
-'''
+</html>'''
 
-# === URUCHOMIENIE ===
+# === URUCHOMIENIE SERWERA ===
 if __name__ == "__main__":
     initialize_db_pool()
     logger.info("🚀 Cold Search Premium — Panel admina gotowy")
     port = int(os.environ.get('PORT', 10000))
     debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
     app.run(host='0.0.0.0', port=port, debug=debug_mode)
-
-
 
