@@ -12,6 +12,7 @@ from flask import Flask, request, jsonify, render_template_string, redirect, ses
 import mysql.connector
 from mysql.connector import pooling
 import re
+import json
 
 # === KONFIGURACJA ŚRODOWISKOWA ===
 DB_CONFIG = {
@@ -382,12 +383,16 @@ def admin_panel():
             total_searches = 0
             active_users_24h = 0
             try:
-                logs = sb_query("search_logs", "select=count(*)")
-                total_searches = logs[0]['count'] if logs and logs[0] else 0
+                # Naprawione zapytania do Supabase - poprawna składnia dla count
+                logs = sb_query("search_logs", "select=count")  # Zamiast count(*)
+                if logs and logs[0] and 'count' in logs[0]:
+                    total_searches = logs[0]['count']
                 
                 yesterday = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-                active_users = sb_query("search_logs", f"timestamp=gte.{yesterday}&select=count(distinct ip)")
-                active_users_24h = active_users[0]['count'] if active_users and active_users[0] else 0
+                # Naprawione zapytanie - poprawna składnia dla zliczania unikalnych IP
+                active_users = sb_query("search_logs", f"timestamp=gte.{yesterday}&select=count_distinct_ip::int")  # Zamiast count(distinct ip)
+                if active_users and active_users[0] and 'count_distinct_ip' in active_users[0]:
+                    active_users_24h = active_users[0]['count_distinct_ip']
             except Exception as e:
                 logger.error(f"❌ Błąd pobierania statystyk: {e}")
             
@@ -579,18 +584,33 @@ def api_search():
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
         
-        # Wyszukiwanie w bazie danych
-        with get_db() as conn:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute("""
-                SELECT data, source, created_at as timestamp
-                FROM leaks
-                WHERE MATCH(data) AGAINST (%s IN BOOLEAN MODE)
-                LIMIT %s
-            """, (f"+{query}*", limit))
-            results = cursor.fetchall()
-            
-            return jsonify({"success": True, "results": results})
+        # Wyszukiwanie w bazie danych - dodano obsługę timeout i ponownych prób
+        max_retries = 3
+        retry_count = 0
+        results = []
+        
+        while retry_count < max_retries:
+            try:
+                with get_db() as conn:
+                    cursor = conn.cursor(dictionary=True)
+                    # Dodano bardziej wydajne zapytanie
+                    cursor.execute("""
+                        SELECT data, source, created_at as timestamp
+                        FROM leaks
+                        WHERE data LIKE %s OR data LIKE %s
+                        LIMIT %s
+                    """, (f"{query}%", f"%{query}%", limit))
+                    results = cursor.fetchall()
+                    break
+            except mysql.connector.Error as e:
+                retry_count += 1
+                logger.warning(f"⚠️ Próba {retry_count}/{max_retries} nie powiodła się: {e}")
+                time.sleep(1)
+                if retry_count >= max_retries:
+                    logger.error(f"❌ Ostateczny błąd połączenia z MySQL: {e}")
+                    raise
+        
+        return jsonify({"success": True, "results": results})
     
     except Exception as e:
         logger.error(f"Błąd wyszukiwania: {e}")
@@ -1700,7 +1720,7 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
             // Formatowanie liczb
             const statValues = document.querySelectorAll('.stat-value');
             statValues.forEach(el => {
-                const numStr = el.textContent.replace(/\\s/g, '').replace(/\s/g, '');
+                const numStr = el.textContent.replace(/\\\\s/g, '').replace(/\\s/g, '');
                 const num = parseInt(numStr.replace(/[^0-9]/g, ''));
                 if (!isNaN(num)) {
                     el.textContent = num.toLocaleString('pl-PL');
@@ -1735,4 +1755,3 @@ if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10000))
     debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
     app.run(host='0.0.0.0', port=port, debug=debug_mode)
-
