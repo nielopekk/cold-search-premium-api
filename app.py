@@ -13,6 +13,7 @@ import mysql.connector
 from mysql.connector import pooling
 import re
 import json
+from collections import defaultdict
 
 # === KONFIGURACJA ŚRODOWISKOWA ===
 DB_CONFIG = {
@@ -36,7 +37,6 @@ SUPABASE_HEADERS = {
     "Prefer": "return=minimal"
 }
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "wyciek12")
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
@@ -56,7 +56,7 @@ def initialize_db_pool():
                 db_pool = mysql.connector.pooling.MySQLConnectionPool(**DB_CONFIG)
                 logger.info("✅ Pula połączeń z MariaDB została pomyślnie utworzona")
                 ensure_leaks_table_exists()
-                return True
+            return True
         except Exception as e:
             logger.error(f"❌ Błąd połączenia z MariaDB (próba {attempt + 1}): {e}")
             attempt += 1
@@ -138,7 +138,10 @@ def get_db():
 def sb_query(table, params=""):
     try:
         r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}?{params}", headers=SUPABASE_HEADERS, timeout=10)
-        return r.json() if r.status_code == 200 else []
+        if r.status_code == 200:
+            return r.json()
+        logger.error(f"❌ Błąd Supabase ({r.status_code}): {r.text}")
+        return []
     except Exception as e:
         logger.error(f"❌ Błąd zapytania do Supabase ({table}): {e}")
         return []
@@ -176,6 +179,23 @@ def is_valid_ip(ip):
 def format_datetime(dt):
     if isinstance(dt, datetime):
         return dt.strftime("%d.%m.%Y %H:%M")
+    elif isinstance(dt, str):
+        try:
+            # Próba parsowania różnych formatów daty
+            formats = [
+                "%Y-%m-%dT%H:%M:%S.%fZ",
+                "%Y-%m-%dT%H:%M:%SZ",
+                "%Y-%m-%d %H:%M:%S"
+            ]
+            for fmt in formats:
+                try:
+                    parsed = datetime.strptime(dt, fmt)
+                    return parsed.strftime("%d.%m.%Y %H:%M")
+                except ValueError:
+                    continue
+            return dt
+        except:
+            return dt
     return str(dt)
 
 # === IMPORT WORKER ===
@@ -187,8 +207,8 @@ def import_worker(url):
         with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp_file:
             for chunk in response.iter_content(chunk_size=8192):
                 tmp_file.write(chunk)
-            tmp_path = tmp_file.name
-
+        tmp_path = tmp_file.name
+        
         total_added = 0
         with tempfile.TemporaryDirectory() as tmp_dir:
             with zipfile.ZipFile(tmp_path, 'r') as zip_ref:
@@ -209,16 +229,14 @@ def import_worker(url):
                                             batch.append((clean_line, source_name))
                                             if len(batch) >= 1000:
                                                 cursor.executemany(
-                                                    "INSERT INTO leaks (data, source) VALUES (%s, %s) "
-                                                    "ON DUPLICATE KEY UPDATE updated_at = CURRENT_TIMESTAMP",
+                                                    "INSERT IGNORE INTO leaks (data, source) VALUES (%s, %s)",
                                                     batch
                                                 )
                                                 total_added += cursor.rowcount
                                                 batch = []
                                     if batch:
                                         cursor.executemany(
-                                            "INSERT INTO leaks (data, source) VALUES (%s, %s) "
-                                            "ON DUPLICATE KEY UPDATE updated_at = CURRENT_TIMESTAMP",
+                                            "INSERT IGNORE INTO leaks (data, source) VALUES (%s, %s)",
                                             batch
                                         )
                                         total_added += cursor.rowcount
@@ -233,149 +251,183 @@ def import_worker(url):
 # === GŁÓWNY ENDPOINT: / (panel admina) ===
 @app.route("/", methods=["GET", "POST"])
 def admin_panel():
-    if request.method == "POST":
-        if not session.get('is_admin'):
-            if request.form.get("password") == ADMIN_PASSWORD:
-                session['is_admin'] = True
-                session['login_time'] = datetime.now(timezone.utc).isoformat()
-                flash('✅ Zalogowano pomyślnie!', 'success')
-            else:
-                flash('❌ Nieprawidłowe hasło!', 'error')
-                return render_template_string(ADMIN_LOGIN_TEMPLATE)
+    if request.method == "POST" and not session.get('is_admin'):
+        if request.form.get("password") == ADMIN_PASSWORD:
+            session['is_admin'] = True
+            session['login_time'] = datetime.now(timezone.utc).isoformat()
+            flash('✅ Zalogowano pomyślnie!', 'success')
         else:
-            action = request.form.get("action")
-            if action == "add_license":
-                days = int(request.form.get("days", 30))
-                daily_limit = int(request.form.get("daily_limit", 100))
-                total_limit = int(request.form.get("total_limit", 1000))
-                new_key = "COLD-" + uuid.uuid4().hex.upper()[:12]
-                expiry = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
-                payload = {
-                    "key": new_key,
-                    "active": True,
-                    "expiry": expiry,
-                    "daily_limit": daily_limit,
-                    "total_limit": total_limit,
-                    "ip": get_client_ip(),
-                    "created_at": datetime.now(timezone.utc).isoformat()
-                }
-                r = sb_insert("licenses", payload)
-                if r and r.status_code in (200, 201):
-                    flash(f"✅ Licencja: {new_key} (limit dzienny: {daily_limit}, całkowity: {total_limit})", 'success')
-                else:
-                    flash("❌ Błąd generowania licencji", 'error')
-
-            elif action == "toggle_license":
-                key = request.form.get("key")
-                licenses = sb_query("licenses", f"key=eq.{key}")
-                if licenses:
-                    new_status = not licenses[0].get('active', False)
-                    sb_update("licenses", {"active": new_status}, f"key=eq.{key}")
-                    flash(f"{'Włączono' if new_status else 'Wyłączono'} licencję", 'success')
-
-            elif action == "del_license":
-                key = request.form.get("key")
-                sb_delete("licenses", f"key=eq.{key}")
-                flash("✅ Licencja usunięta", 'success')
-
-            elif action == "add_ban":
-                ip = request.form.get("ip", "").strip()
-                if is_valid_ip(ip):
-                    if not sb_query("banned_ips", f"ip=eq.{ip}"):
-                        sb_insert("banned_ips", {"ip": ip, "reason": request.form.get("reason", "—"), "admin_ip": get_client_ip()})
-                        flash(f"✅ Zbanowano IP: {ip}", 'success')
-                    else:
-                        flash("❌ IP już zbanowane", 'error')
-                else:
-                    flash("❌ Nieprawidłowe IP", 'error')
-
-            elif action == "del_ban":
-                ip = request.form.get("ip")
-                sb_delete("banned_ips", f"ip=eq.{ip}")
-                flash("✅ Odbanowano IP", 'success')
-
-            elif action == "import_start":
-                url = request.form.get("import_url")
-                if url and url.startswith(('http://', 'https://')):
-                    threading.Thread(target=import_worker, args=(url,), daemon=True).start()
-                    flash("✅ Import uruchomiony w tle", 'info')
-                else:
-                    flash("❌ Nieprawidłowy URL", 'error')
-
+            flash('❌ Nieprawidłowe hasło!', 'error')
+        return redirect("/")
+    
     if not session.get('is_admin'):
         return render_template_string(ADMIN_LOGIN_TEMPLATE)
-
+    
+    action = request.form.get("action")
+    if action == "add_license":
+        days = int(request.form.get("days", 30))
+        daily_limit = int(request.form.get("daily_limit", 100))
+        total_limit = int(request.form.get("total_limit", 1000))
+        license_type = request.form.get("license_type", "standard")
+        
+        new_key = "COLD-" + uuid.uuid4().hex.upper()[:12]
+        expiry = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+        payload = {
+            "key": new_key,
+            "active": True,
+            "expiry": expiry,
+            "daily_limit": daily_limit,
+            "total_limit": total_limit,
+            "license_type": license_type,
+            "ip": get_client_ip(),
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        r = sb_insert("licenses", payload)
+        if r and r.status_code in (200, 201):
+            flash(f"✅ Licencja: {new_key} (limit dzienny: {daily_limit}, całkowity: {total_limit})", 'success')
+        else:
+            flash(f"❌ Błąd generowania licencji: {r.text if r else 'unknown'}", 'error')
+    elif action == "toggle_license":
+        key = request.form.get("key")
+        licenses = sb_query("licenses", f"key=eq.{key}")
+        if licenses:
+            new_status = not licenses[0].get('active', False)
+            sb_update("licenses", {"active": new_status}, f"key=eq.{key}")
+            flash(f"{'Włączono' if new_status else 'Wyłączono'} licencję", 'success')
+    elif action == "del_license":
+        key = request.form.get("key")
+        sb_delete("licenses", f"key=eq.{key}")
+        flash("✅ Licencja usunięta", 'success')
+    elif action == "add_ban":
+        ip = request.form.get("ip", "").strip()
+        if is_valid_ip(ip):
+            if not sb_query("banned_ips", f"ip=eq.{ip}"):
+                sb_insert("banned_ips", {
+                    "ip": ip, 
+                    "reason": request.form.get("reason", "—"), 
+                    "admin_ip": get_client_ip(),
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                })
+                flash(f"✅ Zbanowano IP: {ip}", 'success')
+            else:
+                flash("❌ IP już zbanowane", 'error')
+        else:
+            flash("❌ Nieprawidłowe IP", 'error')
+    elif action == "del_ban":
+        ip = request.form.get("ip")
+        sb_delete("banned_ips", f"ip=eq.{ip}")
+        flash("✅ Odbanowano IP", 'success')
+    elif action == "import_start":
+        url = request.form.get("import_url")
+        if url and url.startswith(('http://', 'https://')):
+            threading.Thread(target=import_worker, args=(url,), daemon=True).start()
+            flash("✅ Import uruchomiony w tle", 'info')
+        else:
+            flash("❌ Nieprawidłowy URL", 'error')
+    
     # Ładowanie danych
     try:
         with get_db() as conn:
             cursor = conn.cursor(dictionary=True)
             cursor.execute("SELECT COUNT(*) as total FROM leaks")
             total_leaks = cursor.fetchone()['total']
+            
             cursor.execute("SELECT COUNT(DISTINCT source) as sources FROM leaks")
             source_count = cursor.fetchone()['sources']
+            
             cursor.execute("SELECT data, source, created_at FROM leaks ORDER BY created_at DESC LIMIT 10")
             recent_leaks = cursor.fetchall()
+            
             cursor.execute("SELECT source, COUNT(*) as count FROM leaks GROUP BY source ORDER BY count DESC LIMIT 5")
             top_sources = cursor.fetchall()
             
             # Statystyki dla wykresu (ostatnie 7 dni)
             cursor.execute("""
-                SELECT DATE(created_at) as date, COUNT(*) as count 
-                FROM leaks 
-                WHERE created_at >= CURDATE() - INTERVAL 7 DAY 
-                GROUP BY DATE(created_at) 
-                ORDER BY date ASC
+            SELECT DATE(created_at) as date, COUNT(*) as count
+            FROM leaks
+            WHERE created_at >= CURDATE() - INTERVAL 7 DAY
+            GROUP BY DATE(created_at)
+            ORDER BY date ASC
             """)
             daily_stats = cursor.fetchall()
             max_count = max([stat['count'] for stat in daily_stats]) if daily_stats else 1
-
-        licenses = sb_query("licenses", "order=created_at.desc")
-        banned_ips = sb_query("banned_ips", "order=created_at.desc")
-        active_licenses = sum(1 for lic in licenses if lic.get('active'))
-        
-        # Statystyki użytkowników i wyszukiwań
-        total_searches = 0
-        active_users_24h = 0
-        
-        try:
-            # Całkowita liczba wyszukiwań
-            logs = sb_query("search_logs", "select=count(*)")
-            total_searches = logs[0]['count'] if logs and logs[0] else 0
             
-            # Aktywni użytkownicy w ciągu ostatnich 24h
-            yesterday = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-            active_users = sb_query(f"search_logs", f"timestamp=gte.{yesterday}&select=count(distinct key)")
-            active_users_24h = active_users[0]['count'] if active_users and active_users[0] else 0
-        except Exception as e:
-            logger.error(f"❌ Błąd pobierania statystyk: {e}")
-
-        login_time = datetime.fromisoformat(session['login_time'])
-        session_duration = str(datetime.now(timezone.utc) - login_time).split('.')[0]
-        
-        # Dodano brakującą zmienną now
-        now = datetime.now(timezone.utc)
-        
-        tab = request.args.get('tab', 'dashboard')  # Pobierz aktywną zakładkę z URL
-
-        return render_template_string(
-            ADMIN_TEMPLATE,
-            total_leaks=total_leaks,
-            source_count=source_count,
-            recent_leaks=recent_leaks,
-            top_sources=top_sources,
-            daily_stats=daily_stats,
-            max_count=max_count,
-            licenses=licenses,
-            banned_ips=banned_ips,
-            active_licenses=active_licenses,
-            total_searches=total_searches,
-            active_users_24h=active_users_24h,
-            session_duration=session_duration,
-            client_ip=get_client_ip(),
-            format_datetime=format_datetime,
-            now=now,
-            active_tab=tab  # Przekaż aktywną zakładkę do szablonu
-        )
+            # Użytkownicy i wyszukiwania
+            cursor.execute("""
+            SELECT COUNT(DISTINCT ip) as active_users
+            FROM search_logs
+            WHERE timestamp >= NOW() - INTERVAL 1 DAY
+            """)
+            active_users_24h = cursor.fetchone()['active_users']
+            
+            cursor.execute("SELECT COUNT(*) as total_searches FROM search_logs")
+            total_searches = cursor.fetchone()['total_searches']
+            
+            # Licencje
+            licenses = sb_query("licenses", "order=created_at.desc")
+            active_licenses = sum(1 for lic in licenses if lic.get('active'))
+            
+            # Zbanowane IP
+            banned_ips = sb_query("banned_ips", "order=created_at.desc")
+            
+            # Statystyki dla wykresu (aktywność użytkowników)
+            cursor.execute("""
+            SELECT DATE(timestamp) as date, COUNT(*) as count
+            FROM search_logs
+            WHERE timestamp >= NOW() - INTERVAL 7 DAY
+            GROUP BY DATE(timestamp)
+            ORDER BY date ASC
+            """)
+            user_activity = cursor.fetchall()
+            
+            # Top wyszukiwania
+            cursor.execute("""
+            SELECT query, COUNT(*) as count
+            FROM search_logs
+            GROUP BY query
+            ORDER BY count DESC
+            LIMIT 10
+            """)
+            top_searches = cursor.fetchall()
+            
+            # Wydajność bazy
+            db_performance = {
+                "avg_query_time": 45,
+                "cpu_usage": 23,
+                "memory_usage": 42
+            }
+            
+            login_time = datetime.fromisoformat(session['login_time'])
+            session_duration = str(datetime.now(timezone.utc) - login_time).split('.')[0]
+            
+            # Aktualna data i czas
+            now = datetime.now(timezone.utc)
+            
+            # Aktywna zakładka
+            tab = request.args.get('tab', 'dashboard')
+            
+            return render_template_string(
+                ADMIN_TEMPLATE,
+                total_leaks=total_leaks,
+                source_count=source_count,
+                recent_leaks=recent_leaks,
+                top_sources=top_sources,
+                daily_stats=daily_stats,
+                max_count=max_count,
+                licenses=licenses,
+                banned_ips=banned_ips,
+                active_licenses=active_licenses,
+                total_searches=total_searches,
+                active_users_24h=active_users_24h,
+                user_activity=user_activity,
+                top_searches=top_searches,
+                db_performance=db_performance,
+                session_duration=session_duration,
+                client_ip=get_client_ip(),
+                format_datetime=format_datetime,
+                now=now,
+                active_tab=tab
+            )
     except Exception as e:
         logger.error(f"💥 Błąd ładowania panelu: {e}")
         flash("❌ Błąd serwera", 'error')
@@ -387,1634 +439,109 @@ def admin_logout():
     flash("✅ Wylogowano", 'success')
     return redirect("/")
 
-# === SZABLONY HTML ===
-ADMIN_LOGIN_TEMPLATE = '''
-<!DOCTYPE html>
-<html lang="pl">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Cold Search Premium — Panel Admina</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-<style>
-:root {
---primary: #6366f1;
---primary-dark: #4f46e5;
---bg: #0f172a;
---card-bg: #1e293b;
---border: #334155;
---text: #f1f5f9;
---text-secondary: #94a3b8;
---success: #10b981;
---danger: #ef4444;
-}
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body {
-background: var(--bg);
-color: var(--text);
-font-family: 'Inter', sans-serif;
-min-height: 100vh;
-display: flex;
-align-items: center;
-justify-content: center;
-padding: 20px;
-background-image: 
-radial-gradient(circle at 10% 20%, rgba(99, 102, 241, 0.1) 0%, transparent 20%),
-radial-gradient(circle at 90% 80%, rgba(147, 51, 234, 0.1) 0%, transparent 20%);
-}
-.login-container { 
-max-width: 450px; 
-width: 100%;
-animation: fadeIn 0.5s ease;
-}
-.logo { 
-text-align: center; 
-margin-bottom: 20px; 
-}
-.logo-text {
-font-size: 2.8rem;
-font-weight: 800;
-background: linear-gradient(90deg, #8b5cf6, #ec4899);
--webkit-background-clip: text;
--webkit-text-fill-color: transparent;
-background-clip: text;
-letter-spacing: -0.5px;
-}
-.logo-subtitle {
-font-size: 1.1rem;
-color: var(--text-secondary);
-margin-top: 8px;
-font-weight: 300;
-}
-.card {
-background: var(--card-bg);
-border-radius: 24px;
-padding: 40px;
-box-shadow: 
-0 10px 15px -3px rgba(0, 0, 0, 0.1),
-0 4px 6px -4px rgba(0, 0, 0, 0.1),
-0 0 30px rgba(99, 102, 241, 0.15);
-border: 1px solid var(--border);
-backdrop-filter: blur(12px);
-animation: slideUp 0.6s ease;
-}
-.card-title { 
-font-size: 1.8rem; 
-font-weight: 700; 
-margin-bottom: 25px; 
-text-align: center; 
-color: var(--text);
-letter-spacing: -0.5px;
-}
-.form-group { 
-margin-bottom: 20px; 
-}
-.form-label { 
-display: block; 
-margin-bottom: 8px; 
-font-weight: 500; 
-color: var(--text);
-font-size: 0.95rem;
-}
-.form-input {
-width: 100%;
-padding: 16px;
-background: rgba(0, 0, 0, 0.2);
-border: 1px solid var(--border);
-border-radius: 14px;
-color: white;
-font-family: 'Inter', sans-serif;
-font-size: 1rem;
-transition: all 0.3s;
-}
-.form-input:focus {
-outline: none;
-border-color: var(--primary);
-box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.3);
-}
-.btn {
-width: 100%;
-padding: 16px;
-background: linear-gradient(90deg, var(--primary), var(--primary-dark));
-color: white;
-border: none;
-border-radius: 14px;
-font-family: 'Inter', sans-serif;
-font-weight: 600;
-font-size: 1.1rem;
-cursor: pointer;
-transition: all 0.2s ease;
-margin-top: 10px;
-box-shadow: 0 4px 6px rgba(99, 102, 241, 0.3);
-}
-.btn:hover {
-transform: translateY(-2px);
-box-shadow: 0 6px 8px rgba(99, 102, 241, 0.4);
-}
-.btn:active {
-transform: translateY(0);
-}
-.alert {
-padding: 14px;
-margin: 18px 0;
-border-radius: 12px;
-font-weight: 500;
-display: flex;
-align-items: center;
-gap: 12px;
-}
-.alert-error { 
-background: rgba(239, 68, 68, 0.15); 
-border: 1px solid var(--danger); 
-color: var(--danger); 
-animation: shake 0.5s;
-}
-.alert-success { 
-background: rgba(16, 185, 129, 0.15); 
-border: 1px solid var(--success); 
-color: var(--success); 
-}
-@keyframes fadeIn {
-from { opacity: 0; }
-to { opacity: 1; }
-}
-@keyframes slideUp {
-from { 
-opacity: 0; 
-transform: translateY(30px); 
-}
-to { 
-opacity: 1; 
-transform: translateY(0); 
-}
-}
-@keyframes shake {
-0%, 100% { transform: translateX(0); }
-25% { transform: translateX(-5px); }
-75% { transform: translateX(5px); }
-}
-</style>
-</head>
-<body>
-<div class="login-container">
-<div class="logo">
-<div class="logo-text">❄ COLD SEARCH</div>
-<div class="logo-subtitle">Premium Admin Panel</div>
-</div>
-<div class="card">
-<h1 class="card-title">🔐 Logowanie Administratora</h1>
-<form method="post">
-<div class="form-group">
-<label for="password" class="form-label">Hasło dostępu</label>
-<input type="password" id="password" name="password" class="form-input" placeholder="••••••••••••••••" required autofocus>
-</div>
-<button type="submit" class="btn">ZALOGUJ SIĘ</button>
-{% with messages = get_flashed_messages(with_categories=true) %}
-{% for cat, msg in messages %}
-<div class="alert alert-{{ 'success' if cat == 'success' else 'error' }}">
-{% if cat == 'success' %}
-<i class="fas fa-check-circle"></i>
-{% else %}
-<i class="fas fa-exclamation-triangle"></i>
-{% endif %}
-{{ msg }}
-</div>
-{% endfor %}
-{% endwith %}
-</form>
-</div>
-</div>
-</body>
-</html>
-'''
+@app.route("/api/users")
+def api_users():
+    if not session.get('is_admin'):
+        return jsonify({"success": False, "message": "Brak dostępu"}), 401
+    
+    search_query = request.args.get('search', '').strip()
+    page = int(request.args.get('page', 1))
+    per_page = int(request.args.get('per_page', 10))
+    
+    with get_db() as conn:
+        cursor = conn.cursor(dictionary=True)
+        
+        # Pobranie unikalnych IP z search_logs
+        if search_query:
+            cursor.execute("""
+                SELECT DISTINCT ip, MIN(timestamp) as first_seen, MAX(timestamp) as last_seen,
+                COUNT(*) as total_searches
+                FROM search_logs
+                WHERE ip LIKE %s OR query LIKE %s
+                GROUP BY ip
+                ORDER BY last_seen DESC
+                LIMIT %s OFFSET %s
+                """, (f'%{search_query}%', f'%{search_query}%', per_page, (page-1)*per_page))
+        else:
+            cursor.execute("""
+                SELECT DISTINCT ip, MIN(timestamp) as first_seen, MAX(timestamp) as last_seen,
+                COUNT(*) as total_searches
+                FROM search_logs
+                GROUP BY ip
+                ORDER BY last_seen DESC
+                LIMIT %s OFFSET %s
+                """, (per_page, (page-1)*per_page))
+        
+        users = cursor.fetchall()
+        
+        # Pobranie ogólnego statystyk
+        if search_query:
+            cursor.execute("""
+                SELECT COUNT(DISTINCT ip) as total_count
+                FROM search_logs
+                WHERE ip LIKE %s OR query LIKE %s
+                """, (f'%{search_query}%', f'%{search_query}%'))
+        else:
+            cursor.execute("SELECT COUNT(DISTINCT ip) as total_count FROM search_logs")
+        
+        total_count = cursor.fetchone()['total_count']
+        
+        # Pobieranie szczegółów dla każdej licencji
+        license_details = {}
+        if users:
+            ip_list = [user['ip'] for user in users]
+            for ip in ip_list:
+                licenses = sb_query("licenses", f"ip=eq.{ip}")
+                if licenses:
+                    license_details[ip] = licenses[0]
+        
+        return jsonify({
+            "success": True,
+            "users": users,
+            "license_details": license_details,
+            "total_count": total_count,
+            "page": page,
+            "per_page": per_page,
+            "pages": (total_count + per_page - 1) // per_page
+        })
 
-ADMIN_TEMPLATE = '''
-<!DOCTYPE html>
-<html lang="pl">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Cold Search Premium — Panel Admina</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-<link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/dataTables.bootstrap5.min.css">
-<style>
-:root {
---primary: #6366f1;
---primary-dark: #4f46e5;
---secondary: #8b5cf6;
---secondary-dark: #7c3aed;
---bg: #0f172a;
---card-bg: #1e293b;
---border: #334155;
---text: #f1f5f9;
---text-secondary: #94a3b8;
---success: #10b981;
---danger: #ef4444;
---warning: #f59e0b;
---info: #3b82f6;
---gradient-start: #8b5cf6;
---gradient-end: #ec4899;
---sidebar-width: 280px;
-}
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body {
-background: var(--bg);
-color: var(--text);
-font-family: 'Inter', sans-serif;
-min-height: 100vh;
-}
-.container {
-display: grid;
-grid-template-columns: var(--sidebar-width) 1fr;
-min-height: 100vh;
-}
-/* Sidebar */
-.sidebar {
-background: rgba(15, 23, 42, 0.95);
-border-right: 1px solid var(--border);
-padding: 20px 0;
-position: fixed;
-width: var(--sidebar-width);
-height: 100vh;
-z-index: 100;
-overflow-y: auto;
-}
-.logo {
-padding: 0 20px 20px;
-border-bottom: 1px solid var(--border);
-margin-bottom: 20px;
-text-align: center;
-}
-.logo-text {
-font-size: 1.8rem;
-font-weight: 800;
-background: linear-gradient(90deg, var(--gradient-start), var(--gradient-end));
--webkit-background-clip: text;
--webkit-text-fill-color: transparent;
-background-clip: text;
-}
-.nav-links {
-padding: 0 10px;
-}
-.nav-item {
-display: flex;
-align-items: center;
-padding: 14px 20px;
-margin-bottom: 4px;
-border-radius: 12px;
-cursor: pointer;
-transition: all 0.2s;
-text-decoration: none;
-color: var(--text);
-}
-.nav-item:hover {
-background: rgba(99, 102, 241, 0.15);
-}
-.nav-item.active {
-background: rgba(99, 102, 241, 0.25);
-border-left: 4px solid var(--primary);
-}
-.nav-icon {
-margin-right: 15px;
-font-size: 1.2rem;
-width: 24px;
-text-align: center;
-}
-.nav-text {
-font-weight: 500;
-font-size: 1.05rem;
-}
-.logout-btn {
-margin-top: 40px;
-padding: 12px 20px;
-background: rgba(239, 68, 68, 0.15);
-border: 1px solid var(--danger);
-color: var(--danger);
-border-radius: 10px;
-width: calc(100% - 40px);
-cursor: pointer;
-display: flex;
-align-items: center;
-transition: all 0.2s;
-}
-.logout-btn:hover {
-background: rgba(239, 68, 68, 0.25);
-}
-.logout-icon {
-margin-right: 12px;
-font-size: 1.1rem;
-}
-/* Main Content */
-.main-content {
-margin-left: var(--sidebar-width);
-padding: 20px;
-}
-.header {
-display: flex;
-justify-content: space-between;
-align-items: center;
-margin-bottom: 30px;
-padding-bottom: 15px;
-border-bottom: 1px solid var(--border);
-}
-.logo-main {
-display: flex;
-align-items: center;
-gap: 12px;
-}
-.logo-text-main {
-font-size: 1.8rem;
-font-weight: 800;
-background: linear-gradient(90deg, var(--gradient-start), var(--gradient-end));
--webkit-background-clip: text;
--webkit-text-fill-color: transparent;
-background-clip: text;
-}
-.page-title { 
-font-size: 1.5rem; 
-font-weight: 700; 
-color: var(--text); 
-}
-.logout-btn-header {
-background: rgba(239, 68, 68, 0.15);
-color: var(--danger);
-border: 1px solid var(--danger);
-padding: 8px 16px;
-border-radius: 10px;
-text-decoration: none;
-font-weight: 600;
-display: inline-flex;
-align-items: center;
-gap: 8px;
-transition: all 0.2s;
-}
-.logout-btn-header:hover {
-background: rgba(239, 68, 68, 0.25);
-transform: translateY(-1px);
-}
-.stats-grid {
-display: grid;
-grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-gap: 24px;
-margin-bottom: 30px;
-}
-.stat-card {
-background: var(--card-bg);
-border-radius: 20px;
-padding: 24px;
-border: 1px solid var(--border);
-text-align: center;
-transition: all 0.3s ease;
-box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-}
-.stat-card:hover {
-transform: translateY(-5px);
-box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
-border-color: rgba(99, 102, 241, 0.5);
-}
-.stat-card:nth-child(1) { background: linear-gradient(135deg, #6366f1, #8b5cf6); }
-.stat-card:nth-child(2) { background: linear-gradient(135deg, #10b981, #0ea5e9); }
-.stat-card:nth-child(3) { background: linear-gradient(135deg, #f59e0b, #ef4444); }
-.stat-card:nth-child(4) { background: linear-gradient(135deg, #3b82f6, #8b5cf6); }
-.stat-icon {
-font-size: 2.5rem;
-margin-bottom: 12px;
-opacity: 0.9;
-}
-.stat-value { 
-font-size: 2.2rem; 
-font-weight: 800; 
-color: white; 
-font-family: 'JetBrains Mono', monospace; 
-margin: 10px 0; 
-text-shadow: 0 2px 4px rgba(0,0,0,0.2);
-}
-.stat-label { 
-font-size: 1rem; 
-color: rgba(255,255,255,0.9); 
-font-weight: 500; 
-margin-top: 4px;
-}
-.section {
-background: var(--card-bg);
-border-radius: 20px;
-padding: 25px;
-margin-bottom: 25px;
-border: 1px solid var(--border);
-transition: all 0.3s ease;
-box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
-}
-.section-title {
-display: flex;
-align-items: center;
-gap: 12px;
-margin-bottom: 20px;
-font-size: 1.4rem;
-font-weight: 700;
-color: white;
-padding-bottom: 10px;
-border-bottom: 2px solid rgba(99, 102, 241, 0.3);
-}
-.section-title i { 
-color: var(--primary); 
-font-size: 1.3rem; 
-}
-.form-row { 
-display: flex; 
-gap: 20px; 
-margin-bottom: 20px; 
-flex-wrap: wrap; 
-align-items: flex-end;
-}
-.form-group { 
-flex: 1; 
-min-width: 180px; 
-}
-.form-label { 
-display: block; 
-margin-bottom: 8px; 
-font-size: 0.95rem;
-color: var(--text);
-font-weight: 500;
-}
-.form-input, .form-select {
-width: 100%;
-padding: 14px;
-background: rgba(15, 23, 42, 0.7);
-border: 1px solid var(--border);
-border-radius: 12px;
-color: white;
-font-family: 'Inter', sans-serif;
-font-size: 0.95rem;
-transition: all 0.3s;
-}
-.form-input:focus, .form-select:focus {
-outline: none;
-border-color: var(--primary);
-box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
-}
-.btn {
-padding: 12px 28px;
-background: linear-gradient(90deg, #6366f1, #8b5cf6);
-color: white;
-border: none;
-border-radius: 12px;
-font-weight: 600;
-cursor: pointer;
-font-size: 0.95rem;
-transition: all 0.2s;
-display: inline-flex;
-align-items: center;
-gap: 8px;
-box-shadow: 0 3px 5px rgba(0, 0, 0, 0.2);
-font-family: 'Inter', sans-serif;
-}
-.btn:hover {
-transform: translateY(-2px);
-box-shadow: 0 5px 10px rgba(99, 102, 241, 0.3);
-}
-.btn:active {
-transform: translateY(0);
-}
-.btn-danger {
-background: linear-gradient(90deg, #ef4444, #f97316);
-}
-.btn-danger:hover {
-box-shadow: 0 5px 10px rgba(239, 68, 68, 0.3);
-}
-.table-container {
-overflow-x: auto;
-margin-top: 15px;
-border-radius: 16px;
-border: 1px solid var(--border);
-}
-.table { 
-width: 100%; 
-border-collapse: collapse; 
-}
-.table th { 
-text-align: left; 
-padding: 16px 18px; 
-border-bottom: 2px solid var(--border); 
-font-weight: 700;
-background: rgba(0,0,0,0.2);
-color: var(--text);
-font-size: 0.95rem;
-}
-.table td { 
-padding: 16px 18px; 
-border-bottom: 1px solid var(--border);
-font-size: 0.95rem;
-color: var(--text);
-}
-.table tr:last-child td { border-bottom: none; }
-.table tr:hover {
-background: rgba(99, 102, 241, 0.08);
-}
-.key { 
-font-family: 'JetBrains Mono', monospace; 
-color: var(--primary); 
-font-weight: 600; 
-letter-spacing: 0.5px;
-font-size: 0.9rem;
-}
-.status-active { 
-color: var(--success); 
-font-weight: 600; 
-display: inline-flex;
-align-items: center;
-gap: 6px;
-}
-.status-active::before {
-content: '';
-display: inline-block;
-width: 8px;
-height: 8px;
-background: var(--success);
-border-radius: 50%;
-}
-.status-inactive { 
-color: var(--danger); 
-font-weight: 600; 
-display: inline-flex;
-align-items: center;
-gap: 6px;
-}
-.status-inactive::before {
-content: '';
-display: inline-block;
-width: 8px;
-height: 8px;
-background: var(--danger);
-border-radius: 50%;
-}
-.alert {
-padding: 16px;
-margin-bottom: 20px;
-border-radius: 14px;
-font-weight: 500;
-display: flex;
-align-items: center;
-gap: 12px;
-border-left: 4px solid;
-}
-.alert-info { 
-background: rgba(59, 130, 246, 0.15); 
-border-left-color: var(--info);
-color: #bfdbfe; 
-}
-.alert-error { 
-background: rgba(239, 68, 68, 0.15); 
-border-left-color: var(--danger);
-color: #fecaca; 
-}
-.alert-success { 
-background: rgba(16, 185, 129, 0.15); 
-border-left-color: var(--success);
-color: #bbf7d0; 
-}
-.leak-item { 
-padding: 12px 0; 
-border-bottom: 1px dashed var(--border); 
-}
-.leak-item:last-child { border-bottom: none; }
-.leak-data {
-font-family: 'JetBrains Mono', monospace;
-font-size: 0.95rem;
-word-break: break-all;
-color: var(--text);
-}
-.ip-badge {
-display: inline-block;
-background: rgba(139, 92, 246, 0.2);
-border: 1px solid rgba(139, 92, 246, 0.4);
-padding: 4px 10px;
-border-radius: 20px;
-font-size: 0.85rem;
-font-family: 'JetBrains Mono', monospace;
-}
-.limit-badge {
-display: inline-block;
-padding: 4px 12px;
-border-radius: 20px;
-font-size: 0.85rem;
-font-weight: 600;
-margin-right: 8px;
-margin-bottom: 4px;
-}
-.limit-daily { 
-background: rgba(245, 158, 11, 0.2); 
-color: #fcd34d; 
-border: 1px solid rgba(245, 158, 11, 0.3);
-}
-.limit-total { 
-background: rgba(239, 68, 68, 0.2); 
-color: #fca5a5; 
-border: 1px solid rgba(239, 68, 68, 0.3);
-}
-.usage-bar {
-height: 10px;
-background: rgba(56, 189, 248, 0.1);
-border-radius: 5px;
-margin-top: 6px;
-overflow: hidden;
-}
-.usage-fill {
-height: 100%;
-border-radius: 5px;
-}
-.usage-low { background: var(--success); }
-.usage-medium { background: var(--warning); }
-.usage-high { background: var(--danger); }
-.usage-critical {
-background: var(--danger);
-animation: pulse 1.5s infinite;
-}
-@keyframes pulse {
-0% { opacity: 1; }
-50% { opacity: 0.7; }
-100% { opacity: 1; }
-}
-.usage-text {
-font-size: 0.85rem;
-color: var(--text-secondary);
-margin-top: 4px;
-font-weight: 500;
-}
-.search-input {
-display: flex;
-gap: 12px;
-margin-bottom: 20px;
-}
-.search-box {
-flex: 1;
-position: relative;
-}
-.search-box i {
-position: absolute;
-left: 16px;
-top: 50%;
-transform: translateY(-50%);
-color: var(--text-secondary);
-font-size: 1.1rem;
-}
-.search-input-field {
-width: 100%;
-padding: 14px 14px 14px 45px;
-background: rgba(15, 23, 42, 0.7);
-border: 1px solid var(--border);
-border-radius: 14px;
-color: white;
-font-family: 'Inter', sans-serif;
-font-size: 0.95rem;
-transition: all 0.3s;
-}
-.search-input-field:focus {
-outline: none;
-border-color: var(--primary);
-box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
-}
-.system-grid {
-display: grid;
-grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-gap: 20px;
-}
-.system-card {
-background: rgba(15, 23, 42, 0.6);
-border-radius: 16px;
-padding: 20px;
-border: 1px solid var(--border);
-}
-.system-card h4 {
-font-size: 1rem;
-font-weight: 600;
-margin-bottom: 12px;
-color: var(--text);
-display: flex;
-align-items: center;
-gap: 10px;
-}
-.system-card h4 i {
-color: var(--primary);
-}
-.system-info {
-display: grid;
-grid-template-columns: 1fr 1fr;
-gap: 15px;
-}
-.system-info-item {
-padding: 12px;
-border-radius: 12px;
-background: rgba(0,0,0,0.2);
-}
-.system-info-label {
-font-size: 0.85rem;
-color: var(--text-secondary);
-margin-bottom: 4px;
-}
-.system-info-value {
-font-weight: 600;
-font-size: 0.95rem;
-color: var(--text);
-}
-.footer {
-text-align: center;
-margin-top: 30px;
-padding-top: 20px;
-border-top: 1px solid var(--border);
-color: var(--text-secondary);
-font-size: 0.9rem;
-}
-.tab-content {
-display: none;
-}
-.tab-content.active {
-display: block;
-animation: fadeIn 0.3s ease;
-}
-@keyframes fadeIn {
-from { opacity: 0; transform: translateY(10px); }
-to { opacity: 1; transform: translateY(0); }
-}
-.chart-container {
-height: 240px;
-margin-top: 20px;
-}
-.chart-bar {
-background: var(--primary);
-height: 100%;
-border-radius: 4px 4px 0 0;
-transition: height 0.5s ease;
-}
-.endpoint-card {
-background: rgba(15, 23, 42, 0.7);
-border-radius: 16px;
-padding: 20px;
-margin-bottom: 20px;
-border: 1px solid var(--border);
-}
-.endpoint-method {
-display: inline-block;
-padding: 4px 12px;
-border-radius: 20px;
-font-weight: 600;
-font-size: 0.85rem;
-margin-right: 10px;
-}
-.method-get { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; }
-.method-post { background: rgba(99, 102, 241, 0.2); color: #a5b4fc; }
-.method-delete { background: rgba(239, 68, 68, 0.2); color: #fca5a5; }
-.endpoint-url {
-font-family: 'JetBrains Mono', monospace;
-font-weight: 600;
-color: var(--primary);
-margin: 8px 0;
-}
-.endpoint-params {
-margin-top: 10px;
-padding: 12px;
-background: rgba(0,0,0,0.2);
-border-radius: 8px;
-}
-.endpoint-param {
-display: flex;
-gap: 10px;
-margin-bottom: 6px;
-}
-.param-name {
-flex: 1;
-font-weight: 500;
-color: var(--text);
-}
-.param-type {
-background: rgba(56, 189, 248, 0.2);
-padding: 2px 8px;
-border-radius: 4px;
-font-size: 0.85rem;
-}
-.source-bar {
-height: 8px;
-background: rgba(56, 189, 248, 0.1);
-border-radius: 4px;
-margin-top: 4px;
-overflow: hidden;
-}
-.source-fill {
-height: 100%;
-border-radius: 4px;
-background: var(--primary);
-}
-@media (max-width: 768px) {
-.container {
-grid-template-columns: 1fr;
-}
-.sidebar {
-position: relative;
-width: 100%;
-height: auto;
-}
-.main-content {
-margin-left: 0;
-}
-.form-row { flex-direction: column; }
-.stats-grid { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
-.nav-item { padding: 10px 15px; }
-}
-</style>
-</head>
-<body>
-<div class="container">
-<!-- Sidebar - Nawigacja po lewej stronie -->
-<div class="sidebar">
-<div class="logo">
-<div class="logo-text">❄ COLD SEARCH</div>
-</div>
-<div class="nav-links">
-<a href="/?tab=dashboard" class="nav-item {% if active_tab == 'dashboard' %}active{% endif %}">
-<i class="fas fa-home nav-icon"></i>
-<span class="nav-text">Dashboard</span>
-</a>
-<a href="/?tab=licenses" class="nav-item {% if active_tab == 'licenses' %}active{% endif %}">
-<i class="fas fa-key nav-icon"></i>
-<span class="nav-text">Licencje</span>
-</a>
-<a href="/?tab=imports" class="nav-item {% if active_tab == 'imports' %}active{% endif %}">
-<i class="fas fa-file-import nav-icon"></i>
-<span class="nav-text">Import danych</span>
-</a>
-<a href="/?tab=bans" class="nav-item {% if active_tab == 'bans' %}active{% endif %}">
-<i class="fas fa-ban nav-icon"></i>
-<span class="nav-text">Bany IP</span>
-</a>
-<a href="/?tab=stats" class="nav-item {% if active_tab == 'stats' %}active{% endif %}">
-<i class="fas fa-chart-bar nav-icon"></i>
-<span class="nav-text">Statystyki</span>
-</a>
-<a href="/?tab=help" class="nav-item {% if active_tab == 'help' %}active{% endif %}">
-<i class="fas fa-question-circle nav-icon"></i>
-<span class="nav-text">Dokumentacja API</span>
-</a>
-</div>
-<button class="logout-btn" onclick="location.href='/logout'">
-<i class="fas fa-sign-out-alt logout-icon"></i>
-<span>Wyloguj się</span>
-</button>
-</div>
-
-<!-- Główna zawartość -->
-<div class="main-content">
-<div class="header">
-<div class="logo-main">
-<i class="fas fa-snowflake" style="font-size: 1.8rem; color: var(--primary);"></i>
-<div class="logo-text-main">COLD SEARCH ADMIN</div>
-</div>
-<a href="/logout" class="logout-btn-header">
-<i class="fas fa-sign-out-alt"></i> Wyloguj
-</a>
-</div>
-
-{% with messages = get_flashed_messages(with_categories=true) %}
-{% for cat, msg in messages %}
-<div class="alert alert-{{ 'success' if cat == 'success' else 'error' if cat == 'error' else 'info' }}">
-{% if cat == 'success' %}
-<i class="fas fa-check-circle" style="color: var(--success); font-size: 1.2rem;"></i>
-{% elif cat == 'error' %}
-<i class="fas fa-exclamation-triangle" style="color: var(--danger); font-size: 1.2rem;"></i>
-{% else %}
-<i class="fas fa-info-circle" style="color: var(--info); font-size: 1.2rem;"></i>
-{% endif %}
-<div style="flex: 1;">
-<strong style="display: block; margin-bottom: 4px;">{% if cat == 'success' %}Sukces{% elif cat == 'error' %}Błąd{% else %}Informacja{% endif %}</strong>
-<span>{{ msg }}</span>
-</div>
-</div>
-{% endfor %}
-{% endwith %}
-
-<!-- Zawartość dla zakładki Dashboard -->
-<div class="tab-content {% if active_tab == 'dashboard' %}active{% endif %}" id="dashboard-tab">
-<!-- Statystyki -->
-<div class="stats-grid">
-<div class="stat-card">
-<div class="stat-icon">
-<i class="fas fa-database"></i>
-</div>
-<div class="stat-value">{{ "{:,}".format(total_leaks).replace(",", " ") }}</div>
-<div class="stat-label">Rekordów w bazie</div>
-</div>
-<div class="stat-card">
-<div class="stat-icon">
-<i class="fas fa-file-alt"></i>
-</div>
-<div class="stat-value">{{ "{:,}".format(source_count).replace(",", " ") }}</div>
-<div class="stat-label">Źródeł danych</div>
-</div>
-<div class="stat-card">
-<div class="stat-icon">
-<i class="fas fa-key"></i>
-</div>
-<div class="stat-value">{{ active_licenses }}</div>
-<div class="stat-label">Aktywnych licencji</div>
-</div>
-<div class="stat-card">
-<div class="stat-icon">
-<i class="fas fa-users"></i>
-</div>
-<div class="stat-value">{{ "{:,}".format(active_users_24h).replace(",", " ") }}</div>
-<div class="stat-label">Aktywni użytkownicy (24h)</div>
-</div>
-</div>
-
-<!-- Ostatnie leaki -->
-<div class="section">
-<div class="section-title">
-<i class="fas fa-history"></i> Ostatnie dane wyciekowe
-</div>
-{% for leak in recent_leaks %}
-<div class="leak-item">
-<div class="leak-data">{{ leak.data | truncate(70) }}</div>
-<small>
-<span class="ip-badge">{{ leak.source }}</span> 
-<span style="color: var(--text-secondary); margin-left: 10px;">• {{ format_datetime(leak.created_at) }}</span>
-</small>
-</div>
-{% endfor %}
-</div>
-
-<!-- Wykres aktywności -->
-<div class="section">
-<div class="section-title">
-<i class="fas fa-chart-line"></i> Aktywność dodawania danych (ostatnie 7 dni)
-</div>
-<div class="chart-container">
-<div style="display: flex; height: 100%; align-items: flex-end; gap: 4px;">
-{% for stat in daily_stats %}
-<div style="flex: 1; text-align: center;">
-<div class="chart-bar" style="height: {{ (stat.count / max_count * 100) | int }}%;"></div>
-<div style="margin-top: 8px; font-size: 0.8rem; color: var(--text-secondary);">{{ stat.date.strftime('%a') }}</div>
-<div style="margin-top: 2px; font-size: 0.75rem; color: var(--primary);">{{ stat.count }}</div>
-</div>
-{% endfor %}
-</div>
-</div>
-</div>
-
-<!-- Najczęstsze źródła -->
-<div class="section">
-<div class="section-title">
-<i class="fas fa-layer-group"></i> Najczęstsze źródła danych
-</div>
-{% for source in top_sources %}
-<div style="margin-bottom: 15px;">
-<div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
-<span style="font-weight: 500;">{{ source.source }}</span>
-<span style="color: var(--text-secondary);">{{ source.count }}</span>
-</div>
-<div class="source-bar">
-<div class="source-fill" style="width: {{ (source.count / total_leaks * 100) | int }}%;"></div>
-</div>
-</div>
-{% endfor %}
-</div>
-
-<!-- Informacje systemowe -->
-<div class="section">
-<div class="section-title">
-<i class="fas fa-server"></i> Informacje systemowe
-</div>
-<div class="system-grid">
-<div class="system-card">
-<h4><i class="fas fa-clock"></i> Sesja administratora</h4>
-<div class="system-info">
-<div class="system-info-item">
-<div class="system-info-label">Czas trwania</div>
-<div class="system-info-value">{{ session_duration }}</div>
-</div>
-<div class="system-info-item">
-<div class="system-info-label">Twój adres IP</div>
-<div class="system-info-value"><span class="ip-badge">{{ client_ip }}</span></div>
-</div>
-</div>
-</div>
-<div class="system-card">
-<h4><i class="fas fa-database"></i> Baza danych leaków</h4>
-<div class="system-info">
-<div class="system-info-item">
-<div class="system-info-label">Status</div>
-<div class="system-info-value" style="color: var(--success);">
-<i class="fas fa-circle" style="font-size: 0.6rem; margin-right: 6px;"></i> Online
-</div>
-</div>
-<div class="system-info-item">
-<div class="system-info-label">Liczba rekordów</div>
-<div class="system-info-value">{{ "{:,}".format(total_leaks).replace(",", " ") }} rekordów</div>
-</div>
-<div class="system-info-item">
-<div class="system-info-label">Ostatnia aktualizacja</div>
-<div class="system-info-value">{{ format_datetime(now) }}</div>
-</div>
-</div>
-</div>
-<div class="system-card">
-<h4><i class="fas fa-cloud"></i> Supabase API</h4>
-<div class="system-info">
-<div class="system-info-item">
-<div class="system-info-label">Status</div>
-<div class="system-info-value" style="color: var(--success);">
-<i class="fas fa-circle" style="font-size: 0.6rem; margin-right: 6px;"></i> Online
-</div>
-</div>
-<div class="system-info-item">
-<div class="system-info-label">Aktywne licencje</div>
-<div class="system-info-value">{{ active_licenses }}</div>
-</div>
-<div class="system-info-item">
-<div class="system-info-label">Zbanowane IP</div>
-<div class="system-info-value">{{ banned_ips|length }}</div>
-</div>
-</div>
-</div>
-</div>
-</div>
-</div>
-
-<!-- Zawartość dla zakładki Licencje -->
-<div class="tab-content {% if active_tab == 'licenses' %}active{% endif %}" id="licenses-tab">
-<div class="section">
-<div class="section-title">
-<i class="fas fa-key"></i> Zarządzanie licencjami ({{ licenses|length }})
-</div>
-<form method="post" style="margin-bottom:25px;">
-<input type="hidden" name="action" value="add_license">
-<div class="form-row">
-<div class="form-group">
-<label>Liczba dni ważności</label>
-<input type="number" name="days" value="30" min="1" max="3650" class="form-input">
-</div>
-<div class="form-group">
-<label>Limit wyszukiwań dziennych</label>
-<input type="number" name="daily_limit" value="100" min="1" max="10000" class="form-input">
-</div>
-<div class="form-group">
-<label>Limit wyszukiwań całkowitych</label>
-<input type="number" name="total_limit" value="1000" min="10" max="100000" class="form-input">
-</div>
-<div class="form-group" style="align-self: flex-end;">
-<button type="submit" class="btn">
-<i class="fas fa-plus"></i> Generuj licencję
-</button>
-</div>
-</div>
-</form>
-
-<div class="table-container">
-<table class="table">
-<thead>
-<tr>
-<th>Klucz dostępu</th>
-<th>Ważność</th>
-<th>IP</th>
-<th>Status</th>
-<th>Data utworzenia</th>
-<th>Akcje</th>
-</tr>
-</thead>
-<tbody>
-{% for lic in licenses %}
-<tr>
-<td>
-<span class="key">{{ lic.key }}</span>
-<div style="font-size: 0.8rem; color: var(--text-secondary); margin-top: 4px;">
-{% if lic.ip %}
-<i class="fas fa-lock" style="margin-right: 4px;"></i>Przypisany do: {{ lic.ip }}
-{% else %}
-<i class="fas fa-unlock" style="margin-right: 4px; color: var(--warning);"></i>Bez ograniczeń IP
-{% endif %}
-</div>
-</td>
-<td>{{ lic.expiry.split('T')[0] }}</td>
-<td>
-{% if lic.ip %}
-<span class="ip-badge">{{ lic.ip }}</span>
-{% else %}
-<span style="color: var(--warning);">Brak ograniczeń</span>
-{% endif %}
-</td>
-<td>
-<span class="{{ 'status-active' if lic.active else 'status-inactive' }}">
-{{ 'Aktywna' if lic.active else 'Nieaktywna' }}
-</span>
-</td>
-<td>{{ format_datetime(lic.created_at) if lic.created_at else '—' }}</td>
-<td>
-<div style="display: flex; gap: 8px;">
-<form method="post" style="display:inline;" onsubmit="return confirm('Na pewno chcesz {{ '' if lic.active else 'w' }}yłączyć tę licencję?')">
-<input type="hidden" name="action" value="toggle_license">
-<input type="hidden" name="key" value="{{ lic.key }}">
-<button type="submit" class="btn {% if lic.active %}btn-danger{% else %}btn{% endif %}" style="padding: 6px 12px; font-size: 0.85rem;">
-{% if lic.active %}<i class="fas fa-power-off"></i> Wyłącz{% else %}<i class="fas fa-power-off"></i> Włącz{% endif %}
-</button>
-</form>
-<form method="post" style="display:inline;" onsubmit="return confirm('Na pewno usunąć tę licencję?')">
-<input type="hidden" name="action" value="del_license">
-<input type="hidden" name="key" value="{{ lic.key }}">
-<button type="submit" class="btn btn-danger" style="padding: 6px 12px; font-size: 0.85rem;">
-<i class="fas fa-trash"></i> Usuń
-</button>
-</form>
-</div>
-</td>
-</tr>
-{% endfor %}
-</tbody>
-</table>
-</div>
-</div>
-</div>
-
-<!-- Zawartość dla zakładki Import danych -->
-<div class="tab-content {% if active_tab == 'imports' %}active{% endif %}" id="imports-tab">
-<div class="section">
-<div class="section-title">
-<i class="fas fa-file-import"></i> Import bazy danych
-</div>
-<div style="background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.3); border-radius: 16px; padding: 20px; margin-bottom: 20px;">
-<p style="margin: 0; color: #bae6fd; line-height: 1.6;">
-<strong><i class="fas fa-info-circle" style="margin-right: 8px;"></i>Uwaga:</strong> Import danych może zająć kilka minut w zależności od rozmiaru archiwum ZIP. 
-Proces odbywa się w tle - możesz kontynuować pracę w panelu.
-</p>
-</div>
-<form method="post">
-<input type="hidden" name="action" value="import_start">
-<div class="form-row">
-<div class="form-group" style="flex: 3;">
-<label>URL do archiwum ZIP z danymi</label>
-<input type="url" name="import_url" placeholder="https://example.com/dane.zip" class="form-input" required>
-</div>
-<div class="form-group" style="align-self: flex-end; flex: 1;">
-<button type="submit" class="btn" style="width: 100%;">
-<i class="fas fa-cloud-download-alt"></i> Importuj dane
-</button>
-</div>
-</div>
-</form>
-<div style="margin-top: 20px; padding: 16px; background: rgba(15, 23, 42, 0.7); border-radius: 16px; border: 1px solid var(--border);">
-<p style="margin: 0; color: var(--text-secondary); line-height: 1.6;">
-<strong><i class="fas fa-file-archive" style="margin-right: 8px; color: var(--warning);"></i>Wymagania:</strong> 
-Archiwum ZIP powinno zawierać pliki tekstowe (.txt, .csv, .log) z danymi wyciekowymi. 
-Każda linia w pliku powinna zawierać pojedynczy rekord (email, login, etc.).
-</p>
-</div>
-</div>
-
-<div class="section">
-<div class="section-title">
-<i class="fas fa-inbox"></i> Historia importów
-</div>
-<div style="text-align: center; padding: 40px 20px; color: var(--text-secondary);">
-<i class="fas fa-database" style="font-size: 3rem; margin-bottom: 15px; opacity: 0.5;"></i>
-<div style="font-size: 1.1rem; margin-bottom: 10px;">Brak zakończonych importów</div>
-<div>Uruchom nowy import, aby wyświetlić historię</div>
-</div>
-</div>
-</div>
-
-<!-- Zawartość dla zakładki Bany IP -->
-<div class="tab-content {% if active_tab == 'bans' %}active{% endif %}" id="bans-tab">
-<div class="section">
-<div class="section-title">
-<i class="fas fa-ban"></i> Zbanowane adresy IP ({{ banned_ips|length }})
-</div>
-<form method="post" style="margin-bottom:25px;">
-<input type="hidden" name="action" value="add_ban">
-<div class="form-row">
-<div class="form-group">
-<label>Adres IP do zbanowania</label>
-<input type="text" name="ip" placeholder="np. 192.168.1.1" class="form-input" required>
-</div>
-<div class="form-group">
-<label>Powód bana (opcjonalnie)</label>
-<input type="text" name="reason" placeholder="Naruszenie regulaminu" class="form-input">
-</div>
-<div class="form-group" style="align-self: flex-end;">
-<button type="submit" class="btn">
-<i class="fas fa-ban"></i> Zbanuj adres IP
-</button>
-</div>
-</div>
-</form>
-
-<div class="table-container">
-<table class="table">
-<thead>
-<tr>
-<th>Adres IP</th>
-<th>Powód bana</th>
-<th>Data bana</th>
-<th>Zbanował</th>
-<th>Akcje</th>
-</tr>
-</thead>
-<tbody>
-{% for ban in banned_ips %}
-<tr>
-<td><span class="ip-badge">{{ ban.ip }}</span></td>
-<td>{{ ban.reason or 'Brak informacji' }}</td>
-<td>{{ format_datetime(ban.created_at) if ban.created_at else '—' }}</td>
-<td>{{ ban.admin_ip or 'System' }}</td>
-<td>
-<form method="post" style="display:inline;" onsubmit="return confirm('Na pewno chcesz odbanować ten adres?')">
-<input type="hidden" name="action" value="del_ban">
-<input type="hidden" name="ip" value="{{ ban.ip }}">
-<button type="submit" class="btn btn-danger" style="padding: 6px 12px; font-size: 0.85rem;">
-<i class="fas fa-user-check"></i> Odbanuj
-</button>
-</form>
-</td>
-</tr>
-{% endfor %}
-</tbody>
-</table>
-</div>
-</div>
-</div>
-
-<!-- Zawartość dla zakładki Statystyki -->
-<div class="tab-content {% if active_tab == 'stats' %}active{% endif %}" id="stats-tab">
-<div class="section">
-<div class="section-title">
-<i class="fas fa-chart-bar"></i> Szczegółowe statystyki systemu
-</div>
-<div class="system-grid">
-<div class="system-card">
-<h4><i class="fas fa-search"></i> Wyszukiwania</h4>
-<div class="system-info">
-<div class="system-info-item">
-<div class="system-info-label">Wszystkie wyszukiwania</div>
-<div class="system-info-value">{{ "{:,}".format(total_searches).replace(",", " ") }}</div>
-</div>
-<div class="system-info-item">
-<div class="system-info-label">Dziennie (średnio)</div>
-<div class="system-info-value">{{ "{:,}".format((total_searches / 30) | int).replace(",", " ") }}</div>
-</div>
-<div class="system-info-item">
-<div class="system-info-label">Aktywni użytkownicy (24h)</div>
-<div class="system-info-value">{{ "{:,}".format(active_users_24h).replace(",", " ") }}</div>
-</div>
-</div>
-</div>
-<div class="system-card">
-<h4><i class="fas fa-server"></i> Wydajność bazy</h4>
-<div class="system-info">
-<div class="system-info-item">
-<div class="system-info-label">Rekordów w bazie</div>
-<div class="system-info-value">{{ "{:,}".format(total_leaks).replace(",", " ") }}</div>
-</div>
-<div class="system-info-item">
-<div class="system-info-label">Średni czas odpowiedzi</div>
-<div class="system-info-value">45 ms</div>
-</div>
-<div class="system-info-item">
-<div class="system-info-label">Wykorzystanie CPU</div>
-<div class="system-info-value">23%</div>
-</div>
-</div>
-</div>
-<div class="system-card">
-<h4><i class="fas fa-shield-alt"></i> Bezpieczeństwo</h4>
-<div class="system-info">
-<div class="system-info-item">
-<div class="system-info-label">Zbanowane IP</div>
-<div class="system-info-value">{{ "{:,}".format(banned_ips|length).replace(",", " ") }}</div>
-</div>
-<div class="system-info-item">
-<div class="system-info-label">Aktywne licencje</div>
-<div class="system-info-value">{{ "{:,}".format(active_licenses).replace(",", " ") }}</div>
-</div>
-<div class="system-info-item">
-<div class="system-info-label">Nieudane logowania</div>
-<div class="system-info-value">15</div>
-</div>
-</div>
-</div>
-</div>
-</div>
-
-<div class="section">
-<div class="section-title">
-<i class="fas fa-history"></i> Historia aktywności administratora
-</div>
-<div class="table-container">
-<table class="table">
-<thead>
-<tr>
-<th>Data</th>
-<th>Akcja</th>
-<th>Szczegóły</th>
-<th>IP Administratora</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>{{ format_datetime(now) }}</td>
-<td>Logowanie</td>
-<td>Zalogowano do panelu administratora</td>
-<td>{{ client_ip }}</td>
-</tr>
-<tr>
-<td>{{ format_datetime(now) }}</td>
-<td>Odwiedziny</td>
-<td>Wyświetlono dashboard</td>
-<td>{{ client_ip }}</td>
-</tr>
-{% if licenses|length > 0 %}
-<tr>
-<td>{{ format_datetime(licenses[0].created_at) if licenses[0].created_at else now }}</td>
-<td>Generowanie licencji</td>
-<td>Klucz: {{ licenses[0].key }}</td>
-<td>{{ client_ip }}</td>
-</tr>
-{% endif %}
-</tbody>
-</table>
-</div>
-</div>
-</div>
-
-<!-- Zawartość dla zakładki Dokumentacja API - NOWA ZAKŁADKA -->
-<div class="tab-content {% if active_tab == 'help' %}active{% endif %}" id="help-tab">
-<div class="section">
-<div class="section-title">
-<i class="fas fa-book-open"></i> Dokumentacja API
-</div>
-<p style="margin-bottom: 20px; color: var(--text-secondary); line-height: 1.6;">
-Poniżej znajdziesz kompletne informacje na temat endpointów API, które są wykorzystywane przez klienta desktopowego.
-</p>
-
-<div class="endpoint-card">
-<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-<span class="endpoint-method method-get">GET</span>
-<div class="endpoint-url">/api/status</div>
-</div>
-<p style="margin-bottom: 12px; color: var(--text-secondary);">
-Zwraca podstawowy status serwera, wersję i sprawdza dostępność bazy danych.
-</p>
-<div class="endpoint-params">
-<strong style="display: block; margin-bottom: 6px; color: var(--text);">Parametry odpowiedzi:</strong>
-<div class="endpoint-param">
-<span class="param-name">success</span>
-<span class="param-type">boolean</span>
-</div>
-<div class="endpoint-param">
-<span class="param-name">status</span>
-<span class="param-type">string</span>
-</div>
-<div class="endpoint-param">
-<span class="param-name">version</span>
-<span class="param-type">string</span>
-</div>
-<div class="endpoint-param">
-<span class="param-name">server_time</span>
-<span class="param-type">ISO string</span>
-</div>
-<div class="endpoint-param">
-<span class="param-name">database_status</span>
-<span class="param-type">boolean</span>
-</div>
-</div>
-</div>
-
-<div class="endpoint-card">
-<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-<span class="endpoint-method method-post">POST</span>
-<div class="endpoint-url">/api/auth</div>
-</div>
-<p style="margin-bottom: 12px; color: var(--text-secondary);">
-Endpoint do autoryzacji licencji. Wymaga przekazania klucza i opcjonalnie IP klienta.
-</p>
-<div class="endpoint-params">
-<strong style="display: block; margin-bottom: 6px; color: var(--text);">Parametry żądania:</strong>
-<div class="endpoint-param">
-<span class="param-name">key</span>
-<span class="param-type">string (required)</span>
-</div>
-<div class="endpoint-param">
-<span class="param-name">client_ip</span>
-<span class="param-type">string (optional)</span>
-</div>
-<strong style="display: block; margin-top: 12px; margin-bottom: 6px; color: var(--text);">Parametry odpowiedzi:</strong>
-<div class="endpoint-param">
-<span class="param-name">success</span>
-<span class="param-type">boolean</span>
-</div>
-<div class="endpoint-param">
-<span class="param-name">message</span>
-<span class="param-type">string</span>
-</div>
-</div>
-</div>
-
-<div class="endpoint-card">
-<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-<span class="endpoint-method method-post">POST</span>
-<div class="endpoint-url">/api/license-info</div>
-</div>
-<p style="margin-bottom: 12px; color: var(--text-secondary);">
-Zwraca szczegółowe informacje o licencji: typ, data ważności, limity, użycie itp.
-</p>
-<div class="endpoint-params">
-<strong style="display: block; margin-bottom: 6px; color: var(--text);">Parametry żądania:</strong>
-<div class="endpoint-param">
-<span class="param-name">key</span>
-<span class="param-type">string (required)</span>
-</div>
-<div class="endpoint-param">
-<span class="param-name">client_ip</span>
-<span class="param-type">string (optional)</span>
-</div>
-<strong style="display: block; margin-top: 12px; margin-bottom: 6px; color: var(--text);">Parametry odpowiedzi:</strong>
-<div class="endpoint-param">
-<span class="param-name">success</span>
-<span class="param-type">boolean</span>
-</div>
-<div class="endpoint-param">
-<span class="param-name">info.license_type</span>
-<span class="param-type">string</span>
-</div>
-<div class="endpoint-param">
-<span class="param-name">info.expiration_date</span>
-<span class="param-type">string (YYYY-MM-DD)</span>
-</div>
-<div class="endpoint-param">
-<span class="param-name">info.daily_limit</span>
-<span class="param-type">integer</span>
-</div>
-<div class="endpoint-param">
-<span class="param-name">info.daily_used</span>
-<span class="param-type">integer</span>
-</div>
-<div class="endpoint-param">
-<span class="param-name">info.total_limit</span>
-<span class="param-type">integer</span>
-</div>
-<div class="endpoint-param">
-<span class="param-name">info.total_used</span>
-<span class="param-type">integer</span>
-</div>
-<div class="endpoint-param">
-<span class="param-name">info.ip_bound</span>
-<span class="param-type">string</span>
-</div>
-<div class="endpoint-param">
-<span class="param-name">info.last_search</span>
-<span class="param-type">string</span>
-</div>
-</div>
-</div>
-
-<div class="endpoint-card">
-<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-<span class="endpoint-method method-post">POST</span>
-<div class="endpoint-url">/api/search</div>
-</div>
-<p style="margin-bottom: 12px; color: var(--text-secondary);">
-Endpoint do wyszukiwania danych wyciekowych. Wymaga klucza i zapytania.
-</p>
-<div class="endpoint-params">
-<strong style="display: block; margin-bottom: 6px; color: var(--text);">Parametry żądania:</strong>
-<div class="endpoint-param">
-<span class="param-name">key</span>
-<span class="param-type">string (required)</span>
-</div>
-<div class="endpoint-param">
-<span class="param-name">query</span>
-<span class="param-type">string (required)</span>
-</div>
-<div class="endpoint-param">
-<span class="param-name">client_ip</span>
-<span class="param-type">string (optional)</span>
-</div>
-<div class="endpoint-param">
-<span class="param-name">limit</span>
-<span class="param-type">integer (default: 150)</span>
-</div>
-<strong style="display: block; margin-top: 12px; margin-bottom: 6px; color: var(--text);">Parametry odpowiedzi:</strong>
-<div class="endpoint-param">
-<span class="param-name">success</span>
-<span class="param-type">boolean</span>
-</div>
-<div class="endpoint-param">
-<span class="param-name">results</span>
-<span class="param-type">array[object]</span>
-</div>
-<div class="endpoint-param">
-<span class="param-name">results[].data</span>
-<span class="param-type">string</span>
-</div>
-<div class="endpoint-param">
-<span class="param-name">results[].source</span>
-<span class="param-type">string</span>
-</div>
-</div>
-</div>
-
-<div class="section">
-<div class="section-title">
-<i class="fas fa-lightbulb"></i> Przykładowe zapytanie z klienta
-</div>
-<div style="background: rgba(0,0,0,0.3); border-radius: 12px; padding: 20px; font-family: 'JetBrains Mono', monospace; font-size: 0.95rem; overflow-x: auto;">
-<pre style="margin: 0; color: #6ee7b7;">
-// Autoryzacja licencji
-POST /api/auth
-Content-Type: application/json
-
-{
-  "key": "COLD-XXXXXXXXXXXX",
-  "client_ip": "123.123.123.123"
-}
-</pre>
-</div>
-</div>
-
-<div class="section">
-<div class="section-title">
-<i class="fas fa-exclamation-triangle"></i> Ograniczenia i kody błędów
-</div>
-<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px;">
-<div style="background: rgba(15, 23, 42, 0.6); border-radius: 12px; padding: 15px; border: 1px solid var(--border);">
-<strong style="color: var(--danger); display: block; margin-bottom: 8px;">400 Bad Request</strong>
-<p style="color: var(--text-secondary); font-size: 0.95rem; line-height: 1.5;">
-Brak klucza licencyjnego lub nieprawidłowe parametry żądania.
-</p>
-</div>
-<div style="background: rgba(15, 23, 42, 0.6); border-radius: 12px; padding: 15px; border: 1px solid var(--border);">
-<strong style="color: var(--danger); display: block; margin-bottom: 8px;">401 Unauthorized</strong>
-<p style="color: var(--text-secondary); font-size: 0.95rem; line-height: 1.5;">
-Nieprawidłowy klucz licencyjny, licencja wygasła lub jest zablokowana.
-</p>
-</div>
-<div style="background: rgba(15, 23, 42, 0.6); border-radius: 12px; padding: 15px; border: 1px solid var(--border);">
-<strong style="color: var(--danger); display: block; margin-bottom: 8px;">403 Forbidden</strong>
-<p style="color: var(--text-secondary); font-size: 0.95rem; line-height: 1.5;">
-Klucz przypisany do innego adresu IP niż podany w żądaniu.
-</p>
-</div>
-<div style="background: rgba(15, 23, 42, 0.6); border-radius: 12px; padding: 15px; border: 1px solid var(--border);">
-<strong style="color: var(--danger); display: block; margin-bottom: 8px;">429 Too Many Requests</strong>
-<p style="color: var(--text-secondary); font-size: 0.95rem; line-height: 1.5;">
-Przekroczono dzienny lub całkowity limit wyszukiwań dla danej licencji.
-</p>
-</div>
-</div>
-</div>
-</div>
-</div>
-
-<div class="footer">
-<p>❄️ Cold Search Premium Admin Panel &copy; {{ now.year }} | Wersja 3.1</p>
-<p style="margin-top: 6px; font-size: 0.85rem; color: var(--text-secondary);">
-Panel jest chroniony hasłem i dostępny wyłącznie dla upoważnionych administratorów
-</p>
-</div>
-</div>
-
-<script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
-<script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
-<script src="https://cdn.datatables.net/1.13.6/js/dataTables.bootstrap5.min.js"></script>
-<script>
-$(document).ready(function() {
-$('table').DataTable({
-"language": {
-"url": "//cdn.datatables.net/plug-ins/1.13.6/i18n/pl.json"
-}
-});
-
-// Formatowanie liczb
-document.addEventListener('DOMContentLoaded', function() {
-const statValues = document.querySelectorAll('.stat-value');
-statValues.forEach(el => {
-const numStr = el.textContent.replace(/\\s/g, '').replace(/\s/g, '');
-const num = parseInt(numStr.replace(/[^0-9]/g, ''));
-if (!isNaN(num)) {
-el.textContent = num.toLocaleString('pl-PL');
-}
-});
-});
-
-// Automatyczne odświeżanie co 30 sekund (tylko dla dashboardu)
-let autoRefresh = true;
-setTimeout(function refreshData() {
-if (autoRefresh && window.location.search.includes('tab=dashboard')) {
-location.reload();
-}
-setTimeout(refreshData, 30000);
-}, 30000);
-</script>
-</body>
-</html>
-'''
+@app.route("/api/license-activity")
+def api_license_activity():
+    if not session.get('is_admin'):
+        return jsonify({"success": False, "message": "Brak dostępu"}), 401
+    
+    license_key = request.args.get('key', '').strip()
+    if not license_key:
+        return jsonify({"success": False, "message": "Brak klucza licencji"}), 400
+    
+    with get_db() as conn:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT query, timestamp, ip
+            FROM search_logs
+            WHERE key = %s
+            ORDER BY timestamp DESC
+            LIMIT 50
+        """, (license_key,))
+        
+        activity = cursor.fetchall()
+        
+        # Liczba wyszukiwań według dni
+        cursor.execute("""
+            SELECT DATE(timestamp) as date, COUNT(*) as count
+            FROM search_logs
+            WHERE key = %s
+            GROUP BY DATE(timestamp)
+            ORDER BY date ASC
+        """, (license_key,))
+        
+        daily_usage = cursor.fetchall()
+        
+        return jsonify({
+            "success": True,
+            "activity": activity,
+            "daily_usage": daily_usage
+        })
 
 # === API ENDPOINTS ===
 @app.route("/api/status", methods=["GET"])
@@ -2026,10 +553,11 @@ def api_status():
             db_status = cursor.fetchone()[0] == 1
     except:
         db_status = False
+    
     return jsonify({
         "success": True,
         "status": "online",
-        "version": "3.1.0",
+        "version": "3.1.1",
         "server_time": datetime.now(timezone.utc).isoformat(),
         "database_status": db_status
     })
@@ -2039,6 +567,7 @@ def api_auth():
     data = request.json or request.form.to_dict()
     key = data.get("key")
     ip = data.get("client_ip") or get_client_ip()
+    
     if not key:
         return jsonify({"success": False, "message": "Brak klucza"}), 400
     
@@ -2047,8 +576,8 @@ def api_auth():
         return jsonify({"success": False, "message": "Nieprawidłowy klucz licencyjny"}), 401
     
     lic = licenses[0] if isinstance(licenses, list) else licenses
-    
     expiry_str = lic.get('expiry')
+    
     if expiry_str:
         expiry = datetime.fromisoformat(expiry_str.replace('Z', '+00:00'))
     else:
@@ -2057,10 +586,13 @@ def api_auth():
     if datetime.now(timezone.utc) > expiry or not lic.get('active', True):
         return jsonify({"success": False, "message": "Licencja wygasła lub została zablokowana"}), 401
     
-    if not lic.get("ip"):
-        sb_update("licenses", {"ip": ip}, f"key=eq.{key}")
-    elif lic.get("ip") and lic["ip"] != ip:
+    lic_ip = lic.get("ip")
+    if lic_ip and lic_ip != ip:
         return jsonify({"success": False, "message": "Klucz przypisany do innego adresu IP"}), 403
+    
+    # Jeśli IP nie jest ustawione, aktualizuj je
+    if not lic_ip:
+        sb_update("licenses", {"ip": ip}, f"key=eq.{key}")
     
     return jsonify({"success": True, "message": "Zalogowano pomyślnie"})
 
@@ -2069,11 +601,15 @@ def api_info():
     data = request.json or request.form.to_dict()
     key = data.get("key")
     ip = data.get("client_ip") or get_client_ip()
+    
     if not key:
         return jsonify({"success": False, "message": "Brak klucza"}), 400
+    
+    # Weryfikacja autoryzacji
     auth_response = api_auth()
     if auth_response.status_code != 200:
         return auth_response
+    
     licenses = sb_query("licenses", f"key=eq.{key}")
     if not licenses or (isinstance(licenses, list) and len(licenses) == 0):
         return jsonify({"success": False, "message": "Nie znaleziono licencji"}), 404
@@ -2082,29 +618,42 @@ def api_info():
     
     # Pobierz statystyki użycia
     today_count, total_count = 0, 0
+    last_search = "Nigdy"
     try:
         # Dzienne użycie
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        today_logs = sb_query("search_logs", f"key=eq.{key}&timestamp=gte.{today}T00:00:00.000Z&select=count(*)")
-        today_count = today_logs[0].get("count", 0) if today_logs and today_logs[0] else 0
+        today_logs = sb_query("search_logs", f"key=eq.{key}&timestamp=gte.{today}T00:00:00.000Z")
+        today_count = len(today_logs)
         
         # Całkowite użycie
-        total_logs = sb_query("search_logs", f"key=eq.{key}&select=count(*)")
-        total_count = total_logs[0].get("count", 0) if total_logs and total_logs[0] else 0
+        total_logs = sb_query("search_logs", f"key=eq.{key}")
+        total_count = len(total_logs)
+        
+        # Ostatnie wyszukiwanie
+        if total_logs:
+            last_search = max(log['timestamp'] for log in total_logs)
     except Exception as e:
         logger.error(f"Błąd pobierania statystyk użycia: {e}")
+    
+    # Formatowanie daty ważności
+    expiry_date = "Nieznana"
+    if lic.get("expiry"):
+        try:
+            expiry_date = lic["expiry"].split("T")[0]
+        except:
+            expiry_date = str(lic["expiry"])
     
     return jsonify({
         "success": True,
         "info": {
-            "license_type": lic.get("type", "Standard"),
-            "expiration_date": lic["expiry"].split("T")[0] if "expiry" in lic else "Nieznana",
+            "license_type": lic.get("license_type", "Standard").capitalize(),
+            "expiration_date": expiry_date,
             "daily_limit": lic.get("daily_limit", 100),
             "daily_used": today_count,
             "total_limit": lic.get("total_limit", 1000),
             "total_used": total_count,
             "ip_bound": lic.get("ip", "Nie przypisano"),
-            "last_search": "Brak danych"
+            "last_search": last_search
         }
     })
 
@@ -2115,38 +664,2361 @@ def api_search():
     key = data.get("key")
     ip = data.get("client_ip") or get_client_ip()
     limit = int(data.get("limit", 150))
+    
     if not key:
         return jsonify({"success": False, "message": "Brak klucza"}), 400
+    
     if not query:
         return jsonify({"success": False, "message": "Puste zapytanie"}), 400
+    
+    # Sprawdzenie limitów licencji
     auth_response = api_auth()
     if auth_response.status_code != 200:
         return auth_response
+    
     try:
+        # Pobranie licencji do sprawdzenia limitów
+        licenses = sb_query("licenses", f"key=eq.{key}")
+        if not licenses:
+            return jsonify({"success": False, "message": "Nieprawidłowa licencja"}), 401
+        
+        lic = licenses[0] if isinstance(licenses, list) else licenses
+        
+        # Sprawdzenie dziennego limitu
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today_logs = sb_query("search_logs", f"key=eq.{key}&timestamp=gte.{today}T00:00:00.000Z")
+        daily_count = len(today_logs)
+        
+        if daily_count >= lic.get("daily_limit", 100):
+            return jsonify({"success": False, "message": "Przekroczono dzienny limit wyszukiwań"}), 429
+        
+        # Sprawdzenie całkowitego limitu
+        total_logs = sb_query("search_logs", f"key=eq.{key}")
+        total_count = len(total_logs)
+        
+        if total_count >= lic.get("total_limit", 1000):
+            return jsonify({"success": False, "message": "Przekroczono całkowity limit wyszukiwań"}), 429
+        
+        # Zapisanie logu wyszukiwania
         sb_insert("search_logs", {
             "key": key,
             "query": query,
             "ip": ip,
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
+        
+        # Wyszukiwanie w bazie danych
         with get_db() as conn:
             cursor = conn.cursor(dictionary=True)
             cursor.execute("""
-                SELECT data, source
+                SELECT data, source, created_at as timestamp
                 FROM leaks
                 WHERE MATCH(data) AGAINST (%s IN BOOLEAN MODE)
                 LIMIT %s
-            """, (f"*{query}*", limit))
+            """, (f"+{query}*", limit))
             results = cursor.fetchall()
-        return jsonify({"success": True, "results": results})
+            
+            # Formatowanie timestamp dla klienta
+            for result in results:
+                if 'timestamp' in result and result['timestamp']:
+                    result['timestamp'] = result['timestamp'].strftime("%Y-%m-%d %H:%M:%S")
+            
+            return jsonify({"success": True, "results": results})
+    
     except Exception as e:
         logger.error(f"Błąd wyszukiwania: {e}")
         return jsonify({"success": False, "message": f"Błąd bazy danych: {str(e)}"}), 500
+
+# === SZABLONY HTML ===
+ADMIN_LOGIN_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cold Search Premium — Panel Admina</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --bg: #0f172a;
+            --card-bg: #1e293b;
+            --border: #334155;
+            --text: #f1f5f9;
+            --text-secondary: #94a3b8;
+            --success: #10b981;
+            --danger: #ef4444;
+            --sidebar-width: 280px;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'Inter', sans-serif;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            background-image: 
+                radial-gradient(circle at 10% 20%, rgba(99, 102, 241, 0.1) 0%, transparent 20%),
+                radial-gradient(circle at 90% 80%, rgba(147, 51, 234, 0.1) 0%, transparent 20%);
+        }
+        .login-container {
+            max-width: 450px;
+            width: 100%;
+            animation: fadeIn 0.5s ease;
+        }
+        .logo {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        .logo-text {
+            font-size: 2.8rem;
+            font-weight: 800;
+            background: linear-gradient(90deg, #8b5cf6, #ec4899);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            letter-spacing: -0.5px;
+        }
+        .logo-subtitle {
+            font-size: 1.1rem;
+            color: var(--text-secondary);
+            margin-top: 8px;
+            font-weight: 300;
+        }
+        .card {
+            background: var(--card-bg);
+            border-radius: 24px;
+            padding: 40px;
+            box-shadow:
+                0 10px 15px -3px rgba(0, 0, 0, 0.1),
+                0 4px 6px -4px rgba(0, 0, 0, 0.1),
+                0 0 30px rgba(99, 102, 241, 0.15);
+            border: 1px solid var(--border);
+            backdrop-filter: blur(12px);
+            animation: slideUp 0.6s ease;
+        }
+        .card-title {
+            font-size: 1.8rem;
+            font-weight: 700;
+            margin-bottom: 25px;
+            text-align: center;
+            color: var(--text);
+            letter-spacing: -0.5px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        .form-label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            color: var(--text);
+            font-size: 0.95rem;
+        }
+        .form-input {
+            width: 100%;
+            padding: 16px;
+            background: rgba(0, 0, 0, 0.2);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            color: white;
+            font-family: 'Inter', sans-serif;
+            font-size: 1rem;
+            transition: all 0.3s;
+        }
+        .form-input:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.3);
+        }
+        .btn {
+            width: 100%;
+            padding: 16px;
+            background: linear-gradient(90deg, var(--primary), var(--primary-dark));
+            color: white;
+            border: none;
+            border-radius: 14px;
+            font-family: 'Inter', sans-serif;
+            font-weight: 600;
+            font-size: 1.1rem;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            margin-top: 10px;
+            box-shadow: 0 4px 6px rgba(99, 102, 241, 0.3);
+        }
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 8px rgba(99, 102, 241, 0.4);
+        }
+        .btn:active {
+            transform: translateY(0);
+        }
+        .alert {
+            padding: 14px;
+            margin: 18px 0;
+            border-radius: 12px;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .alert-error {
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid var(--danger);
+            color: var(--danger);
+            animation: shake 0.5s;
+        }
+        .alert-success {
+            background: rgba(16, 185, 129, 0.15);
+            border: 1px solid var(--success);
+            color: var(--success);
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        @keyframes slideUp {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        @keyframes shake {
+            0%, 100% { transform: translateX(0); }
+            25% { transform: translateX(-5px); }
+            75% { transform: translateX(5px); }
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <div class="logo">
+            <div class="logo-text">❄ COLD SEARCH</div>
+            <div class="logo-subtitle">Premium Admin Panel</div>
+        </div>
+        <div class="card">
+            <h1 class="card-title">🔐 Logowanie Administratora</h1>
+            <form method="post">
+                <div class="form-group">
+                    <label for="password" class="form-label">Hasło dostępu</label>
+                    <input type="password" id="password" name="password" class="form-input" placeholder="••••••••••••••••" required autofocus>
+                </div>
+                <button type="submit" class="btn">ZALOGUJ SIĘ</button>
+                {% with messages = get_flashed_messages(with_categories=true) %}
+                    {% for cat, msg in messages %}
+                        <div class="alert alert-{{ 'success' if cat == 'success' else 'error' }}">
+                            {% if cat == 'success' %}
+                                <i class="fas fa-check-circle"></i>
+                            {% else %}
+                                <i class="fas fa-exclamation-triangle"></i>
+                            {% endif %}
+                            {{ msg }}
+                        </div>
+                    {% endfor %}
+                {% endwith %}
+            </form>
+        </div>
+    </div>
+</body>
+</html>
+'''
+
+ADMIN_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cold Search Premium — Panel Admina</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/dataTables.bootstrap5.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --secondary: #8b5cf6;
+            --secondary-dark: #7c3aed;
+            --bg: #0f172a;
+            --card-bg: #1e293b;
+            --border: #334155;
+            --text: #f1f5f9;
+            --text-secondary: #94a3b8;
+            --success: #10b981;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+            --info: #3b82f6;
+            --gradient-start: #8b5cf6;
+            --gradient-end: #ec4899;
+            --sidebar-width: 280px;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'Inter', sans-serif;
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+        .container {
+            display: grid;
+            grid-template-columns: var(--sidebar-width) 1fr;
+            min-height: 100vh;
+        }
+        /* Sidebar */
+        .sidebar {
+            background: rgba(15, 23, 42, 0.95);
+            border-right: 1px solid var(--border);
+            padding: 20px 0;
+            position: fixed;
+            width: var(--sidebar-width);
+            height: 100vh;
+            z-index: 100;
+            overflow-y: auto;
+            backdrop-filter: blur(10px);
+        }
+        .logo {
+            padding: 0 20px 20px;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        .logo-text {
+            font-size: 1.8rem;
+            font-weight: 800;
+            background: linear-gradient(90deg, var(--gradient-start), var(--gradient-end));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .nav-links {
+            padding: 0 10px;
+        }
+        .nav-item {
+            display: flex;
+            align-items: center;
+            padding: 14px 20px;
+            margin-bottom: 4px;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-decoration: none;
+            color: var(--text);
+        }
+        .nav-item:hover {
+            background: rgba(99, 102, 241, 0.15);
+        }
+        .nav-item.active {
+            background: rgba(99, 102, 241, 0.25);
+            border-left: 4px solid var(--primary);
+        }
+        .nav-icon {
+            margin-right: 15px;
+            font-size: 1.2rem;
+            width: 24px;
+            text-align: center;
+        }
+        .nav-text {
+            font-weight: 500;
+            font-size: 1.05rem;
+        }
+        .logout-btn {
+            margin-top: 40px;
+            padding: 12px 20px;
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid var(--danger);
+            color: var(--danger);
+            border-radius: 10px;
+            width: calc(100% - 40px);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            transition: all 0.2s;
+        }
+        .logout-btn:hover {
+            background: rgba(239, 68, 68, 0.25);
+        }
+        .logout-icon {
+            margin-right: 12px;
+            font-size: 1.1rem;
+        }
+        /* Main Content */
+        .main-content {
+            margin-left: var(--sidebar-width);
+            padding: 20px;
+            width: calc(100% - var(--sidebar-width));
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid var(--border);
+        }
+        .logo-main {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .logo-text-main {
+            font-size: 1.8rem;
+            font-weight: 800;
+            background: linear-gradient(90deg, var(--gradient-start), var(--gradient-end));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .page-title {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--text);
+        }
+        .logout-btn-header {
+            background: rgba(239, 68, 68, 0.15);
+            color: var(--danger);
+            border: 1px solid var(--danger);
+            padding: 8px 16px;
+            border-radius: 10px;
+            text-decoration: none;
+            font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            transition: all 0.2s;
+        }
+        .logout-btn-header:hover {
+            background: rgba(239, 68, 68, 0.25);
+            transform: translateY(-1px);
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 24px;
+            margin-bottom: 30px;
+        }
+        .stat-card {
+            background: var(--card-bg);
+            border-radius: 20px;
+            padding: 24px;
+            border: 1px solid var(--border);
+            text-align: center;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        .stat-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
+            border-color: rgba(99, 102, 241, 0.5);
+        }
+        .stat-card:nth-child(1) { background: linear-gradient(135deg, #6366f1, #8b5cf6); }
+        .stat-card:nth-child(2) { background: linear-gradient(135deg, #10b981, #0ea5e9); }
+        .stat-card:nth-child(3) { background: linear-gradient(135deg, #f59e0b, #ef4444); }
+        .stat-card:nth-child(4) { background: linear-gradient(135deg, #3b82f6, #8b5cf6); }
+        .stat-icon {
+            font-size: 2.5rem;
+            margin-bottom: 12px;
+            opacity: 0.9;
+        }
+        .stat-value {
+            font-size: 2.2rem;
+            font-weight: 800;
+            color: white;
+            font-family: 'JetBrains Mono', monospace;
+            margin: 10px 0;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.2);
+        }
+        .stat-label {
+            font-size: 1rem;
+            color: rgba(255,255,255,0.9);
+            font-weight: 500;
+            margin-top: 4px;
+        }
+        .section {
+            background: var(--card-bg);
+            border-radius: 20px;
+            padding: 25px;
+            margin-bottom: 25px;
+            border: 1px solid var(--border);
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+        }
+        .section-title {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 20px;
+            font-size: 1.4rem;
+            font-weight: 700;
+            color: white;
+            padding-bottom: 10px;
+            border-bottom: 2px solid rgba(99, 102, 241, 0.3);
+        }
+        .section-title i {
+            color: var(--primary);
+            font-size: 1.3rem;
+        }
+        .form-row {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            align-items: flex-end;
+        }
+        .form-group {
+            flex: 1;
+            min-width: 180px;
+        }
+        .form-label {
+            display: block;
+            margin-bottom: 8px;
+            font-size: 0.95rem;
+            color: var(--text);
+            font-weight: 500;
+        }
+        .form-input, .form-select {
+            width: 100%;
+            padding: 14px;
+            background: rgba(15, 23, 42, 0.7);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            color: white;
+            font-family: 'Inter', sans-serif;
+            font-size: 0.95rem;
+            transition: all 0.3s;
+        }
+        .form-input:focus, .form-select:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
+        }
+        .btn {
+            padding: 12px 28px;
+            background: linear-gradient(90deg, #6366f1, #8b5cf6);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            font-size: 0.95rem;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            box-shadow: 0 3px 5px rgba(0, 0, 0, 0.2);
+            font-family: 'Inter', sans-serif;
+        }
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 10px rgba(99, 102, 241, 0.3);
+        }
+        .btn:active {
+            transform: translateY(0);
+        }
+        .btn-danger {
+            background: linear-gradient(90deg, #ef4444, #f97316);
+        }
+        .btn-danger:hover {
+            box-shadow: 0 5px 10px rgba(239, 68, 68, 0.3);
+        }
+        .btn-secondary {
+            background: linear-gradient(90deg, #3b82f6, #6366f1);
+        }
+        .table-container {
+            overflow-x: auto;
+            margin-top: 15px;
+            border-radius: 16px;
+            border: 1px solid var(--border);
+        }
+        .table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .table th {
+            text-align: left;
+            padding: 16px 18px;
+            border-bottom: 2px solid var(--border);
+            font-weight: 700;
+            background: rgba(0,0,0,0.2);
+            color: var(--text);
+            font-size: 0.95rem;
+        }
+        .table td {
+            padding: 16px 18px;
+            border-bottom: 1px solid var(--border);
+            font-size: 0.95rem;
+            color: var(--text);
+        }
+        .table tr:last-child td { border-bottom: none; }
+        .table tr:hover {
+            background: rgba(99, 102, 241, 0.08);
+        }
+        .key {
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--primary);
+            font-weight: 600;
+            letter-spacing: 0.5px;
+            font-size: 0.9rem;
+        }
+        .status-active {
+            color: var(--success);
+            font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .status-active::before {
+            content: '';
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            background: var(--success);
+            border-radius: 50%;
+        }
+        .status-inactive {
+            color: var(--danger);
+            font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .status-inactive::before {
+            content: '';
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            background: var(--danger);
+            border-radius: 50%;
+        }
+        .alert {
+            padding: 16px;
+            margin-bottom: 20px;
+            border-radius: 14px;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            border-left: 4px solid;
+        }
+        .alert-info {
+            background: rgba(59, 130, 246, 0.15);
+            border-left-color: var(--info);
+            color: #bfdbfe;
+        }
+        .alert-error {
+            background: rgba(239, 68, 68, 0.15);
+            border-left-color: var(--danger);
+            color: #fecaca;
+        }
+        .alert-success {
+            background: rgba(16, 185, 129, 0.15);
+            border-left-color: var(--success);
+            color: #bbf7d0;
+        }
+        .leak-item {
+            padding: 12px 0;
+            border-bottom: 1px dashed var(--border);
+        }
+        .leak-item:last-child { border-bottom: none; }
+        .leak-data {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.95rem;
+            word-break: break-all;
+            color: var(--text);
+        }
+        .ip-badge {
+            display: inline-block;
+            background: rgba(139, 92, 246, 0.2);
+            border: 1px solid rgba(139, 92, 246, 0.4);
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-family: 'JetBrains Mono', monospace;
+        }
+        .limit-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            margin-right: 8px;
+            margin-bottom: 4px;
+        }
+        .limit-daily {
+            background: rgba(245, 158, 11, 0.2);
+            color: #fcd34d;
+            border: 1px solid rgba(245, 158, 11, 0.3);
+        }
+        .limit-total {
+            background: rgba(239, 68, 68, 0.2);
+            color: #fca5a5;
+            border: 1px solid rgba(239, 68, 68, 0.3);
+        }
+        .usage-bar {
+            height: 10px;
+            background: rgba(56, 189, 248, 0.1);
+            border-radius: 5px;
+            margin-top: 6px;
+            overflow: hidden;
+        }
+        .usage-fill {
+            height: 100%;
+            border-radius: 5px;
+        }
+        .usage-low { background: var(--success); }
+        .usage-medium { background: var(--warning); }
+        .usage-high { background: var(--danger); }
+        .usage-critical {
+            background: var(--danger);
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.7; }
+            100% { opacity: 1; }
+        }
+        .usage-text {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-top: 4px;
+            font-weight: 500;
+        }
+        .search-input {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+        .search-box {
+            flex: 1;
+            position: relative;
+        }
+        .search-box i {
+            position: absolute;
+            left: 16px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--text-secondary);
+            font-size: 1.1rem;
+        }
+        .search-input-field {
+            width: 100%;
+            padding: 14px 14px 14px 45px;
+            background: rgba(15, 23, 42, 0.7);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            color: white;
+            font-family: 'Inter', sans-serif;
+            font-size: 0.95rem;
+            transition: all 0.3s;
+        }
+        .search-input-field:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
+        }
+        .system-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+        }
+        .system-card {
+            background: rgba(15, 23, 42, 0.6);
+            border-radius: 16px;
+            padding: 20px;
+            border: 1px solid var(--border);
+        }
+        .system-card h4 {
+            font-size: 1rem;
+            font-weight: 600;
+            margin-bottom: 12px;
+            color: var(--text);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .system-card h4 i {
+            color: var(--primary);
+        }
+        .system-info {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+        }
+        .system-info-item {
+            padding: 12px;
+            border-radius: 12px;
+            background: rgba(0,0,0,0.2);
+        }
+        .system-info-label {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 4px;
+        }
+        .system-info-value {
+            font-weight: 600;
+            font-size: 0.95rem;
+            color: var(--text);
+        }
+        .footer {
+            text-align: center;
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid var(--border);
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+            animation: fadeIn 0.3s ease;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .chart-container {
+            height: 240px;
+            margin-top: 20px;
+            position: relative;
+        }
+        .chart-container canvas {
+            width: 100% !important;
+            height: 100% !important;
+        }
+        .endpoint-card {
+            background: rgba(15, 23, 42, 0.7);
+            border-radius: 16px;
+            padding: 20px;
+            margin-bottom: 20px;
+            border: 1px solid var(--border);
+        }
+        .endpoint-method {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-weight: 600;
+            font-size: 0.85rem;
+            margin-right: 10px;
+        }
+        .method-get { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; }
+        .method-post { background: rgba(99, 102, 241, 0.2); color: #a5b4fc; }
+        .method-delete { background: rgba(239, 68, 68, 0.2); color: #fca5a5; }
+        .endpoint-url {
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 600;
+            color: var(--primary);
+            margin: 8px 0;
+        }
+        .endpoint-params {
+            margin-top: 10px;
+            padding: 12px;
+            background: rgba(0,0,0,0.2);
+            border-radius: 8px;
+        }
+        .endpoint-param {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 6px;
+        }
+        .param-name {
+            flex: 1;
+            font-weight: 500;
+            color: var(--text);
+        }
+        .param-type {
+            background: rgba(56, 189, 248, 0.2);
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.85rem;
+        }
+        .source-bar {
+            height: 8px;
+            background: rgba(56, 189, 248, 0.1);
+            border-radius: 4px;
+            margin-top: 4px;
+            overflow: hidden;
+        }
+        .source-fill {
+            height: 100%;
+            border-radius: 4px;
+            background: var(--primary);
+        }
+        .license-type {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+        .type-standard {
+            background: rgba(59, 130, 246, 0.2);
+            color: #93c5fd;
+        }
+        .type-premium {
+            background: rgba(168, 85, 247, 0.2);
+            color: #c4b5fd;
+        }
+        .type-enterprise {
+            background: rgba(239, 68, 68, 0.2);
+            color: #fca5a5;
+        }
+        .user-card {
+            background: var(--card-bg);
+            border-radius: 16px;
+            padding: 20px;
+            margin-bottom: 20px;
+            border: 1px solid var(--border);
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+            transition: all 0.3s ease;
+        }
+        .user-card:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
+        }
+        .user-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid var(--border);
+        }
+        .user-ip {
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 600;
+            color: var(--primary);
+        }
+        .user-stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 15px;
+        }
+        .stat-box {
+            background: rgba(15, 23, 42, 0.5);
+            border-radius: 12px;
+            padding: 12px;
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 1.4rem;
+            font-weight: 700;
+            margin: 8px 0 4px;
+        }
+        .stat-label {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+        .license-badge {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 10px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+        .license-active {
+            background: rgba(16, 185, 129, 0.2);
+            color: #6ee7b7;
+        }
+        .license-inactive {
+            background: rgba(239, 68, 68, 0.2);
+            color: #fca5a5;
+        }
+        .action-buttons {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+        .pagination {
+            display: flex;
+            justify-content: center;
+            margin-top: 20px;
+            gap: 5px;
+        }
+        .page-item {
+            background: rgba(99, 102, 241, 0.15);
+            border: 1px solid var(--border);
+            color: white;
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .page-item.active {
+            background: var(--primary);
+            border-color: var(--primary);
+        }
+        .page-item:hover:not(.active) {
+            background: rgba(99, 102, 241, 0.3);
+        }
+        @media (max-width: 992px) {
+            .container {
+                grid-template-columns: 1fr;
+            }
+            .sidebar {
+                position: relative;
+                width: 100%;
+                height: auto;
+            }
+            .main-content {
+                margin-left: 0;
+                width: 100%;
+            }
+            .stats-grid {
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            }
+        }
+        @media (max-width: 768px) {
+            .form-row { 
+                flex-direction: column; 
+            }
+            .nav-item { 
+                padding: 10px 15px; 
+            }
+            .stats-grid {
+                grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            }
+            .section {
+                padding: 15px;
+            }
+            .table-container {
+                font-size: 0.85rem;
+            }
+            .table td, .table th {
+                padding: 10px 12px;
+            }
+        }
+        .search-container {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        .search-input-wrapper {
+            flex: 1;
+            min-width: 200px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Sidebar - Nawigacja po lewej stronie -->
+        <div class="sidebar">
+            <div class="logo">
+                <div class="logo-text">❄ COLD SEARCH</div>
+            </div>
+            <div class="nav-links">
+                <a href="/?tab=dashboard" class="nav-item {% if active_tab == 'dashboard' %}active{% endif %}">
+                    <i class="fas fa-home nav-icon"></i>
+                    <span class="nav-text">Dashboard</span>
+                </a>
+                <a href="/?tab=licenses" class="nav-item {% if active_tab == 'licenses' %}active{% endif %}">
+                    <i class="fas fa-key nav-icon"></i>
+                    <span class="nav-text">Licencje</span>
+                </a>
+                <a href="/?tab=users" class="nav-item {% if active_tab == 'users' %}active{% endif %}">
+                    <i class="fas fa-users nav-icon"></i>
+                    <span class="nav-text">Użytkownicy</span>
+                </a>
+                <a href="/?tab=imports" class="nav-item {% if active_tab == 'imports' %}active{% endif %}">
+                    <i class="fas fa-file-import nav-icon"></i>
+                    <span class="nav-text">Import danych</span>
+                </a>
+                <a href="/?tab=bans" class="nav-item {% if active_tab == 'bans' %}active{% endif %}">
+                    <i class="fas fa-ban nav-icon"></i>
+                    <span class="nav-text">Bany IP</span>
+                </a>
+                <a href="/?tab=stats" class="nav-item {% if active_tab == 'stats' %}active{% endif %}">
+                    <i class="fas fa-chart-bar nav-icon"></i>
+                    <span class="nav-text">Statystyki</span>
+                </a>
+                <a href="/?tab=help" class="nav-item {% if active_tab == 'help' %}active{% endif %}">
+                    <i class="fas fa-question-circle nav-icon"></i>
+                    <span class="nav-text">Dokumentacja API</span>
+                </a>
+            </div>
+            <button class="logout-btn" onclick="location.href='/logout'">
+                <i class="fas fa-sign-out-alt logout-icon"></i>
+                <span>Wyloguj się</span>
+            </button>
+        </div>
+        
+        <!-- Główna zawartość -->
+        <div class="main-content">
+            <div class="header">
+                <div class="logo-main">
+                    <i class="fas fa-snowflake" style="font-size: 1.8rem; color: var(--primary);"></i>
+                    <div class="logo-text-main">COLD SEARCH ADMIN</div>
+                </div>
+                <a href="/logout" class="logout-btn-header">
+                    <i class="fas fa-sign-out-alt"></i> Wyloguj
+                </a>
+            </div>
+            
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% for cat, msg in messages %}
+                    <div class="alert alert-{{ 'success' if cat == 'success' else 'error' if cat == 'error' else 'info' }}">
+                        {% if cat == 'success' %}
+                            <i class="fas fa-check-circle" style="color: var(--success); font-size: 1.2rem;"></i>
+                        {% elif cat == 'error' %}
+                            <i class="fas fa-exclamation-triangle" style="color: var(--danger); font-size: 1.2rem;"></i>
+                        {% else %}
+                            <i class="fas fa-info-circle" style="color: var(--info); font-size: 1.2rem;"></i>
+                        {% endif %}
+                        <div style="flex: 1;">
+                            <strong style="display: block; margin-bottom: 4px;">{% if cat == 'success' %}Sukces{% elif cat == 'error' %}Błąd{% else %}Informacja{% endif %}</strong>
+                            <span>{{ msg }}</span>
+                        </div>
+                    </div>
+                {% endfor %}
+            {% endwith %}
+            
+            <!-- Zawartość dla zakładki Dashboard -->
+            <div class="tab-content {% if active_tab == 'dashboard' %}active{% endif %}" id="dashboard-tab">
+                <!-- Statystyki -->
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon">
+                            <i class="fas fa-database"></i>
+                        </div>
+                        <div class="stat-value">{{ "{:,}".format(total_leaks).replace(",", " ") }}</div>
+                        <div class="stat-label">Rekordów w bazie</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">
+                            <i class="fas fa-file-alt"></i>
+                        </div>
+                        <div class="stat-value">{{ "{:,}".format(source_count).replace(",", " ") }}</div>
+                        <div class="stat-label">Źródeł danych</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">
+                            <i class="fas fa-key"></i>
+                        </div>
+                        <div class="stat-value">{{ active_licenses }}</div>
+                        <div class="stat-label">Aktywnych licencji</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon">
+                            <i class="fas fa-users"></i>
+                        </div>
+                        <div class="stat-value">{{ "{:,}".format(active_users_24h).replace(",", " ") }}</div>
+                        <div class="stat-label">Aktywni użytkownicy (24h)</div>
+                    </div>
+                </div>
+                
+                <!-- Wykresy -->
+                <div class="section">
+                    <div class="section-title">
+                        <i class="fas fa-chart-line"></i> Wykresy aktywności
+                    </div>
+                    <div class="system-grid">
+                        <div class="system-card">
+                            <h4><i class="fas fa-database"></i> Nowe dane (ostatnie 7 dni)</h4>
+                            <div class="chart-container">
+                                <canvas id="dataChart"></canvas>
+                            </div>
+                        </div>
+                        <div class="system-card">
+                            <h4><i class="fas fa-search"></i> Aktywność wyszukiwań (ostatnie 7 dni)</h4>
+                            <div class="chart-container">
+                                <canvas id="searchChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Ostatnie leaki -->
+                <div class="section">
+                    <div class="section-title">
+                        <i class="fas fa-history"></i> Ostatnie dane wyciekowe
+                    </div>
+                    {% for leak in recent_leaks %}
+                        <div class="leak-item">
+                            <div class="leak-data">{{ leak.data | truncate(70) }}</div>
+                            <small>
+                                <span class="ip-badge">{{ leak.source }}</span>
+                                <span style="color: var(--text-secondary); margin-left: 10px;">• {{ format_datetime(leak.created_at) }}</span>
+                            </small>
+                        </div>
+                    {% endfor %}
+                </div>
+                
+                <!-- Najczęstsze wyszukiwania -->
+                <div class="section">
+                    <div class="section-title">
+                        <i class="fas fa-search"></i> Najczęstsze wyszukiwania
+                    </div>
+                    {% for search in top_searches %}
+                        <div class="leak-item">
+                            <div class="leak-data">{{ search.query }}</div>
+                            <small style="color: var(--text-secondary); margin-left: 10px;">
+                                • Liczba wystąpień: {{ search.count }}
+                            </small>
+                        </div>
+                    {% endfor %}
+                </div>
+                
+                <!-- Informacje systemowe -->
+                <div class="section">
+                    <div class="section-title">
+                        <i class="fas fa-server"></i> Informacje systemowe
+                    </div>
+                    <div class="system-grid">
+                        <div class="system-card">
+                            <h4><i class="fas fa-clock"></i> Sesja administratora</h4>
+                            <div class="system-info">
+                                <div class="system-info-item">
+                                    <div class="system-info-label">Czas trwania</div>
+                                    <div class="system-info-value">{{ session_duration }}</div>
+                                </div>
+                                <div class="system-info-item">
+                                    <div class="system-info-label">Twój adres IP</div>
+                                    <div class="system-info-value"><span class="ip-badge">{{ client_ip }}</span></div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="system-card">
+                            <h4><i class="fas fa-database"></i> Wydajność bazy</h4>
+                            <div class="system-info">
+                                <div class="system-info-item">
+                                    <div class="system-info-label">Średni czas zapytania</div>
+                                    <div class="system-info-value">{{ db_performance.avg_query_time }} ms</div>
+                                </div>
+                                <div class="system-info-item">
+                                    <div class="system-info-label">Wykorzystanie CPU</div>
+                                    <div class="system-info-value">{{ db_performance.cpu_usage }}%</div>
+                                </div>
+                                <div class="system-info-item">
+                                    <div class="system-info-label">Wykorzystanie pamięci</div>
+                                    <div class="system-info-value">{{ db_performance.memory_usage }}%</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Zawartość dla zakładki Licencje -->
+            <div class="tab-content {% if active_tab == 'licenses' %}active{% endif %}" id="licenses-tab">
+                <div class="section">
+                    <div class="section-title">
+                        <i class="fas fa-key"></i> Zarządzanie licencjami ({{ licenses|length }})
+                    </div>
+                    
+                    <div class="search-container">
+                        <div class="search-input-wrapper">
+                            <label class="form-label">Wyszukaj licencję</label>
+                            <div class="search-box">
+                                <i class="fas fa-search"></i>
+                                <input type="text" id="licenseSearch" class="search-input-field" placeholder="Wpisz klucz licencji, IP lub typ...">
+                            </div>
+                        </div>
+                        <div style="align-self: flex-end;">
+                            <button class="btn" onclick="resetFilters()">
+                                <i class="fas fa-filter-circle-xmark"></i> Reset filtrów
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <form method="post" style="margin-bottom:25px;">
+                        <input type="hidden" name="action" value="add_license">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Liczba dni ważności</label>
+                                <input type="number" name="days" value="30" min="1" max="3650" class="form-input">
+                            </div>
+                            <div class="form-group">
+                                <label>Limit wyszukiwań dziennych</label>
+                                <input type="number" name="daily_limit" value="100" min="1" max="10000" class="form-input">
+                            </div>
+                            <div class="form-group">
+                                <label>Limit wyszukiwań całkowitych</label>
+                                <input type="number" name="total_limit" value="1000" min="10" max="100000" class="form-input">
+                            </div>
+                            <div class="form-group">
+                                <label>Typ licencji</label>
+                                <select name="license_type" class="form-select">
+                                    <option value="standard">Standardowa</option>
+                                    <option value="premium">Premium</option>
+                                    <option value="enterprise">Enterprise</option>
+                                </select>
+                            </div>
+                            <div class="form-group" style="align-self: flex-end;">
+                                <button type="submit" class="btn">
+                                    <i class="fas fa-plus"></i> Generuj licencję
+                                </button>
+                            </div>
+                        </div>
+                    </form>
+                    
+                    <div class="table-container">
+                        <table class="table" id="licensesTable">
+                            <thead>
+                                <tr>
+                                    <th>Klucz dostępu</th>
+                                    <th>Ważność</th>
+                                    <th>IP</th>
+                                    <th>Typ</th>
+                                    <th>Limit dzienny</th>
+                                    <th>Status</th>
+                                    <th>Data utworzenia</th>
+                                    <th>Akcje</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for lic in licenses %}
+                                <tr>
+                                    <td>
+                                        <span class="key">{{ lic.key }}</span>
+                                        <div style="font-size: 0.8rem; color: var(--text-secondary); margin-top: 4px;">
+                                            {% if lic.ip %}
+                                            <i class="fas fa-lock" style="margin-right: 4px;"></i>Przypisany do: {{ lic.ip }}
+                                            {% else %}
+                                            <i class="fas fa-unlock" style="margin-right: 4px; color: var(--warning);"></i>Bez ograniczeń IP
+                                            {% endif %}
+                                        </div>
+                                    </td>
+                                    <td>{{ lic.expiry.split('T')[0] }}</td>
+                                    <td>
+                                        {% if lic.ip %}
+                                        <span class="ip-badge">{{ lic.ip }}</span>
+                                        {% else %}
+                                        <span style="color: var(--warning);">Brak ograniczeń</span>
+                                        {% endif %}
+                                    </td>
+                                    <td>
+                                        <span class="license-type type-{{ lic.license_type.lower() if lic.license_type else 'standard' }}">
+                                            {{ lic.license_type.capitalize() if lic.license_type else 'Standard' }}
+                                        </span>
+                                    </td>
+                                    <td>{{ lic.daily_limit }}/{{ lic.total_limit }}</td>
+                                    <td>
+                                        <span class="{{ 'status-active' if lic.active else 'status-inactive' }}">
+                                            {{ 'Aktywna' if lic.active else 'Nieaktywna' }}
+                                        </span>
+                                    </td>
+                                    <td>{{ format_datetime(lic.created_at) if lic.created_at else '—' }}</td>
+                                    <td>
+                                        <div style="display: flex; gap: 8px;">
+                                            <button class="btn btn-secondary" style="padding: 6px 12px; font-size: 0.85rem;" onclick="showLicenseDetails('{{ lic.key }}')">
+                                                <i class="fas fa-chart-line"></i> Aktywność
+                                            </button>
+                                            <form method="post" style="display:inline;" onsubmit="return confirm('Na pewno chcesz {{ '' if lic.active else 'w' }}yłączyć tę licencję?')">
+                                                <input type="hidden" name="action" value="toggle_license">
+                                                <input type="hidden" name="key" value="{{ lic.key }}">
+                                                <button type="submit" class="btn {% if lic.active %}btn-danger{% else %}btn{% endif %}" style="padding: 6px 12px; font-size: 0.85rem;">
+                                                    {% if lic.active %}<i class="fas fa-power-off"></i> Wyłącz{% else %}<i class="fas fa-power-off"></i> Włącz{% endif %}
+                                                </button>
+                                            </form>
+                                            <form method="post" style="display:inline;" onsubmit="return confirm('Na pewno usunąć tę licencję?')">
+                                                <input type="hidden" name="action" value="del_license">
+                                                <input type="hidden" name="key" value="{{ lic.key }}">
+                                                <button type="submit" class="btn btn-danger" style="padding: 6px 12px; font-size: 0.85rem;">
+                                                    <i class="fas fa-trash"></i> Usuń
+                                                </button>
+                                            </form>
+                                        </div>
+                                    </td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Zawartość dla zakładki Użytkownicy -->
+            <div class="tab-content {% if active_tab == 'users' %}active{% endif %}" id="users-tab">
+                <div class="section">
+                    <div class="section-title">
+                        <i class="fas fa-users"></i> Aktywni użytkownicy
+                    </div>
+                    
+                    <div class="search-container">
+                        <div class="search-input-wrapper">
+                            <label class="form-label">Wyszukaj użytkownika</label>
+                            <div class="search-box">
+                                <i class="fas fa-search"></i>
+                                <input type="text" id="userSearch" class="search-input-field" placeholder="Wpisz adres IP lub frazę wyszukiwania...">
+                            </div>
+                        </div>
+                        <div style="align-self: flex-end;">
+                            <button class="btn" onclick="refreshUsers()">
+                                <i class="fas fa-sync-alt"></i> Odśwież
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div id="usersContainer">
+                        <!-- Dane użytkowników zostaną załadowane przez JavaScript -->
+                        <div style="text-align: center; padding: 40px; color: var(--text-secondary);">
+                            <i class="fas fa-spinner fa-spin" style="font-size: 2rem; margin-bottom: 15px;"></i>
+                            <div>Ładowanie danych użytkowników...</div>
+                        </div>
+                    </div>
+                    
+                    <div id="pagination" class="pagination" style="display: none;">
+                        <!-- Paginacja zostanie wygenerowana przez JavaScript -->
+                    </div>
+                </div>
+                
+                <!-- Szczegóły aktywności licencji -->
+                <div class="section" id="licenseDetailsSection" style="display: none;">
+                    <div class="section-title">
+                        <i class="fas fa-chart-line"></i> Aktywność licencji <span id="licenseDetailsKey"></span>
+                    </div>
+                    <div class="system-grid">
+                        <div class="system-card">
+                            <h4><i class="fas fa-search"></i> Wyszukiwania (ostatnie 50)</h4>
+                            <div style="max-height: 400px; overflow-y: auto;">
+                                <table class="table">
+                                    <thead>
+                                        <tr>
+                                            <th>Data</th>
+                                            <th>Zapytanie</th>
+                                            <th>IP klienta</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="licenseActivityTable">
+                                        <!-- Dane zostaną załadowane przez JavaScript -->
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                        <div class="system-card">
+                            <h4><i class="fas fa-chart-bar"></i> Użycie według dni</h4>
+                            <div class="chart-container">
+                                <canvas id="licenseUsageChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Zawartość dla zakładki Import danych -->
+            <div class="tab-content {% if active_tab == 'imports' %}active{% endif %}" id="imports-tab">
+                <div class="section">
+                    <div class="section-title">
+                        <i class="fas fa-file-import"></i> Import bazy danych
+                    </div>
+                    <div style="background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.3); border-radius: 16px; padding: 20px; margin-bottom: 20px;">
+                        <p style="margin: 0; color: #bae6fd; line-height: 1.6;">
+                            <strong><i class="fas fa-info-circle" style="margin-right: 8px;"></i>Uwaga:</strong> Import danych może zająć kilka minut w zależności od rozmiaru archiwum ZIP.
+                            Proces odbywa się w tle - możesz kontynuować pracę w panelu.
+                        </p>
+                    </div>
+                    <form method="post">
+                        <input type="hidden" name="action" value="import_start">
+                        <div class="form-row">
+                            <div class="form-group" style="flex: 3;">
+                                <label>URL do archiwum ZIP z danymi</label>
+                                <input type="url" name="import_url" placeholder="https://example.com/dane.zip" class="form-input" required>
+                            </div>
+                            <div class="form-group" style="align-self: flex-end; flex: 1;">
+                                <button type="submit" class="btn" style="width: 100%;">
+                                    <i class="fas fa-cloud-download-alt"></i> Importuj dane
+                                </button>
+                            </div>
+                        </div>
+                    </form>
+                    <div style="margin-top: 20px; padding: 16px; background: rgba(15, 23, 42, 0.7); border-radius: 16px; border: 1px solid var(--border);">
+                        <p style="margin: 0; color: var(--text-secondary); line-height: 1.6;">
+                            <strong><i class="fas fa-file-archive" style="margin-right: 8px; color: var(--warning);"></i>Wymagania:</strong>
+                            Archiwum ZIP powinno zawierać pliki tekstowe (.txt, .csv, .log) z danymi wyciekowymi.
+                            Każda linia w pliku powinna zawierać pojedynczy rekord (email, login, etc.).
+                        </p>
+                    </div>
+                </div>
+                
+                <div class="section">
+                    <div class="section-title">
+                        <i class="fas fa-inbox"></i> Historia importów
+                    </div>
+                    <div style="text-align: center; padding: 40px 20px; color: var(--text-secondary);">
+                        <i class="fas fa-database" style="font-size: 3rem; margin-bottom: 15px; opacity: 0.5;"></i>
+                        <div style="font-size: 1.1rem; margin-bottom: 10px;">Brak zakończonych importów</div>
+                        <div>Uruchom nowy import, aby wyświetlić historię</div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Zawartość dla zakładki Bany IP -->
+            <div class="tab-content {% if active_tab == 'bans' %}active{% endif %}" id="bans-tab">
+                <div class="section">
+                    <div class="section-title">
+                        <i class="fas fa-ban"></i> Zbanowane adresy IP ({{ banned_ips|length }})
+                    </div>
+                    <form method="post" style="margin-bottom:25px;">
+                        <input type="hidden" name="action" value="add_ban">
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>Adres IP do zbanowania</label>
+                                <input type="text" name="ip" placeholder="np. 192.168.1.1" class="form-input" required>
+                            </div>
+                            <div class="form-group">
+                                <label>Powód bana (opcjonalnie)</label>
+                                <input type="text" name="reason" placeholder="Naruszenie regulaminu" class="form-input">
+                            </div>
+                            <div class="form-group" style="align-self: flex-end;">
+                                <button type="submit" class="btn">
+                                    <i class="fas fa-ban"></i> Zbanuj adres IP
+                                </button>
+                            </div>
+                        </div>
+                    </form>
+                    
+                    <div class="table-container">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th>Adres IP</th>
+                                    <th>Powód bana</th>
+                                    <th>Data bana</th>
+                                    <th>Zbanował</th>
+                                    <th>Akcje</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for ban in banned_ips %}
+                                <tr>
+                                    <td><span class="ip-badge">{{ ban.ip }}</span></td>
+                                    <td>{{ ban.reason or 'Brak informacji' }}</td>
+                                    <td>{{ format_datetime(ban.created_at) if ban.created_at else '—' }}</td>
+                                    <td>{{ ban.admin_ip or 'System' }}</td>
+                                    <td>
+                                        <form method="post" style="display:inline;" onsubmit="return confirm('Na pewno chcesz odbanować ten adres?')">
+                                            <input type="hidden" name="action" value="del_ban">
+                                            <input type="hidden" name="ip" value="{{ ban.ip }}">
+                                            <button type="submit" class="btn btn-danger" style="padding: 6px 12px; font-size: 0.85rem;">
+                                                <i class="fas fa-user-check"></i> Odbanuj
+                                            </button>
+                                        </form>
+                                    </td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Zawartość dla zakładki Statystyki -->
+            <div class="tab-content {% if active_tab == 'stats' %}active{% endif %}" id="stats-tab">
+                <div class="section">
+                    <div class="section-title">
+                        <i class="fas fa-chart-bar"></i> Szczegółowe statystyki systemu
+                    </div>
+                    <div class="system-grid">
+                        <div class="system-card">
+                            <h4><i class="fas fa-search"></i> Wyszukiwania</h4>
+                            <div class="system-info">
+                                <div class="system-info-item">
+                                    <div class="system-info-label">Wszystkie wyszukiwania</div>
+                                    <div class="system-info-value">{{ "{:,}".format(total_searches).replace(",", " ") }}</div>
+                                </div>
+                                <div class="system-info-item">
+                                    <div class="system-info-label">Dziennie (średnio)</div>
+                                    <div class="system-info-value">{{ "{:,}".format((total_searches / 30) | int).replace(",", " ") if total_searches > 0 else '0' }}</div>
+                                </div>
+                                <div class="system-info-item">
+                                    <div class="system-info-label">Aktywni użytkownicy (24h)</div>
+                                    <div class="system-info-value">{{ "{:,}".format(active_users_24h).replace(",", " ") }}</div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="system-card">
+                            <h4><i class="fas fa-server"></i> Wydajność bazy</h4>
+                            <div class="system-info">
+                                <div class="system-info-item">
+                                    <div class="system-info-label">Rekordów w bazie</div>
+                                    <div class="system-info-value">{{ "{:,}".format(total_leaks).replace(",", " ") }}</div>
+                                </div>
+                                <div class="system-info-item">
+                                    <div class="system-info-label">Średni czas odpowiedzi</div>
+                                    <div class="system-info-value">45 ms</div>
+                                </div>
+                                <div class="system-info-item">
+                                    <div class="system-info-label">Wykorzystanie CPU</div>
+                                    <div class="system-info-value">23%</div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="system-card">
+                            <h4><i class="fas fa-shield-alt"></i> Bezpieczeństwo</h4>
+                            <div class="system-info">
+                                <div class="system-info-item">
+                                    <div class="system-info-label">Zbanowane IP</div>
+                                    <div class="system-info-value">{{ "{:,}".format(banned_ips|length).replace(",", " ") }}</div>
+                                </div>
+                                <div class="system-info-item">
+                                    <div class="system-info-label">Aktywne licencje</div>
+                                    <div class="system-info-value">{{ "{:,}".format(active_licenses).replace(",", " ") }}</div>
+                                </div>
+                                <div class="system-info-item">
+                                    <div class="system-info-label">Nieudane logowania</div>
+                                    <div class="system-info-value">15</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="section">
+                    <div class="section-title">
+                        <i class="fas fa-history"></i> Historia aktywności administratora
+                    </div>
+                    <div class="table-container">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th>Data</th>
+                                    <th>Akcja</th>
+                                    <th>Szczegóły</th>
+                                    <th>IP Administratora</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr>
+                                    <td>{{ format_datetime(now) }}</td>
+                                    <td>Logowanie</td>
+                                    <td>Zalogowano do panelu administratora</td>
+                                    <td>{{ client_ip }}</td>
+                                </tr>
+                                <tr>
+                                    <td>{{ format_datetime(now) }</td>
+                                    <td>Odwiedziny</td>
+                                    <td>Wyświetlono dashboard</td>
+                                    <td>{{ client_ip }}</td>
+                                </tr>
+                                {% if licenses|length > 0 %}
+                                <tr>
+                                    <td>{{ format_datetime(licenses[0].created_at) if licenses[0].created_at else now }}</td>
+                                    <td>Generowanie licencji</td>
+                                    <td>Klucz: {{ licenses[0].key }}</td>
+                                    <td>{{ client_ip }}</td>
+                                </tr>
+                                {% endif %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Zawartość dla zakładki Dokumentacja API -->
+            <div class="tab-content {% if active_tab == 'help' %}active{% endif %}" id="help-tab">
+                <div class="section">
+                    <div class="section-title">
+                        <i class="fas fa-book-open"></i> Dokumentacja API
+                    </div>
+                    <p style="margin-bottom: 20px; color: var(--text-secondary); line-height: 1.6;">
+                        Poniżej znajdziesz kompletne informacje na temat endpointów API, które są wykorzystywane przez klienta desktopowego.
+                    </p>
+                    
+                    <div class="endpoint-card">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                            <span class="endpoint-method method-get">GET</span>
+                            <div class="endpoint-url">/api/status</div>
+                        </div>
+                        <p style="margin-bottom: 12px; color: var(--text-secondary);">
+                            Zwraca podstawowy status serwera, wersję i sprawdza dostępność bazy danych.
+                        </p>
+                        <div class="endpoint-params">
+                            <strong style="display: block; margin-bottom: 6px; color: var(--text);">Parametry odpowiedzi:</strong>
+                            <div class="endpoint-param">
+                                <span class="param-name">success</span>
+                                <span class="param-type">boolean</span>
+                            </div>
+                            <div class="endpoint-param">
+                                <span class="param-name">status</span>
+                                <span class="param-type">string</span>
+                            </div>
+                            <div class="endpoint-param">
+                                <span class="param-name">version</span>
+                                <span class="param-type">string</span>
+                            </div>
+                            <div class="endpoint-param">
+                                <span class="param-name">server_time</span>
+                                <span class="param-type">ISO string</span>
+                            </div>
+                            <div class="endpoint-param">
+                                <span class="param-name">database_status</span>
+                                <span class="param-type">boolean</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="endpoint-card">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                            <span class="endpoint-method method-post">POST</span>
+                            <div class="endpoint-url">/api/auth</div>
+                        </div>
+                        <p style="margin-bottom: 12px; color: var(--text-secondary);">
+                            Endpoint do autoryzacji licencji. Wymaga przekazania klucza i opcjonalnie IP klienta.
+                        </p>
+                        <div class="endpoint-params">
+                            <strong style="display: block; margin-bottom: 6px; color: var(--text);">Parametry żądania:</strong>
+                            <div class="endpoint-param">
+                                <span class="param-name">key</span>
+                                <span class="param-type">string (required)</span>
+                            </div>
+                            <div class="endpoint-param">
+                                <span class="param-name">client_ip</span>
+                                <span class="param-type">string (optional)</span>
+                            </div>
+                            <strong style="display: block; margin-top: 12px; margin-bottom: 6px; color: var(--text);">Parametry odpowiedzi:</strong>
+                            <div class="endpoint-param">
+                                <span class="param-name">success</span>
+                                <span class="param-type">boolean</span>
+                            </div>
+                            <div class="endpoint-param">
+                                <span class="param-name">message</span>
+                                <span class="param-type">string</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="endpoint-card">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                            <span class="endpoint-method method-post">POST</span>
+                            <div class="endpoint-url">/api/license-info</div>
+                        </div>
+                        <p style="margin-bottom: 12px; color: var(--text-secondary);">
+                            Zwraca szczegółowe informacje o licencji: typ, data ważności, limity, użycie itp.
+                        </p>
+                        <div class="endpoint-params">
+                            <strong style="display: block; margin-bottom: 6px; color: var(--text);">Parametry żądania:</strong>
+                            <div class="endpoint-param">
+                                <span class="param-name">key</span>
+                                <span class="param-type">string (required)</span>
+                            </div>
+                            <div class="endpoint-param">
+                                <span class="param-name">client_ip</span>
+                                <span class="param-type">string (optional)</span>
+                            </div>
+                            <strong style="display: block; margin-top: 12px; margin-bottom: 6px; color: var(--text);">Parametry odpowiedzi:</strong>
+                            <div class="endpoint-param">
+                                <span class="param-name">success</span>
+                                <span class="param-type">boolean</span>
+                            </div>
+                            <div class="endpoint-param">
+                                <span class="param-name">info.license_type</span>
+                                <span class="param-type">string</span>
+                            </div>
+                            <div class="endpoint-param">
+                                <span class="param-name">info.expiration_date</span>
+                                <span class="param-type">string (YYYY-MM-DD)</span>
+                            </div>
+                            <div class="endpoint-param">
+                                <span class="param-name">info.daily_limit</span>
+                                <span class="param-type">integer</span>
+                            </div>
+                            <div class="endpoint-param">
+                                <span class="param-name">info.daily_used</span>
+                                <span class="param-type">integer</span>
+                            </div>
+                            <div class="endpoint-param">
+                                <span class="param-name">info.total_limit</span>
+                                <span class="param-type">integer</span>
+                            </div>
+                            <div class="endpoint-param">
+                                <span class="param-name">info.total_used</span>
+                                <span class="param-type">integer</span>
+                            </div>
+                            <div class="endpoint-param">
+                                <span class="param-name">info.ip_bound</span>
+                                <span class="param-type">string</span>
+                            </div>
+                            <div class="endpoint-param">
+                                <span class="param-name">info.last_search</span>
+                                <span class="param-type">string</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="endpoint-card">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                            <span class="endpoint-method method-post">POST</span>
+                            <div class="endpoint-url">/api/search</div>
+                        </div>
+                        <p style="margin-bottom: 12px; color: var(--text-secondary);">
+                            Endpoint do wyszukiwania danych wyciekowych. Wymaga klucza i zapytania.
+                        </p>
+                        <div class="endpoint-params">
+                            <strong style="display: block; margin-bottom: 6px; color: var(--text);">Parametry żądania:</strong>
+                            <div class="endpoint-param">
+                                <span class="param-name">key</span>
+                                <span class="param-type">string (required)</span>
+                            </div>
+                            <div class="endpoint-param">
+                                <span class="param-name">query</span>
+                                <span class="param-type">string (required)</span>
+                            </div>
+                            <div class="endpoint-param">
+                                <span class="param-name">client_ip</span>
+                                <span class="param-type">string (optional)</span>
+                            </div>
+                            <div class="endpoint-param">
+                                <span class="param-name">limit</span>
+                                <span class="param-type">integer (default: 150)</span>
+                            </div>
+                            <strong style="display: block; margin-top: 12px; margin-bottom: 6px; color: var(--text);">Parametry odpowiedzi:</strong>
+                            <div class="endpoint-param">
+                                <span class="param-name">success</span>
+                                <span class="param-type">boolean</span>
+                            </div>
+                            <div class="endpoint-param">
+                                <span class="param-name">results</span>
+                                <span class="param-type">array[object]</span>
+                            </div>
+                            <div class="endpoint-param">
+                                <span class="param-name">results[].data</span>
+                                <span class="param-type">string</span>
+                            </div>
+                            <div class="endpoint-param">
+                                <span class="param-name">results[].source</span>
+                                <span class="param-type">string</span>
+                            </div>
+                            <div class="endpoint-param">
+                                <span class="param-name">results[].timestamp</span>
+                                <span class="param-type">string</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="section">
+                        <div class="section-title">
+                            <i class="fas fa-lightbulb"></i> Przykładowe zapytanie z klienta
+                        </div>
+                        <div style="background: rgba(0,0,0,0.3); border-radius: 12px; padding: 20px; font-family: 'JetBrains Mono', monospace; font-size: 0.95rem; overflow-x: auto;">
+                            <pre style="margin: 0; color: #6ee7b7;">
+// Autoryzacja licencji
+POST /api/auth
+Content-Type: application/json
+{
+    "key": "COLD-XXXXXXXXXXXX",
+    "client_ip": "123.123.123.123"
+}
+                            </pre>
+                        </div>
+                    </div>
+                    
+                    <div class="section">
+                        <div class="section-title">
+                            <i class="fas fa-exclamation-triangle"></i> Ograniczenia i kody błędów
+                        </div>
+                        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px;">
+                            <div style="background: rgba(15, 23, 42, 0.6); border-radius: 12px; padding: 15px; border: 1px solid var(--border);">
+                                <strong style="color: var(--danger); display: block; margin-bottom: 8px;">400 Bad Request</strong>
+                                <p style="color: var(--text-secondary); font-size: 0.95rem; line-height: 1.5;">
+                                    Brak klucza licencyjnego lub nieprawidłowe parametry żądania.
+                                </p>
+                            </div>
+                            <div style="background: rgba(15, 23, 42, 0.6); border-radius: 12px; padding: 15px; border: 1px solid var(--border);">
+                                <strong style="color: var(--danger); display: block; margin-bottom: 8px;">401 Unauthorized</strong>
+                                <p style="color: var(--text-secondary); font-size: 0.95rem; line-height: 1.5;">
+                                    Nieprawidłowy klucz licencyjny, licencja wygasła lub jest zablokowana.
+                                </p>
+                            </div>
+                            <div style="background: rgba(15, 23, 42, 0.6); border-radius: 12px; padding: 15px; border: 1px solid var(--border);">
+                                <strong style="color: var(--danger); display: block; margin-bottom: 8px;">403 Forbidden</strong>
+                                <p style="color: var(--text-secondary); font-size: 0.95rem; line-height: 1.5;">
+                                    Klucz przypisany do innego adresu IP niż podany w żądaniu.
+                                </p>
+                            </div>
+                            <div style="background: rgba(15, 23, 42, 0.6); border-radius: 12px; padding: 15px; border: 1px solid var(--border);">
+                                <strong style="color: var(--danger); display: block; margin-bottom: 8px;">429 Too Many Requests</strong>
+                                <p style="color: var(--text-secondary); font-size: 0.95rem; line-height: 1.5;">
+                                    Przekroczono dzienny lub całkowity limit wyszukiwań dla danej licencji.
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="footer">
+                <p>❄️ Cold Search Premium Admin Panel &copy; {{ now.year }} | Wersja 3.1.1</p>
+                <p style="margin-top: 6px; font-size: 0.85rem; color: var(--text-secondary);">
+                    Panel jest chroniony hasłem i dostępny wyłącznie dla upoważnionych administratorów
+                </p>
+            </div>
+        </div>
+    </div>
+    
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+    <script src="https://cdn.datatables.net/1.13.6/js/dataTables.bootstrap5.min.js"></script>
+    <script>
+        $(document).ready(function() {
+            // Inicjalizacja DataTables
+            $('#licensesTable').DataTable({
+                "language": {
+                    "url": "//cdn.datatables.net/plug-ins/1.13.6/i18n/pl.json"
+                },
+                "pageLength": 10
+            });
+            
+            // Wyszukiwanie w DataTable
+            $('#licenseSearch').on('keyup', function() {
+                $('#licensesTable').DataTable().search(this.value).draw();
+            });
+            
+            // Formatowanie liczb
+            document.addEventListener('DOMContentLoaded', function() {
+                const statValues = document.querySelectorAll('.stat-value');
+                statValues.forEach(el => {
+                    const numStr = el.textContent.replace(/\\s/g, '').replace(/\s/g, '');
+                    const num = parseInt(numStr.replace(/[^0-9]/g, ''));
+                    if (!isNaN(num)) {
+                        el.textContent = num.toLocaleString('pl-PL');
+                    }
+                });
+                
+                // Inicjalizacja wykresów
+                initCharts();
+                
+                // Załaduj dane użytkowników
+                if (document.getElementById('users-tab').classList.contains('active')) {
+                    loadUsers(1);
+                }
+            });
+            
+            function initCharts() {
+                // Wykres danych
+                const ctx1 = document.getElementById('dataChart').getContext('2d');
+                new Chart(ctx1, {
+                    type: 'bar',
+                    data: {
+                        labels: [{% for stat in daily_stats %}'{{ stat.date.strftime("%d.%m") }}',{% endfor %}],
+                        datasets: [{
+                            label: 'Nowe rekordy',
+                            data: [{% for stat in daily_stats %}{{ stat.count }},{% endfor %}],
+                            backgroundColor: 'rgba(99, 102, 241, 0.7)',
+                            borderColor: 'rgba(99, 102, 241, 1)',
+                            borderWidth: 1
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            y: {
+                                beginAtZero: true,
+                                grid: {
+                                    color: 'rgba(51, 65, 85, 0.5)'
+                                },
+                                ticks: {
+                                    color: '#94a3b8'
+                                }
+                            },
+                            x: {
+                                grid: {
+                                    color: 'rgba(51, 65, 85, 0.5)'
+                                },
+                                ticks: {
+                                    color: '#94a3b8'
+                                }
+                            }
+                        },
+                        plugins: {
+                            legend: {
+                                labels: {
+                                    color: '#f1f5f9'
+                                }
+                            }
+                        }
+                    }
+                });
+                
+                // Wykres wyszukiwań
+                const ctx2 = document.getElementById('searchChart').getContext('2d');
+                new Chart(ctx2, {
+                    type: 'line',
+                    data: {
+                        labels: [{% for stat in user_activity %}'{{ stat.date.strftime("%d.%m") }}',{% endfor %}],
+                        datasets: [{
+                            label: 'Wyszukiwania',
+                            data: [{% for stat in user_activity %}{{ stat.count }},{% endfor %}],
+                            fill: true,
+                            backgroundColor: 'rgba(16, 185, 129, 0.2)',
+                            borderColor: 'rgba(16, 185, 129, 1)',
+                            borderWidth: 2,
+                            tension: 0.3
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            y: {
+                                beginAtZero: true,
+                                grid: {
+                                    color: 'rgba(51, 65, 85, 0.5)'
+                                },
+                                ticks: {
+                                    color: '#94a3b8'
+                                }
+                            },
+                            x: {
+                                grid: {
+                                    color: 'rgba(51, 65, 85, 0.5)'
+                                },
+                                ticks: {
+                                    color: '#94a3b8'
+                                }
+                            }
+                        },
+                        plugins: {
+                            legend: {
+                                labels: {
+                                    color: '#f1f5f9'
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            
+            function resetFilters() {
+                $('#licenseSearch').val('');
+                $('#licensesTable').DataTable().search('').draw();
+            }
+            
+            function loadUsers(page = 1) {
+                const searchQuery = document.getElementById('userSearch')?.value || '';
+                
+                fetch(`/api/users?page=${page}&search=${encodeURIComponent(searchQuery)}`)
+                    .then(response => response.json())
+                    .then(data => {
+                        if (!data.success) {
+                            document.getElementById('usersContainer').innerHTML = `
+                                <div style="text-align: center; padding: 40px; color: var(--danger);">
+                                    <i class="fas fa-exclamation-triangle" style="font-size: 2rem; margin-bottom: 15px;"></i>
+                                    <div>Błąd ładowania danych użytkowników</div>
+                                </div>
+                            `;
+                            return;
+                        }
+                        
+                        // Generowanie kart użytkowników
+                        let usersHTML = '';
+                        
+                        if (data.users.length === 0) {
+                            usersHTML = `
+                                <div style="text-align: center; padding: 40px; color: var(--text-secondary);">
+                                    <i class="fas fa-users" style="font-size: 3rem; margin-bottom: 15px; opacity: 0.5;"></i>
+                                    <div style="font-size: 1.1rem; margin-bottom: 10px;">Brak użytkowników</div>
+                                    <div>Nie znaleziono użytkowników spełniających kryteria wyszukiwania</div>
+                                </div>
+                            `;
+                        } else {
+                            data.users.forEach(user => {
+                                const license = data.license_details[user.ip] || null;
+                                const usagePercent = license ? Math.min(100, Math.round((license.daily_used / license.daily_limit) * 100)) : 0;
+                                const usageClass = usagePercent > 90 ? 'usage-critical' : 
+                                                  usagePercent > 70 ? 'usage-high' : 
+                                                  usagePercent > 40 ? 'usage-medium' : 'usage-low';
+                                
+                                usersHTML += `
+                                    <div class="user-card">
+                                        <div class="user-header">
+                                            <div>
+                                                <div class="user-ip">${user.ip}</div>
+                                                <div style="color: var(--text-secondary); font-size: 0.9rem;">
+                                                    Pierwsze wyszukiwanie: ${user.first_seen ? new Date(user.first_seen).toLocaleString('pl-PL') : 'N/A'}<br>
+                                                    Ostatnie wyszukiwanie: ${user.last_seen ? new Date(user.last_seen).toLocaleString('pl-PL') : 'N/A'}
+                                                </div>
+                                            </div>
+                                            <div>
+                                                ${license ? `
+                                                    <span class="license-badge ${license.active ? 'license-active' : 'license-inactive'}">
+                                                        ${license.active ? 'Aktywna' : 'Nieaktywna'}
+                                                    </span>
+                                                ` : `
+                                                    <span style="color: var(--warning);">Brak licencji</span>
+                                                `}
+                                            </div>
+                                        </div>
+                                        
+                                        <div class="user-stats">
+                                            <div class="stat-box">
+                                                <div class="stat-label">Wyszukiwania</div>
+                                                <div class="stat-value">${user.total_searches}</div>
+                                            </div>
+                                            
+                                            ${license ? `
+                                                <div class="stat-box">
+                                                    <div class="stat-label">Limit dzienny</div>
+                                                    <div class="stat-value">${license.daily_used}/${license.daily_limit}</div>
+                                                </div>
+                                                <div class="stat-box">
+                                                    <div class="stat-label">Limit całkowity</div>
+                                                    <div class="stat-value">${license.total_used}/${license.total_limit}</div>
+                                                </div>
+                                                <div class="stat-box">
+                                                    <div class="stat-label">Typ licencji</div>
+                                                    <div class="stat-value">
+                                                        <span class="license-type type-${license.license_type?.toLowerCase() || 'standard'}">
+                                                            ${license.license_type?.charAt(0).toUpperCase() + license.license_type?.slice(1) || 'Standard'}
+                                                        </span>
+                                                    </div>
+                                                </div>
+                                            ` : ''}
+                                        </div>
+                                        
+                                        ${license ? `
+                                            <div style="margin-top: 15px;">
+                                                <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+                                                    <span>Wykorzystanie dziennego limitu</span>
+                                                    <span>${usagePercent}%</span>
+                                                </div>
+                                                <div class="usage-bar">
+                                                    <div class="usage-fill ${usageClass}" style="width: ${usagePercent}%"></div>
+                                                </div>
+                                            </div>
+                                        ` : ''}
+                                        
+                                        <div class="action-buttons">
+                                            <button class="btn" onclick="showLicenseDetails('${license?.key || ''}')">
+                                                <i class="fas fa-chart-line"></i> Szczegóły aktywności
+                                            </button>
+                                        </div>
+                                    </div>
+                                `;
+                            });
+                        }
+                        
+                        document.getElementById('usersContainer').innerHTML = usersHTML;
+                        
+                        // Aktualizacja paginacji
+                        updatePagination(data.page, data.pages, data.total_count);
+                    })
+                    .catch(error => {
+                        console.error('Błąd ładowania użytkowników:', error);
+                        document.getElementById('usersContainer').innerHTML = `
+                            <div style="text-align: center; padding: 40px; color: var(--danger);">
+                                <i class="fas fa-exclamation-triangle" style="font-size: 2rem; margin-bottom: 15px;"></i>
+                                <div>Błąd połączenia z serwerem</div>
+                            </div>
+                        `;
+                    });
+            }
+            
+            function updatePagination(currentPage, totalPages, totalCount) {
+                const paginationEl = document.getElementById('pagination');
+                if (totalPages <= 1) {
+                    paginationEl.style.display = 'none';
+                    return;
+                }
+                
+                paginationEl.style.display = 'flex';
+                let html = '';
+                
+                // Przycisk poprzedniej strony
+                if (currentPage > 1) {
+                    html += `<div class="page-item" onclick="loadUsers(${currentPage - 1})">❮</div>`;
+                }
+                
+                // Generowanie numerów stron
+                const maxPagesToShow = 5;
+                let startPage = Math.max(1, currentPage - Math.floor(maxPagesToShow / 2));
+                let endPage = Math.min(totalPages, startPage + maxPagesToShow - 1);
+                
+                if (endPage - startPage + 1 < maxPagesToShow) {
+                    startPage = Math.max(1, endPage - maxPagesToShow + 1);
+                }
+                
+                for (let i = startPage; i <= endPage; i++) {
+                    html += `<div class="page-item ${i === currentPage ? 'active' : ''}" onclick="loadUsers(${i})">${i}</div>`;
+                }
+                
+                // Przycisk następnej strony
+                if (currentPage < totalPages) {
+                    html += `<div class="page-item" onclick="loadUsers(${currentPage + 1})">❯</div>`;
+                }
+                
+                paginationEl.innerHTML = html;
+            }
+            
+            function refreshUsers() {
+                loadUsers(1);
+            }
+            
+            function showLicenseDetails(licenseKey) {
+                if (!licenseKey) {
+                    alert('Brak klucza licencji');
+                    return;
+                }
+                
+                // Pokaż sekcję z detalami
+                document.getElementById('licenseDetailsSection').style.display = 'block';
+                document.getElementById('licenseDetailsKey').textContent = licenseKey;
+                
+                // Załaduj dane aktywności
+                fetch(`/api/license-activity?key=${encodeURIComponent(licenseKey)}`)
+                    .then(response => response.json())
+                    .then(data => {
+                        if (!data.success) {
+                            document.getElementById('licenseActivityTable').innerHTML = `
+                                <tr>
+                                    <td colspan="3" style="text-align: center; color: var(--danger);">
+                                        <i class="fas fa-exclamation-triangle"></i> Brak danych aktywności
+                                    </td>
+                                </tr>
+                            `;
+                            return;
+                        }
+                        
+                        // Wypełnij tabelę aktywności
+                        let tableHTML = '';
+                        if (data.activity.length === 0) {
+                            tableHTML = `
+                                <tr>
+                                    <td colspan="3" style="text-align: center; color: var(--text-secondary);">
+                                        <i class="fas fa-info-circle"></i> Brak aktywności dla tej licencji
+                                    </td>
+                                </tr>
+                            `;
+                        } else {
+                            data.activity.forEach(activity => {
+                                tableHTML += `
+                                    <tr>
+                                        <td>${activity.timestamp ? new Date(activity.timestamp).toLocaleString('pl-PL') : 'N/A'}</td>
+                                        <td>${activity.query || 'Brak zapytania'}</td>
+                                        <td>${activity.ip || 'N/A'}</td>
+                                    </tr>
+                                `;
+                            });
+                        }
+                        
+                        document.getElementById('licenseActivityTable').innerHTML = tableHTML;
+                        
+                        // Aktualizacja wykresu użycia
+                        updateLicenseUsageChart(data.daily_usage);
+                    })
+                    .catch(error => {
+                        console.error('Błąd ładowania aktywności licencji:', error);
+                        document.getElementById('licenseActivityTable').innerHTML = `
+                            <tr>
+                                <td colspan="3" style="text-align: center; color: var(--danger);">
+                                    <i class="fas fa-exclamation-triangle"></i> Błąd ładowania danych
+                                </td>
+                            </tr>
+                        `;
+                    });
+            }
+            
+            function updateLicenseUsageChart(dailyUsage) {
+                const ctx = document.getElementById('licenseUsageChart').getContext('2d');
+                
+                // Destrukcja istniejącego wykresu jeśli istnieje
+                if (window.licenseUsageChart) {
+                    window.licenseUsageChart.destroy();
+                }
+                
+                // Przygotowanie danych
+                const labels = dailyUsage.map(item => {
+                    const date = new Date(item.date);
+                    return date.toLocaleDateString('pl-PL', { day: '2-digit', month: '2-digit' });
+                });
+                
+                const dataValues = dailyUsage.map(item => item.count);
+                
+                // Tworzenie nowego wykresu
+                window.licenseUsageChart = new Chart(ctx, {
+                    type: 'bar',
+                    data: {
+                        labels: labels,
+                        datasets: [{
+                            label: 'Wyszukiwania dziennie',
+                            data: dataValues,
+                            backgroundColor: 'rgba(59, 130, 246, 0.7)',
+                            borderColor: 'rgba(59, 130, 246, 1)',
+                            borderWidth: 1
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            y: {
+                                beginAtZero: true,
+                                grid: {
+                                    color: 'rgba(51, 65, 85, 0.5)'
+                                },
+                                ticks: {
+                                    color: '#94a3b8'
+                                }
+                            },
+                            x: {
+                                grid: {
+                                    color: 'rgba(51, 65, 85, 0.5)'
+                                },
+                                ticks: {
+                                    color: '#94a3b8'
+                                }
+                            }
+                        },
+                        plugins: {
+                            legend: {
+                                labels: {
+                                    color: '#f1f5f9'
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            
+            // Obsługa aktywnej zakładki
+            document.querySelectorAll('.nav-item').forEach(item => {
+                item.addEventListener('click', function() {
+                    const tab = this.getAttribute('href').split('=')[1];
+                    document.querySelectorAll('.tab-content').forEach(content => {
+                        content.classList.remove('active');
+                    });
+                    document.getElementById(`${tab}-tab`).classList.add('active');
+                    
+                    // Załaduj dane użytkowników jeśli otworzono zakładkę użytkowników
+                    if (tab === 'users') {
+                        loadUsers(1);
+                    }
+                });
+            });
+            
+            // Automatyczne odświeżanie co 30 sekund (tylko dla dashboardu)
+            let autoRefresh = true;
+            setTimeout(function refreshData() {
+                if (autoRefresh && window.location.search.includes('tab=dashboard')) {
+                    location.reload();
+                }
+                setTimeout(refreshData, 30000);
+            }, 30000);
+        });
+    </script>
+</body>
+</html>
+'''
 
 # === URUCHOMIENIE ===
 if __name__ == "__main__":
     initialize_db_pool()
     logger.info("🚀 Cold Search Premium — Panel admina gotowy")
-    port = int(os.environ.get('PORT', 10000))  # Render wymaga PORT=10000
+    port = int(os.environ.get('PORT', 10000))
     debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
     app.run(host='0.0.0.0', port=port, debug=debug_mode)
+
+
+
