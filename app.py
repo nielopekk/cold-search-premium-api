@@ -7,13 +7,11 @@ import threading
 import logging
 import time
 import contextlib
-import json
-import re
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, render_template_string, redirect, session, url_for, flash
 import mysql.connector
 from mysql.connector import pooling
-from werkzeug.exceptions import InternalServerError
+import re
 
 # === KONFIGURACJA ŚRODOWISKOWA ===
 DB_CONFIG = {
@@ -29,7 +27,7 @@ DB_CONFIG = {
     "pool_reset_session": True
 }
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://wcshypmsurncfufbojvp.supabase.co").strip()
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Indjc2h5cG1zdXJuY2Z1ZmJvanZwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjkwNzIwOTEsImV4cCI6MjA4NDY0ODA5MX0.Hs9j4wXZ6yLwz8k3y9Xy6Qw5n6z7J7xZ3Y2y1X1Y2Z3").strip()
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Indjc2h5cG1zdXJuY2Z1ZmJvanZwIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2OTAzMjQ2OCwiZXhwIjoyMDg0NjA4NDY4fQ.Dqy9y1w7j1u8q5m7Y2lK9V0HfZ1x8N5j9mF6Y9v2Y7I").strip()
 SUPABASE_HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -40,8 +38,7 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "wyciek12")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "cold_search_ultra_2026_fixed")
-app.config['PROPAGATE_EXCEPTIONS'] = True  # Ważne dla Render
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "cold_search_ultra_2026_fixed_secret_random_key_here")
 
 # === AUTOMATYCZNA INICJALIZACJA TABEL ===
 def initialize_tables():
@@ -51,7 +48,7 @@ def initialize_tables():
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor()
         
-        # Tabela search_logs
+        # Tabela search_logs - naprawiony błąd składni SQL (słowo kluczowe key było zastrzeżone)
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS search_logs (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -60,10 +57,10 @@ def initialize_tables():
             `key` VARCHAR(50) NOT NULL,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             INDEX idx_ip (ip),
-            INDEX idx_key (key),
+            INDEX idx_key (`key`),
             INDEX idx_timestamp (timestamp),
             INDEX idx_query (query),
-            INDEX idx_key_timestamp (key, timestamp)
+            INDEX idx_key_timestamp (`key`, timestamp)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """)
         
@@ -107,7 +104,6 @@ def initialize_tables():
         # Sprawdzenie czy tabela licenses istnieje
         r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses?limit=1", headers=SUPABASE_HEADERS, timeout=10)
         if r.status_code == 404:
-            # Tabela nie istnieje - utworzenie
             logger.info("🔧 Tworzenie tabel w Supabase...")
             # Tabele są tworzone przez skrypt SQL powyżej
             logger.info("✅ Tabele w Supabase wymagają ręcznej inicjalizacji przez SQL Editor")
@@ -258,7 +254,7 @@ def import_worker(url):
     except Exception as e:
         logger.error(f"💥 Fatalny błąd importu: {e}")
 
-# === GŁÓWNE ENDPOINTY ===
+# === GŁÓWNY ENDPOINT: / (panel admina) ===
 @app.route("/", methods=["GET", "POST"])
 def admin_panel():
     """Główny panel administracyjny"""
@@ -408,7 +404,6 @@ def admin_panel():
             login_time = datetime.fromisoformat(session['login_time'])
             session_duration = str(datetime.now(timezone.utc) - login_time).split('.')[0]
             now = datetime.now(timezone.utc)
-            tab = request.args.get('tab', 'dashboard')
             
             return render_template_string(
                 ADMIN_TEMPLATE,
@@ -427,7 +422,7 @@ def admin_panel():
                 client_ip=get_client_ip(),
                 format_datetime=format_datetime,
                 now=now,
-                active_tab=tab
+                total_leaks_formatted="{:,}".format(total_leaks).replace(",", " ")
             )
     except Exception as e:
         logger.error(f"💥 Błąd ładowania panelu: {e}")
@@ -454,7 +449,7 @@ def api_status():
     return jsonify({
         "success": True,
         "status": "online",
-        "version": "3.1.2",
+        "version": "3.1.3",
         "server_time": datetime.now(timezone.utc).isoformat(),
         "database_status": db_status
     })
@@ -627,7 +622,6 @@ ADMIN_LOGIN_TEMPLATE = '''<!DOCTYPE html>
             --text-secondary: #94a3b8;
             --success: #10b981;
             --danger: #ef4444;
-            --sidebar-width: 280px;
         }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -639,14 +633,10 @@ ADMIN_LOGIN_TEMPLATE = '''<!DOCTYPE html>
             align-items: center;
             justify-content: center;
             padding: 20px;
-            background-image: 
-                radial-gradient(circle at 10% 20%, rgba(99, 102, 241, 0.1) 0%, transparent 20%),
-                radial-gradient(circle at 90% 80%, rgba(147, 51, 234, 0.1) 0%, transparent 20%);
         }
         .login-container {
             max-width: 450px;
             width: 100%;
-            animation: fadeIn 0.5s ease;
         }
         .logo {
             text-align: center;
@@ -676,8 +666,6 @@ ADMIN_LOGIN_TEMPLATE = '''<!DOCTYPE html>
                 0 4px 6px -4px rgba(0, 0, 0, 0.1),
                 0 0 30px rgba(99, 102, 241, 0.15);
             border: 1px solid var(--border);
-            backdrop-filter: blur(12px);
-            animation: slideUp 0.6s ease;
         }
         .card-title {
             font-size: 1.8rem;
@@ -748,31 +736,11 @@ ADMIN_LOGIN_TEMPLATE = '''<!DOCTYPE html>
             background: rgba(239, 68, 68, 0.15);
             border: 1px solid var(--danger);
             color: var(--danger);
-            animation: shake 0.5s;
         }
         .alert-success {
             background: rgba(16, 185, 129, 0.15);
             border: 1px solid var(--success);
             color: var(--success);
-        }
-        @keyframes fadeIn {
-            from { opacity: 0; }
-            to { opacity: 1; }
-        }
-        @keyframes slideUp {
-            from {
-                opacity: 0;
-                transform: translateY(30px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-        @keyframes shake {
-            0%, 100% { transform: translateX(0); }
-            25% { transform: translateX(-5px); }
-            75% { transform: translateX(5px); }
         }
     </style>
 </head>
@@ -816,7 +784,6 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
     <title>Cold Search Premium — Panel Admina</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/dataTables.bootstrap5.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
@@ -835,7 +802,6 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
             --info: #3b82f6;
             --gradient-start: #8b5cf6;
             --gradient-end: #ec4899;
-            --sidebar-width: 280px;
         }
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -846,92 +812,9 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
             overflow-x: hidden;
         }
         .container {
-            display: grid;
-            grid-template-columns: var(--sidebar-width) 1fr;
-            min-height: 100vh;
-        }
-        /* Sidebar */
-        .sidebar {
-            background: rgba(15, 23, 42, 0.95);
-            border-right: 1px solid var(--border);
-            padding: 20px 0;
-            position: fixed;
-            width: var(--sidebar-width);
-            height: 100vh;
-            z-index: 100;
-            overflow-y: auto;
-            backdrop-filter: blur(10px);
-        }
-        .logo {
-            padding: 0 20px 20px;
-            border-bottom: 1px solid var(--border);
-            margin-bottom: 20px;
-            text-align: center;
-        }
-        .logo-text {
-            font-size: 1.8rem;
-            font-weight: 800;
-            background: linear-gradient(90deg, var(--gradient-start), var(--gradient-end));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-        }
-        .nav-links {
-            padding: 0 10px;
-        }
-        .nav-item {
-            display: flex;
-            align-items: center;
-            padding: 14px 20px;
-            margin-bottom: 4px;
-            border-radius: 12px;
-            cursor: pointer;
-            transition: all 0.2s;
-            text-decoration: none;
-            color: var(--text);
-        }
-        .nav-item:hover {
-            background: rgba(99, 102, 241, 0.15);
-        }
-        .nav-item.active {
-            background: rgba(99, 102, 241, 0.25);
-            border-left: 4px solid var(--primary);
-        }
-        .nav-icon {
-            margin-right: 15px;
-            font-size: 1.2rem;
-            width: 24px;
-            text-align: center;
-        }
-        .nav-text {
-            font-weight: 500;
-            font-size: 1.05rem;
-        }
-        .logout-btn {
-            margin-top: 40px;
-            padding: 12px 20px;
-            background: rgba(239, 68, 68, 0.15);
-            border: 1px solid var(--danger);
-            color: var(--danger);
-            border-radius: 10px;
-            width: calc(100% - 40px);
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            transition: all 0.2s;
-        }
-        .logout-btn:hover {
-            background: rgba(239, 68, 68, 0.25);
-        }
-        .logout-icon {
-            margin-right: 12px;
-            font-size: 1.1rem;
-        }
-        /* Main Content */
-        .main-content {
-            margin-left: var(--sidebar-width);
+            max-width: 1400px;
+            margin: 0 auto;
             padding: 20px;
-            width: calc(100% - var(--sidebar-width));
         }
         .header {
             display: flex;
@@ -941,12 +824,12 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
             padding-bottom: 15px;
             border-bottom: 1px solid var(--border);
         }
-        .logo-main {
+        .logo {
             display: flex;
             align-items: center;
             gap: 12px;
         }
-        .logo-text-main {
+        .logo-text {
             font-size: 1.8rem;
             font-weight: 800;
             background: linear-gradient(90deg, var(--gradient-start), var(--gradient-end));
@@ -954,12 +837,7 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
             -webkit-text-fill-color: transparent;
             background-clip: text;
         }
-        .page-title {
-            font-size: 1.5rem;
-            font-weight: 700;
-            color: var(--text);
-        }
-        .logout-btn-header {
+        .logout-btn {
             background: rgba(239, 68, 68, 0.15);
             color: var(--danger);
             border: 1px solid var(--danger);
@@ -972,28 +850,27 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
             gap: 8px;
             transition: all 0.2s;
         }
-        .logout-btn-header:hover {
+        .logout-btn:hover {
             background: rgba(239, 68, 68, 0.25);
             transform: translateY(-1px);
         }
         .stats-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-            gap: 24px;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 20px;
             margin-bottom: 30px;
         }
         .stat-card {
             background: var(--card-bg);
-            border-radius: 20px;
-            padding: 24px;
+            border-radius: 16px;
+            padding: 20px;
             border: 1px solid var(--border);
             text-align: center;
             transition: all 0.3s ease;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
         }
         .stat-card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
+            transform: translateY(-3px);
+            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2);
             border-color: rgba(99, 102, 241, 0.5);
         }
         .stat-card:nth-child(1) { background: linear-gradient(135deg, #6366f1, #8b5cf6); }
@@ -1001,32 +878,30 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
         .stat-card:nth-child(3) { background: linear-gradient(135deg, #f59e0b, #ef4444); }
         .stat-card:nth-child(4) { background: linear-gradient(135deg, #3b82f6, #8b5cf6); }
         .stat-icon {
-            font-size: 2.5rem;
-            margin-bottom: 12px;
+            font-size: 2rem;
+            margin-bottom: 10px;
             opacity: 0.9;
         }
         .stat-value {
-            font-size: 2.2rem;
+            font-size: 1.8rem;
             font-weight: 800;
             color: white;
             font-family: 'JetBrains Mono', monospace;
-            margin: 10px 0;
+            margin: 8px 0;
             text-shadow: 0 2px 4px rgba(0,0,0,0.2);
         }
         .stat-label {
-            font-size: 1rem;
+            font-size: 0.9rem;
             color: rgba(255,255,255,0.9);
             font-weight: 500;
-            margin-top: 4px;
         }
         .section {
             background: var(--card-bg);
-            border-radius: 20px;
+            border-radius: 16px;
             padding: 25px;
             margin-bottom: 25px;
             border: 1px solid var(--border);
             transition: all 0.3s ease;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
         }
         .section-title {
             display: flex;
@@ -1063,10 +938,10 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
         }
         .form-input, .form-select {
             width: 100%;
-            padding: 14px;
+            padding: 12px;
             background: rgba(15, 23, 42, 0.7);
             border: 1px solid var(--border);
-            border-radius: 12px;
+            border-radius: 10px;
             color: white;
             font-family: 'Inter', sans-serif;
             font-size: 0.95rem;
@@ -1078,11 +953,11 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
             box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
         }
         .btn {
-            padding: 12px 28px;
+            padding: 12px 24px;
             background: linear-gradient(90deg, #6366f1, #8b5cf6);
             color: white;
             border: none;
-            border-radius: 12px;
+            border-radius: 10px;
             font-weight: 600;
             cursor: pointer;
             font-size: 0.95rem;
@@ -1106,31 +981,30 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
         .btn-danger:hover {
             box-shadow: 0 5px 10px rgba(239, 68, 68, 0.3);
         }
-        .btn-secondary {
-            background: linear-gradient(90deg, #3b82f6, #6366f1);
-        }
         .table-container {
             overflow-x: auto;
             margin-top: 15px;
-            border-radius: 16px;
+            border-radius: 12px;
             border: 1px solid var(--border);
         }
         .table {
             width: 100%;
             border-collapse: collapse;
+            min-width: 800px;
+        }
+        .table th, .table td {
+            padding: 12px 15px;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
         }
         .table th {
-            text-align: left;
-            padding: 16px 18px;
-            border-bottom: 2px solid var(--border);
             font-weight: 700;
             background: rgba(0,0,0,0.2);
             color: var(--text);
             font-size: 0.95rem;
+            white-space: nowrap;
         }
         .table td {
-            padding: 16px 18px;
-            border-bottom: 1px solid var(--border);
             font-size: 0.95rem;
             color: var(--text);
         }
@@ -1178,7 +1052,7 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
         .alert {
             padding: 16px;
             margin-bottom: 20px;
-            border-radius: 14px;
+            border-radius: 12px;
             font-weight: 500;
             display: flex;
             align-items: center;
@@ -1240,15 +1114,15 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
             border: 1px solid rgba(239, 68, 68, 0.3);
         }
         .usage-bar {
-            height: 10px;
+            height: 8px;
             background: rgba(56, 189, 248, 0.1);
-            border-radius: 5px;
+            border-radius: 4px;
             margin-top: 6px;
             overflow: hidden;
         }
         .usage-fill {
             height: 100%;
-            border-radius: 5px;
+            border-radius: 4px;
         }
         .usage-low { background: var(--success); }
         .usage-medium { background: var(--warning); }
@@ -1268,151 +1142,10 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
             margin-top: 4px;
             font-weight: 500;
         }
-        .search-input {
-            display: flex;
-            gap: 12px;
-            margin-bottom: 20px;
-        }
-        .search-box {
-            flex: 1;
-            position: relative;
-        }
-        .search-box i {
-            position: absolute;
-            left: 16px;
-            top: 50%;
-            transform: translateY(-50%);
-            color: var(--text-secondary);
-            font-size: 1.1rem;
-        }
-        .search-input-field {
-            width: 100%;
-            padding: 14px 14px 14px 45px;
-            background: rgba(15, 23, 42, 0.7);
-            border: 1px solid var(--border);
-            border-radius: 14px;
-            color: white;
-            font-family: 'Inter', sans-serif;
-            font-size: 0.95rem;
-            transition: all 0.3s;
-        }
-        .search-input-field:focus {
-            outline: none;
-            border-color: var(--primary);
-            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
-        }
-        .system-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
-        }
-        .system-card {
-            background: rgba(15, 23, 42, 0.6);
-            border-radius: 16px;
-            padding: 20px;
-            border: 1px solid var(--border);
-        }
-        .system-card h4 {
-            font-size: 1rem;
-            font-weight: 600;
-            margin-bottom: 12px;
-            color: var(--text);
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        .system-card h4 i {
-            color: var(--primary);
-        }
-        .system-info {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 15px;
-        }
-        .system-info-item {
-            padding: 12px;
-            border-radius: 12px;
-            background: rgba(0,0,0,0.2);
-        }
-        .system-info-label {
-            font-size: 0.85rem;
-            color: var(--text-secondary);
-            margin-bottom: 4px;
-        }
-        .system-info-value {
-            font-weight: 600;
-            font-size: 0.95rem;
-            color: var(--text);
-        }
-        .footer {
-            text-align: center;
-            margin-top: 30px;
-            padding-top: 20px;
-            border-top: 1px solid var(--border);
-            color: var(--text-secondary);
-            font-size: 0.9rem;
-        }
-        .tab-content {
-            display: none;
-        }
-        .tab-content.active {
-            display: block;
-            animation: fadeIn 0.3s ease;
-        }
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(10px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
         .chart-container {
-            height: 240px;
+            height: 200px;
             margin-top: 20px;
             position: relative;
-        }
-        .endpoint-card {
-            background: rgba(15, 23, 42, 0.7);
-            border-radius: 16px;
-            padding: 20px;
-            margin-bottom: 20px;
-            border: 1px solid var(--border);
-        }
-        .endpoint-method {
-            display: inline-block;
-            padding: 4px 12px;
-            border-radius: 20px;
-            font-weight: 600;
-            font-size: 0.85rem;
-            margin-right: 10px;
-        }
-        .method-get { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; }
-        .method-post { background: rgba(99, 102, 241, 0.2); color: #a5b4fc; }
-        .method-delete { background: rgba(239, 68, 68, 0.2); color: #fca5a5; }
-        .endpoint-url {
-            font-family: 'JetBrains Mono', monospace;
-            font-weight: 600;
-            color: var(--primary);
-            margin: 8px 0;
-        }
-        .endpoint-params {
-            margin-top: 10px;
-            padding: 12px;
-            background: rgba(0,0,0,0.2);
-            border-radius: 8px;
-        }
-        .endpoint-param {
-            display: flex;
-            gap: 10px;
-            margin-bottom: 6px;
-        }
-        .param-name {
-            flex: 1;
-            font-weight: 500;
-            color: var(--text);
-        }
-        .param-type {
-            background: rgba(56, 189, 248, 0.2);
-            padding: 2px 8px;
-            border-radius: 4px;
-            font-size: 0.85rem;
         }
         .source-bar {
             height: 8px;
@@ -1445,29 +1178,18 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
             background: rgba(239, 68, 68, 0.2);
             color: #fca5a5;
         }
-        @media (max-width: 992px) {
-            .container {
-                grid-template-columns: 1fr;
-            }
-            .sidebar {
-                position: relative;
-                width: 100%;
-                height: auto;
-            }
-            .main-content {
-                margin-left: 0;
-                width: 100%;
-            }
-            .stats-grid {
-                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            }
+        .footer {
+            text-align: center;
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid var(--border);
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            padding-bottom: 20px;
         }
         @media (max-width: 768px) {
             .form-row { 
                 flex-direction: column; 
-            }
-            .nav-item { 
-                padding: 10px 15px; 
             }
             .stats-grid {
                 grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -1475,830 +1197,423 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
             .section {
                 padding: 15px;
             }
-            .table-container {
-                font-size: 0.85rem;
-            }
-            .table td, .table th {
-                padding: 10px 12px;
-            }
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <!-- Sidebar - Nawigacja po lewej stronie -->
-        <div class="sidebar">
+        <div class="header">
             <div class="logo">
-                <div class="logo-text">❄ COLD SEARCH</div>
+                <i class="fas fa-snowflake" style="font-size: 1.8rem; color: var(--primary);"></i>
+                <div class="logo-text">COLD SEARCH ADMIN</div>
             </div>
-            <div class="nav-links">
-                <a href="{{ url_for('admin_panel', tab='dashboard') }}" class="nav-item {% if active_tab == 'dashboard' %}active{% endif %}">
-                    <i class="fas fa-home nav-icon"></i>
-                    <span class="nav-text">Dashboard</span>
-                </a>
-                <a href="{{ url_for('admin_panel', tab='licenses') }}" class="nav-item {% if active_tab == 'licenses' %}active{% endif %}">
-                    <i class="fas fa-key nav-icon"></i>
-                    <span class="nav-text">Licencje</span>
-                </a>
-                <a href="{{ url_for('admin_panel', tab='imports') }}" class="nav-item {% if active_tab == 'imports' %}active{% endif %}">
-                    <i class="fas fa-file-import nav-icon"></i>
-                    <span class="nav-text">Import danych</span>
-                </a>
-                <a href="{{ url_for('admin_panel', tab='bans') }}" class="nav-item {% if active_tab == 'bans' %}active{% endif %}">
-                    <i class="fas fa-ban nav-icon"></i>
-                    <span class="nav-text">Bany IP</span>
-                </a>
-                <a href="{{ url_for('admin_panel', tab='stats') }}" class="nav-item {% if active_tab == 'stats' %}active{% endif %}">
-                    <i class="fas fa-chart-bar nav-icon"></i>
-                    <span class="nav-text">Statystyki</span>
-                </a>
-                <a href="{{ url_for('admin_panel', tab='help') }}" class="nav-item {% if active_tab == 'help' %}active{% endif %}">
-                    <i class="fas fa-question-circle nav-icon"></i>
-                    <span class="nav-text">Dokumentacja API</span>
-                </a>
-            </div>
-            <button class="logout-btn" onclick="location.href='{{ url_for('admin_logout') }}'">
-                <i class="fas fa-sign-out-alt logout-icon"></i>
-                <span>Wyloguj się</span>
-            </button>
+            <a href="{{ url_for('admin_logout') }}" class="logout-btn">
+                <i class="fas fa-sign-out-alt"></i> Wyloguj
+            </a>
         </div>
         
-        <!-- Główna zawartość -->
-        <div class="main-content">
-            <div class="header">
-                <div class="logo-main">
-                    <i class="fas fa-snowflake" style="font-size: 1.8rem; color: var(--primary);"></i>
-                    <div class="logo-text-main">COLD SEARCH ADMIN</div>
-                </div>
-                <a href="{{ url_for('admin_logout') }}" class="logout-btn-header">
-                    <i class="fas fa-sign-out-alt"></i> Wyloguj
-                </a>
-            </div>
-            
-            {% with messages = get_flashed_messages(with_categories=true) %}
-                {% for cat, msg in messages %}
-                    <div class="alert alert-{{ 'success' if cat == 'success' else 'error' if cat == 'error' else 'info' }}">
-                        {% if cat == 'success' %}
-                            <i class="fas fa-check-circle" style="color: var(--success); font-size: 1.2rem;"></i>
-                        {% elif cat == 'error' %}
-                            <i class="fas fa-exclamation-triangle" style="color: var(--danger); font-size: 1.2rem;"></i>
-                        {% else %}
-                            <i class="fas fa-info-circle" style="color: var(--info); font-size: 1.2rem;"></i>
-                        {% endif %}
-                        <div style="flex: 1;">
-                            <strong style="display: block; margin-bottom: 4px;">{% if cat == 'success' %}Sukces{% elif cat == 'error' %}Błąd{% else %}Informacja{% endif %}</strong>
-                            <span>{{ msg }}</span>
-                        </div>
-                    </div>
-                {% endfor %}
-            {% endwith %}
-            
-            <!-- Zawartość dla zakładki Dashboard -->
-            <div class="tab-content {% if active_tab == 'dashboard' %}active{% endif %}" id="dashboard-tab">
-                <!-- Statystyki -->
-                <div class="stats-grid">
-                    <div class="stat-card">
-                        <div class="stat-icon">
-                            <i class="fas fa-database"></i>
-                        </div>
-                        <div class="stat-value">{{ "{:,}".format(total_leaks).replace(",", " ") }}</div>
-                        <div class="stat-label">Rekordów w bazie</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-icon">
-                            <i class="fas fa-file-alt"></i>
-                        </div>
-                        <div class="stat-value">{{ "{:,}".format(source_count).replace(",", " ") }}</div>
-                        <div class="stat-label">Źródeł danych</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-icon">
-                            <i class="fas fa-key"></i>
-                        </div>
-                        <div class="stat-value">{{ active_licenses }}</div>
-                        <div class="stat-label">Aktywnych licencji</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-icon">
-                            <i class="fas fa-users"></i>
-                        </div>
-                        <div class="stat-value">{{ "{:,}".format(active_users_24h).replace(",", " ") }}</div>
-                        <div class="stat-label">Aktywni użytkownicy (24h)</div>
-                    </div>
-                </div>
-                
-                <!-- Ostatnie leaki -->
-                <div class="section">
-                    <div class="section-title">
-                        <i class="fas fa-history"></i> Ostatnie dane wyciekowe
-                    </div>
-                    {% for leak in recent_leaks %}
-                        <div class="leak-item">
-                            <div class="leak-data">{{ leak.data | truncate(70) }}</div>
-                            <small>
-                                <span class="ip-badge">{{ leak.source }}</span>
-                                <span style="color: var(--text-secondary); margin-left: 10px;">• {{ format_datetime(leak.created_at) }}</span>
-                            </small>
-                        </div>
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% for cat, msg in messages %}
+                <div class="alert alert-{{ 'success' if cat == 'success' else 'error' if cat == 'error' else 'info' }}">
+                    {% if cat == 'success' %}
+                        <i class="fas fa-check-circle" style="color: var(--success); font-size: 1.2rem;"></i>
+                    {% elif cat == 'error' %}
+                        <i class="fas fa-exclamation-triangle" style="color: var(--danger); font-size: 1.2rem;"></i>
                     {% else %}
-                        <div style="text-align: center; padding: 20px; color: var(--text-secondary);">
-                            Brak danych wyciekowych w bazie
-                        </div>
-                    {% endfor %}
-                </div>
-                
-                <!-- Najczęstsze źródła -->
-                <div class="section">
-                    <div class="section-title">
-                        <i class="fas fa-layer-group"></i> Najczęstsze źródła danych
-                    </div>
-                    {% for source in top_sources %}
-                        <div style="margin-bottom: 15px;">
-                            <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
-                                <span style="font-weight: 500;">{{ source.source }}</span>
-                                <span style="color: var(--text-secondary);">{{ source.count }}</span>
-                            </div>
-                            <div class="source-bar">
-                                <div class="source-fill" style="width: {{ (source.count / total_leaks * 100) | int }}%;"></div>
-                            </div>
-                        </div>
-                    {% else %}
-                        <div style="text-align: center; padding: 20px; color: var(--text-secondary);">
-                            Brak źródeł danych w bazie
-                        </div>
-                    {% endfor %}
-                </div>
-                
-                <!-- Informacje systemowe -->
-                <div class="section">
-                    <div class="section-title">
-                        <i class="fas fa-server"></i> Informacje systemowe
-                    </div>
-                    <div class="system-grid">
-                        <div class="system-card">
-                            <h4><i class="fas fa-clock"></i> Sesja administratora</h4>
-                            <div class="system-info">
-                                <div class="system-info-item">
-                                    <div class="system-info-label">Czas trwania</div>
-                                    <div class="system-info-value">{{ session_duration }}</div>
-                                </div>
-                                <div class="system-info-item">
-                                    <div class="system-info-label">Twój adres IP</div>
-                                    <div class="system-info-value"><span class="ip-badge">{{ client_ip }}</span></div>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="system-card">
-                            <h4><i class="fas fa-database"></i> Baza danych leaków</h4>
-                            <div class="system-info">
-                                <div class="system-info-item">
-                                    <div class="system-info-label">Status</div>
-                                    <div class="system-info-value" style="color: var(--success);">
-                                        <i class="fas fa-circle" style="font-size: 0.6rem; margin-right: 6px;"></i> Online
-                                    </div>
-                                </div>
-                                <div class="system-info-item">
-                                    <div class="system-info-label">Liczba rekordów</div>
-                                    <div class="system-info-value">{{ "{:,}".format(total_leaks).replace(",", " ") }} rekordów</div>
-                                </div>
-                                <div class="system-info-item">
-                                    <div class="system-info-label">Ostatnia aktualizacja</div>
-                                    <div class="system-info-value">{{ format_datetime(now) }}</div>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="system-card">
-                            <h4><i class="fas fa-cloud"></i> Supabase API</h4>
-                            <div class="system-info">
-                                <div class="system-info-item">
-                                    <div class="system-info-label">Status</div>
-                                    <div class="system-info-value" style="color: var(--success);">
-                                        <i class="fas fa-circle" style="font-size: 0.6rem; margin-right: 6px;"></i> Online
-                                    </div>
-                                </div>
-                                <div class="system-info-item">
-                                    <div class="system-info-label">Aktywne licencje</div>
-                                    <div class="system-info-value">{{ active_licenses }}</div>
-                                </div>
-                                <div class="system-info-item">
-                                    <div class="system-info-label">Zbanowane IP</div>
-                                    <div class="system-info-value">{{ banned_ips|length }}</div>
-                                </div>
-                            </div>
-                        </div>
+                        <i class="fas fa-info-circle" style="color: var(--info); font-size: 1.2rem;"></i>
+                    {% endif %}
+                    <div style="flex: 1;">
+                        <strong style="display: block; margin-bottom: 4px;">{% if cat == 'success' %}Sukces{% elif cat == 'error' %}Błąd{% else %}Informacja{% endif %}</strong>
+                        <span>{{ msg }}</span>
                     </div>
                 </div>
+            {% endfor %}
+        {% endwith %}
+        
+        <!-- Statystyki -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-icon">
+                    <i class="fas fa-database"></i>
+                </div>
+                <div class="stat-value">{{ total_leaks_formatted }}</div>
+                <div class="stat-label">Rekordów w bazie</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">
+                    <i class="fas fa-file-alt"></i>
+                </div>
+                <div class="stat-value">{{ "{:,}".format(source_count).replace(",", " ") }}</div>
+                <div class="stat-label">Źródeł danych</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">
+                    <i class="fas fa-key"></i>
+                </div>
+                <div class="stat-value">{{ active_licenses }}</div>
+                <div class="stat-label">Aktywnych licencji</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">
+                    <i class="fas fa-users"></i>
+                </div>
+                <div class="stat-value">{{ "{:,}".format(active_users_24h).replace(",", " ") }}</div>
+                <div class="stat-label">Aktywni użytkownicy (24h)</div>
+            </div>
+        </div>
+        
+        <!-- Najczęstsze źródła -->
+        <div class="section">
+            <div class="section-title">
+                <i class="fas fa-layer-group"></i> Najczęstsze źródła danych
+            </div>
+            {% for source in top_sources %}
+                <div style="margin-bottom: 15px;">
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+                        <span style="font-weight: 500;">{{ source.source }}</span>
+                        <span style="color: var(--text-secondary);">{{ source.count }}</span>
+                    </div>
+                    <div class="source-bar">
+                        <div class="source-fill" style="width: {{ (source.count / (total_leaks or 1) * 100) | int }}%;"></div>
+                    </div>
+                </div>
+            {% else %}
+                <div style="text-align: center; padding: 20px; color: var(--text-secondary);">
+                    Brak źródeł danych w bazie
+                </div>
+            {% endfor %}
+        </div>
+        
+        <!-- Zarządzanie licencjami -->
+        <div class="section">
+            <div class="section-title">
+                <i class="fas fa-key"></i> Zarządzanie licencjami ({{ licenses|length }})
             </div>
             
-            <!-- Zawartość dla zakładki Licencje -->
-            <div class="tab-content {% if active_tab == 'licenses' %}active{% endif %}" id="licenses-tab">
-                <div class="section">
-                    <div class="section-title">
-                        <i class="fas fa-key"></i> Zarządzanie licencjami ({{ licenses|length }})
+            <form method="post" style="margin-bottom:25px;">
+                <input type="hidden" name="action" value="add_license">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Liczba dni ważności</label>
+                        <input type="number" name="days" value="30" min="1" max="3650" class="form-input">
                     </div>
-                    
-                    <form method="post">
-                        <input type="hidden" name="action" value="add_license">
-                        <div class="form-row">
-                            <div class="form-group">
-                                <label>Liczba dni ważności</label>
-                                <input type="number" name="days" value="30" min="1" max="3650" class="form-input">
-                            </div>
-                            <div class="form-group">
-                                <label>Limit wyszukiwań dziennych</label>
-                                <input type="number" name="daily_limit" value="100" min="1" max="10000" class="form-input">
-                            </div>
-                            <div class="form-group">
-                                <label>Limit wyszukiwań całkowitych</label>
-                                <input type="number" name="total_limit" value="1000" min="10" max="100000" class="form-input">
-                            </div>
-                            <div class="form-group">
-                                <label>Typ licencji</label>
-                                <select name="license_type" class="form-select">
-                                    <option value="standard">Standardowa</option>
-                                    <option value="premium">Premium</option>
-                                    <option value="enterprise">Enterprise</option>
-                                </select>
-                            </div>
-                            <div class="form-group" style="align-self: flex-end;">
-                                <button type="submit" class="btn">
-                                    <i class="fas fa-plus"></i> Generuj licencję
-                                </button>
-                            </div>
-                        </div>
-                    </form>
-                    
-                    <div class="table-container">
-                        <table class="table">
-                            <thead>
-                                <tr>
-                                    <th>Klucz dostępu</th>
-                                    <th>Ważność</th>
-                                    <th>IP</th>
-                                    <th>Typ</th>
-                                    <th>Limit dzienny</th>
-                                    <th>Status</th>
-                                    <th>Data utworzenia</th>
-                                    <th>Akcje</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {% for lic in licenses %}
-                                <tr>
-                                    <td>
-                                        <span class="key">{{ lic.key }}</span>
-                                        <div style="font-size: 0.8rem; color: var(--text-secondary); margin-top: 4px;">
-                                            {% if lic.ip and lic.ip.strip() != "" %}
-                                            <i class="fas fa-lock" style="margin-right: 4px;"></i>Przypisany do: {{ lic.ip }}
-                                            {% else %}
-                                            <i class="fas fa-unlock" style="margin-right: 4px; color: var(--warning);"></i>Bez ograniczeń IP
-                                            {% endif %}
-                                        </div>
-                                    </td>
-                                    <td>{{ lic.expiry.split('T')[0] }}</td>
-                                    <td>
-                                        {% if lic.ip and lic.ip.strip() != "" %}
-                                        <span class="ip-badge">{{ lic.ip }}</span>
-                                        {% else %}
-                                        <span style="color: var(--warning);">Brak ograniczeń</span>
-                                        {% endif %}
-                                    </td>
-                                    <td>
-                                        <span class="license-type type-{{ lic.license_type.lower() if lic.license_type else 'standard' }}">
-                                            {{ lic.license_type.capitalize() if lic.license_type else 'Standard' }}
-                                        </span>
-                                    </td>
-                                    <td>{{ lic.daily_limit }}/{{ lic.total_limit }}</td>
-                                    <td>
-                                        <span class="{{ 'status-active' if lic.active else 'status-inactive' }}">
-                                            {{ 'Aktywna' if lic.active else 'Nieaktywna' }}
-                                        </span>
-                                    </td>
-                                    <td>{{ format_datetime(lic.created_at) if lic.created_at else '—' }}</td>
-                                    <td>
-                                        <div style="display: flex; gap: 8px;">
-                                            <form method="post" style="display:inline;" onsubmit="return confirm('Na pewno chcesz {{ '' if lic.active else 'w' }}yłączyć tę licencję?')">
-                                                <input type="hidden" name="action" value="toggle_license">
-                                                <input type="hidden" name="key" value="{{ lic.key }}">
-                                                <button type="submit" class="btn {% if lic.active %}btn-danger{% else %}btn{% endif %}" style="padding: 6px 12px; font-size: 0.85rem;">
-                                                    {% if lic.active %}<i class="fas fa-power-off"></i> Wyłącz{% else %}<i class="fas fa-power-off"></i> Włącz{% endif %}
-                                                </button>
-                                            </form>
-                                            <form method="post" style="display:inline;" onsubmit="return confirm('Na pewno usunąć tę licencję?')">
-                                                <input type="hidden" name="action" value="del_license">
-                                                <input type="hidden" name="key" value="{{ lic.key }}">
-                                                <button type="submit" class="btn btn-danger" style="padding: 6px 12px; font-size: 0.85rem;">
-                                                    <i class="fas fa-trash"></i> Usuń
-                                                </button>
-                                            </form>
-                                        </div>
-                                    </td>
-                                </tr>
+                    <div class="form-group">
+                        <label>Limit wyszukiwań dziennych</label>
+                        <input type="number" name="daily_limit" value="100" min="1" max="10000" class="form-input">
+                    </div>
+                    <div class="form-group">
+                        <label>Limit wyszukiwań całkowitych</label>
+                        <input type="number" name="total_limit" value="1000" min="10" max="100000" class="form-input">
+                    </div>
+                    <div class="form-group">
+                        <label>Typ licencji</label>
+                        <select name="license_type" class="form-select">
+                            <option value="standard">Standardowa</option>
+                            <option value="premium">Premium</option>
+                            <option value="enterprise">Enterprise</option>
+                        </select>
+                    </div>
+                    <div class="form-group" style="align-self: flex-end;">
+                        <button type="submit" class="btn">
+                            <i class="fas fa-plus"></i> Generuj licencję
+                        </button>
+                    </div>
+                </div>
+            </form>
+            
+            <div class="table-container">
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th>Klucz dostępu</th>
+                            <th>Ważność</th>
+                            <th>IP</th>
+                            <th>Typ</th>
+                            <th>Limit dzienny</th>
+                            <th>Status</th>
+                            <th>Data utworzenia</th>
+                            <th>Akcje</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for lic in licenses %}
+                        <tr>
+                            <td>
+                                <span class="key">{{ lic.key }}</span>
+                                <div style="font-size: 0.8rem; color: var(--text-secondary); margin-top: 4px;">
+                                    {% if lic.ip and lic.ip.strip() != "" %}
+                                    <i class="fas fa-lock" style="margin-right: 4px;"></i>Przypisany do: {{ lic.ip }}
+                                    {% else %}
+                                    <i class="fas fa-unlock" style="margin-right: 4px; color: var(--warning);"></i>Bez ograniczeń IP
+                                    {% endif %}
+                                </div>
+                            </td>
+                            <td>{{ lic.expiry.split('T')[0] }}</td>
+                            <td>
+                                {% if lic.ip and lic.ip.strip() != "" %}
+                                <span class="ip-badge">{{ lic.ip }}</span>
                                 {% else %}
-                                <tr>
-                                    <td colspan="8" style="text-align: center; padding: 30px; color: var(--text-secondary);">
-                                        <i class="fas fa-database" style="font-size: 2rem; margin-bottom: 10px; opacity: 0.5;"></i>
-                                        <div>Brak licencji w systemie</div>
-                                        <div style="font-size: 0.9rem; margin-top: 8px;">Wygeneruj pierwszą licencję za pomocą formularza powyżej</div>
-                                    </td>
-                                </tr>
-                                {% endfor %}
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- Zawartość dla zakładki Import danych -->
-            <div class="tab-content {% if active_tab == 'imports' %}active{% endif %}" id="imports-tab">
-                <div class="section">
-                    <div class="section-title">
-                        <i class="fas fa-file-import"></i> Import bazy danych
-                    </div>
-                    <div style="background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.3); border-radius: 16px; padding: 20px; margin-bottom: 20px;">
-                        <p style="margin: 0; color: #bae6fd; line-height: 1.6;">
-                            <strong><i class="fas fa-info-circle" style="margin-right: 8px;"></i>Uwaga:</strong> Import danych może zająć kilka minut w zależności od rozmiaru archiwum ZIP.
-                            Proces odbywa się w tle - możesz kontynuować pracę w panelu.
-                        </p>
-                    </div>
-                    <form method="post">
-                        <input type="hidden" name="action" value="import_start">
-                        <div class="form-row">
-                            <div class="form-group" style="flex: 3;">
-                                <label>URL do archiwum ZIP z danymi</label>
-                                <input type="url" name="import_url" placeholder="https://example.com/dane.zip" class="form-input" required>
-                            </div>
-                            <div class="form-group" style="align-self: flex-end; flex: 1;">
-                                <button type="submit" class="btn" style="width: 100%;">
-                                    <i class="fas fa-cloud-download-alt"></i> Importuj dane
-                                </button>
-                            </div>
-                        </div>
-                    </form>
-                    <div style="margin-top: 20px; padding: 16px; background: rgba(15, 23, 42, 0.7); border-radius: 16px; border: 1px solid var(--border);">
-                        <p style="margin: 0; color: var(--text-secondary); line-height: 1.6;">
-                            <strong><i class="fas fa-file-archive" style="margin-right: 8px; color: var(--warning);"></i>Wymagania:</strong>
-                            Archiwum ZIP powinno zawierać pliki tekstowe (.txt, .csv, .log) z danymi wyciekowymi.
-                            Każda linia w pliku powinna zawierać pojedynczy rekord (email, login, etc.).
-                        </p>
-                    </div>
-                </div>
-                
-                <div class="section">
-                    <div class="section-title">
-                        <i class="fas fa-inbox"></i> Historia importów
-                    </div>
-                    <div style="text-align: center; padding: 40px 20px; color: var(--text-secondary);">
-                        <i class="fas fa-database" style="font-size: 3rem; margin-bottom: 15px; opacity: 0.5;"></i>
-                        <div style="font-size: 1.1rem; margin-bottom: 10px;">Brak zakończonych importów</div>
-                        <div>Uruchom nowy import, aby wyświetlić historię</div>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- Zawartość dla zakładki Bany IP -->
-            <div class="tab-content {% if active_tab == 'bans' %}active{% endif %}" id="bans-tab">
-                <div class="section">
-                    <div class="section-title">
-                        <i class="fas fa-ban"></i> Zbanowane adresy IP ({{ banned_ips|length }})
-                    </div>
-                    <form method="post">
-                        <input type="hidden" name="action" value="add_ban">
-                        <div class="form-row">
-                            <div class="form-group">
-                                <label>Adres IP do zbanowania</label>
-                                <input type="text" name="ip" placeholder="np. 192.168.1.1" class="form-input" required>
-                            </div>
-                            <div class="form-group">
-                                <label>Powód bana (opcjonalnie)</label>
-                                <input type="text" name="reason" placeholder="Naruszenie regulaminu" class="form-input">
-                            </div>
-                            <div class="form-group" style="align-self: flex-end;">
-                                <button type="submit" class="btn">
-                                    <i class="fas fa-ban"></i> Zbanuj adres IP
-                                </button>
-                            </div>
-                        </div>
-                    </form>
-                    
-                    <div class="table-container">
-                        <table class="table">
-                            <thead>
-                                <tr>
-                                    <th>Adres IP</th>
-                                    <th>Powód bana</th>
-                                    <th>Data bana</th>
-                                    <th>Zbanował</th>
-                                    <th>Akcje</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {% for ban in banned_ips %}
-                                <tr>
-                                    <td><span class="ip-badge">{{ ban.ip }}</span></td>
-                                    <td>{{ ban.reason or 'Brak informacji' }}</td>
-                                    <td>{{ format_datetime(ban.created_at) if ban.created_at else '—' }}</td>
-                                    <td>{{ ban.admin_ip or 'System' }}</td>
-                                    <td>
-                                        <form method="post" style="display:inline;" onsubmit="return confirm('Na pewno chcesz odbanować ten adres?')">
-                                            <input type="hidden" name="action" value="del_ban">
-                                            <input type="hidden" name="ip" value="{{ ban.ip }}">
-                                            <button type="submit" class="btn btn-danger" style="padding: 6px 12px; font-size: 0.85rem;">
-                                                <i class="fas fa-user-check"></i> Odbanuj
-                                            </button>
-                                        </form>
-                                    </td>
-                                </tr>
-                                {% else %}
-                                <tr>
-                                    <td colspan="5" style="text-align: center; padding: 30px; color: var(--text-secondary);">
-                                        <i class="fas fa-user-slash" style="font-size: 2rem; margin-bottom: 10px; opacity: 0.5;"></i>
-                                        <div>Brak zbanowanych adresów IP</div>
-                                        <div style="font-size: 0.9rem; margin-top: 8px;">Dodaj pierwszy zbanowany adres IP za pomocą formularza powyżej</div>
-                                    </td>
-                                </tr>
-                                {% endfor %}
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- Zawartość dla zakładki Statystyki -->
-            <div class="tab-content {% if active_tab == 'stats' %}active{% endif %}" id="stats-tab">
-                <div class="section">
-                    <div class="section-title">
-                        <i class="fas fa-chart-bar"></i> Szczegółowe statystyki systemu
-                    </div>
-                    <div class="system-grid">
-                        <div class="system-card">
-                            <h4><i class="fas fa-search"></i> Wyszukiwania</h4>
-                            <div class="system-info">
-                                <div class="system-info-item">
-                                    <div class="system-info-label">Wszystkie wyszukiwania</div>
-                                    <div class="system-info-value">{{ "{:,}".format(total_searches).replace(",", " ") }}</div>
-                                </div>
-                                <div class="system-info-item">
-                                    <div class="system-info-label">Dziennie (średnio)</div>
-                                    <div class="system-info-value">{{ "{:,}".format((total_searches / 30) | int).replace(",", " ") if total_searches > 0 else '0' }}</div>
-                                </div>
-                                <div class="system-info-item">
-                                    <div class="system-info-label">Aktywni użytkownicy (24h)</div>
-                                    <div class="system-info-value">{{ "{:,}".format(active_users_24h).replace(",", " ") }}</div>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="system-card">
-                            <h4><i class="fas fa-server"></i> Wydajność bazy</h4>
-                            <div class="system-info">
-                                <div class="system-info-item">
-                                    <div class="system-info-label">Rekordów w bazie</div>
-                                    <div class="system-info-value">{{ "{:,}".format(total_leaks).replace(",", " ") }}</div>
-                                </div>
-                                <div class="system-info-item">
-                                    <div class="system-info-label">Średni czas odpowiedzi</div>
-                                    <div class="system-info-value">45 ms</div>
-                                </div>
-                                <div class="system-info-item">
-                                    <div class="system-info-label">Wykorzystanie CPU</div>
-                                    <div class="system-info-value">23%</div>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="system-card">
-                            <h4><i class="fas fa-shield-alt"></i> Bezpieczeństwo</h4>
-                            <div class="system-info">
-                                <div class="system-info-item">
-                                    <div class="system-info-label">Zbanowane IP</div>
-                                    <div class="system-info-value">{{ "{:,}".format(banned_ips|length).replace(",", " ") }}</div>
-                                </div>
-                                <div class="system-info-item">
-                                    <div class="system-info-label">Aktywne licencje</div>
-                                    <div class="system-info-value">{{ "{:,}".format(active_licenses).replace(",", " ") }}</div>
-                                </div>
-                                <div class="system-info-item">
-                                    <div class="system-info-label">Nieudane logowania</div>
-                                    <div class="system-info-value">15</div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                
-                <div class="section">
-                    <div class="section-title">
-                        <i class="fas fa-history"></i> Historia aktywności administratora
-                    </div>
-                    <div class="table-container">
-                        <table class="table">
-                            <thead>
-                                <tr>
-                                    <th>Data</th>
-                                    <th>Akcja</th>
-                                    <th>Szczegóły</th>
-                                    <th>IP Administratora</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                <tr>
-                                    <td>{{ format_datetime(now) }}</td>
-                                    <td>Logowanie</td>
-                                    <td>Zalogowano do panelu administratora</td>
-                                    <td>{{ client_ip }}</td>
-                                </tr>
-                                <tr>
-                                    <td>{{ format_datetime(now) }}</td>
-                                    <td>Odwiedziny</td>
-                                    <td>Wyświetlono dashboard</td>
-                                    <td>{{ client_ip }}</td>
-                                </tr>
-                                {% if licenses|length > 0 %}
-                                <tr>
-                                    <td>{{ format_datetime(licenses[0].created_at) if licenses[0].created_at else now }}</td>
-                                    <td>Generowanie licencji</td>
-                                    <td>Klucz: {{ licenses[0].key }}</td>
-                                    <td>{{ client_ip }}</td>
-                                </tr>
+                                <span style="color: var(--warning);">Brak ograniczeń</span>
                                 {% endif %}
-                            </tbody>
-                        </table>
+                            </td>
+                            <td>
+                                <span class="license-type type-{{ lic.license_type.lower() if lic.license_type else 'standard' }}">
+                                    {{ lic.license_type.capitalize() if lic.license_type else 'Standard' }}
+                                </span>
+                            </td>
+                            <td>{{ lic.daily_limit }}/{{ lic.total_limit }}</td>
+                            <td>
+                                <span class="{{ 'status-active' if lic.active else 'status-inactive' }}">
+                                    {{ 'Aktywna' if lic.active else 'Nieaktywna' }}
+                                </span>
+                            </td>
+                            <td>{{ format_datetime(lic.created_at) if lic.created_at else '—' }}</td>
+                            <td>
+                                <div style="display: flex; gap: 8px;">
+                                    <form method="post" style="display:inline;" onsubmit="return confirm('Na pewno chcesz {{ '' if lic.active else 'w' }}yłączyć tę licencję?')">
+                                        <input type="hidden" name="action" value="toggle_license">
+                                        <input type="hidden" name="key" value="{{ lic.key }}">
+                                        <button type="submit" class="btn {% if lic.active %}btn-danger{% else %}btn{% endif %}" style="padding: 6px 12px; font-size: 0.85rem;">
+                                            {% if lic.active %}<i class="fas fa-power-off"></i> Wyłącz{% else %}<i class="fas fa-power-off"></i> Włącz{% endif %}
+                                        </button>
+                                    </form>
+                                    <form method="post" style="display:inline;" onsubmit="return confirm('Na pewno usunąć tę licencję?')">
+                                        <input type="hidden" name="action" value="del_license">
+                                        <input type="hidden" name="key" value="{{ lic.key }}">
+                                        <button type="submit" class="btn btn-danger" style="padding: 6px 12px; font-size: 0.85rem;">
+                                            <i class="fas fa-trash"></i> Usuń
+                                        </button>
+                                    </form>
+                                </div>
+                            </td>
+                        </tr>
+                        {% else %}
+                        <tr>
+                            <td colspan="8" style="text-align: center; padding: 30px; color: var(--text-secondary);">
+                                <i class="fas fa-database" style="font-size: 2rem; margin-bottom: 10px; opacity: 0.5;"></i>
+                                <div>Brak licencji w systemie</div>
+                                <div style="font-size: 0.9rem; margin-top: 8px;">Wygeneruj pierwszą licencję za pomocą formularza powyżej</div>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <!-- Zbanowane adresy IP -->
+        <div class="section">
+            <div class="section-title">
+                <i class="fas fa-ban"></i> Zbanowane adresy IP ({{ banned_ips|length }})
+            </div>
+            <form method="post" style="margin-bottom:25px;">
+                <input type="hidden" name="action" value="add_ban">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Adres IP do zbanowania</label>
+                        <input type="text" name="ip" placeholder="np. 192.168.1.1" class="form-input" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Powód bana (opcjonalnie)</label>
+                        <input type="text" name="reason" placeholder="Naruszenie regulaminu" class="form-input">
+                    </div>
+                    <div class="form-group" style="align-self: flex-end;">
+                        <button type="submit" class="btn">
+                            <i class="fas fa-ban"></i> Zbanuj adres IP
+                        </button>
                     </div>
                 </div>
-            </div>
+            </form>
             
-            <!-- Zawartość dla zakładki Dokumentacja API -->
-            <div class="tab-content {% if active_tab == 'help' %}active{% endif %}" id="help-tab">
-                <div class="section">
-                    <div class="section-title">
-                        <i class="fas fa-book-open"></i> Dokumentacja API
+            <div class="table-container">
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th>Adres IP</th>
+                            <th>Powód bana</th>
+                            <th>Data bana</th>
+                            <th>Zbanował</th>
+                            <th>Akcje</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for ban in banned_ips %}
+                        <tr>
+                            <td><span class="ip-badge">{{ ban.ip }}</span></td>
+                            <td>{{ ban.reason or 'Brak informacji' }}</td>
+                            <td>{{ format_datetime(ban.created_at) if ban.created_at else '—' }}</td>
+                            <td>{{ ban.admin_ip or 'System' }}</td>
+                            <td>
+                                <form method="post" style="display:inline;" onsubmit="return confirm('Na pewno chcesz odbanować ten adres?')">
+                                    <input type="hidden" name="action" value="del_ban">
+                                    <input type="hidden" name="ip" value="{{ ban.ip }}">
+                                    <button type="submit" class="btn btn-danger" style="padding: 6px 12px; font-size: 0.85rem;">
+                                        <i class="fas fa-user-check"></i> Odbanuj
+                                    </button>
+                                </form>
+                            </td>
+                        </tr>
+                        {% else %}
+                        <tr>
+                            <td colspan="5" style="text-align: center; padding: 30px; color: var(--text-secondary);">
+                                <i class="fas fa-user-slash" style="font-size: 2rem; margin-bottom: 10px; opacity: 0.5;"></i>
+                                <div>Brak zbanowanych adresów IP</div>
+                                <div style="font-size: 0.9rem; margin-top: 8px;">Dodaj pierwszy zbanowany adres IP za pomocą formularza powyżej</div>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <!-- Import danych -->
+        <div class="section">
+            <div class="section-title">
+                <i class="fas fa-file-import"></i> Import bazy danych
+            </div>
+            <div style="background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.3); border-radius: 12px; padding: 15px; margin-bottom: 20px;">
+                <p style="margin: 0; color: #bae6fd; line-height: 1.6;">
+                    <strong><i class="fas fa-info-circle" style="margin-right: 8px;"></i>Uwaga:</strong> Import danych może zająć kilka minut w zależności od rozmiaru archiwum ZIP.
+                    Proces odbywa się w tle - możesz kontynuować pracę w panelu.
+                </p>
+            </div>
+            <form method="post">
+                <input type="hidden" name="action" value="import_start">
+                <div class="form-row">
+                    <div class="form-group" style="flex: 3;">
+                        <label>URL do archiwum ZIP z danymi</label>
+                        <input type="url" name="import_url" placeholder="https://example.com/dane.zip" class="form-input" required>
                     </div>
-                    <p style="margin-bottom: 20px; color: var(--text-secondary); line-height: 1.6;">
-                        Poniżej znajdziesz kompletne informacje na temat endpointów API, które są wykorzystywane przez klienta desktopowego.
-                    </p>
-                    
-                    <div class="endpoint-card">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-                            <span class="endpoint-method method-get">GET</span>
-                            <div class="endpoint-url">/api/status</div>
-                        </div>
-                        <p style="margin-bottom: 12px; color: var(--text-secondary);">
-                            Zwraca podstawowy status serwera, wersję i sprawdza dostępność bazy danych.
-                        </p>
-                        <div class="endpoint-params">
-                            <strong style="display: block; margin-bottom: 6px; color: var(--text);">Parametry odpowiedzi:</strong>
-                            <div class="endpoint-param">
-                                <span class="param-name">success</span>
-                                <span class="param-type">boolean</span>
-                            </div>
-                            <div class="endpoint-param">
-                                <span class="param-name">status</span>
-                                <span class="param-type">string</span>
-                            </div>
-                            <div class="endpoint-param">
-                                <span class="param-name">version</span>
-                                <span class="param-type">string</span>
-                            </div>
-                            <div class="endpoint-param">
-                                <span class="param-name">server_time</span>
-                                <span class="param-type">ISO string</span>
-                            </div>
-                            <div class="endpoint-param">
-                                <span class="param-name">database_status</span>
-                                <span class="param-type">boolean</span>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <div class="endpoint-card">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-                            <span class="endpoint-method method-post">POST</span>
-                            <div class="endpoint-url">/api/auth</div>
-                        </div>
-                        <p style="margin-bottom: 12px; color: var(--text-secondary);">
-                            Endpoint do autoryzacji licencji. Wymaga przekazania klucza i opcjonalnie IP klienta.
-                        </p>
-                        <div class="endpoint-params">
-                            <strong style="display: block; margin-bottom: 6px; color: var(--text);">Parametry żądania:</strong>
-                            <div class="endpoint-param">
-                                <span class="param-name">key</span>
-                                <span class="param-type">string (required)</span>
-                            </div>
-                            <div class="endpoint-param">
-                                <span class="param-name">client_ip</span>
-                                <span class="param-type">string (optional)</span>
-                            </div>
-                            <strong style="display: block; margin-top: 12px; margin-bottom: 6px; color: var(--text);">Parametry odpowiedzi:</strong>
-                            <div class="endpoint-param">
-                                <span class="param-name">success</span>
-                                <span class="param-type">boolean</span>
-                            </div>
-                            <div class="endpoint-param">
-                                <span class="param-name">message</span>
-                                <span class="param-type">string</span>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <div class="endpoint-card">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-                            <span class="endpoint-method method-post">POST</span>
-                            <div class="endpoint-url">/api/license-info</div>
-                        </div>
-                        <p style="margin-bottom: 12px; color: var(--text-secondary);">
-                            Zwraca szczegółowe informacje o licencji: typ, data ważności, limity, użycie itp.
-                        </p>
-                        <div class="endpoint-params">
-                            <strong style="display: block; margin-bottom: 6px; color: var(--text);">Parametry żądania:</strong>
-                            <div class="endpoint-param">
-                                <span class="param-name">key</span>
-                                <span class="param-type">string (required)</span>
-                            </div>
-                            <div class="endpoint-param">
-                                <span class="param-name">client_ip</span>
-                                <span class="param-type">string (optional)</span>
-                            </div>
-                            <strong style="display: block; margin-top: 12px; margin-bottom: 6px; color: var(--text);">Parametry odpowiedzi:</strong>
-                            <div class="endpoint-param">
-                                <span class="param-name">success</span>
-                                <span class="param-type">boolean</span>
-                            </div>
-                            <div class="endpoint-param">
-                                <span class="param-name">info.license_type</span>
-                                <span class="param-type">string</span>
-                            </div>
-                            <div class="endpoint-param">
-                                <span class="param-name">info.expiration_date</span>
-                                <span class="param-type">string (YYYY-MM-DD)</span>
-                            </div>
-                            <div class="endpoint-param">
-                                <span class="param-name">info.daily_limit</span>
-                                <span class="param-type">integer</span>
-                            </div>
-                            <div class="endpoint-param">
-                                <span class="param-name">info.daily_used</span>
-                                <span class="param-type">integer</span>
-                            </div>
-                            <div class="endpoint-param">
-                                <span class="param-name">info.total_limit</span>
-                                <span class="param-type">integer</span>
-                            </div>
-                            <div class="endpoint-param">
-                                <span class="param-name">info.total_used</span>
-                                <span class="param-type">integer</span>
-                            </div>
-                            <div class="endpoint-param">
-                                <span class="param-name">info.ip_bound</span>
-                                <span class="param-type">string</span>
-                            </div>
-                            <div class="endpoint-param">
-                                <span class="param-name">info.last_search</span>
-                                <span class="param-type">string</span>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <div class="endpoint-card">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-                            <span class="endpoint-method method-post">POST</span>
-                            <div class="endpoint-url">/api/search</div>
-                        </div>
-                        <p style="margin-bottom: 12px; color: var(--text-secondary);">
-                            Endpoint do wyszukiwania danych wyciekowych. Wymaga klucza i zapytania.
-                        </p>
-                        <div class="endpoint-params">
-                            <strong style="display: block; margin-bottom: 6px; color: var(--text);">Parametry żądania:</strong>
-                            <div class="endpoint-param">
-                                <span class="param-name">key</span>
-                                <span class="param-type">string (required)</span>
-                            </div>
-                            <div class="endpoint-param">
-                                <span class="param-name">query</span>
-                                <span class="param-type">string (required)</span>
-                            </div>
-                            <div class="endpoint-param">
-                                <span class="param-name">client_ip</span>
-                                <span class="param-type">string (optional)</span>
-                            </div>
-                            <div class="endpoint-param">
-                                <span class="param-name">limit</span>
-                                <span class="param-type">integer (default: 150)</span>
-                            </div>
-                            <strong style="display: block; margin-top: 12px; margin-bottom: 6px; color: var(--text);">Parametry odpowiedzi:</strong>
-                            <div class="endpoint-param">
-                                <span class="param-name">success</span>
-                                <span class="param-type">boolean</span>
-                            </div>
-                            <div class="endpoint-param">
-                                <span class="param-name">results</span>
-                                <span class="param-type">array[object]</span>
-                            </div>
-                            <div class="endpoint-param">
-                                <span class="param-name">results[].data</span>
-                                <span class="param-type">string</span>
-                            </div>
-                            <div class="endpoint-param">
-                                <span class="param-name">results[].source</span>
-                                <span class="param-type">string</span>
-                            </div>
-                            <div class="endpoint-param">
-                                <span class="param-name">results[].timestamp</span>
-                                <span class="param-type">string</span>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <div class="section">
-                        <div class="section-title">
-                            <i class="fas fa-lightbulb"></i> Przykładowe zapytanie z klienta
-                        </div>
-                        <div style="background: rgba(0,0,0,0.3); border-radius: 12px; padding: 20px; font-family: 'JetBrains Mono', monospace; font-size: 0.95rem; overflow-x: auto;">
-                            <pre style="margin: 0; color: #6ee7b7;">
-// Autoryzacja licencji
-POST /api/auth
-Content-Type: application/json
-{
-    "key": "COLD-XXXXXXXXXXXX",
-    "client_ip": "123.123.123.123"
-}
-                            </pre>
-                        </div>
-                    </div>
-                    
-                    <div class="section">
-                        <div class="section-title">
-                            <i class="fas fa-exclamation-triangle"></i> Ograniczenia i kody błędów
-                        </div>
-                        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px;">
-                            <div style="background: rgba(15, 23, 42, 0.6); border-radius: 12px; padding: 15px; border: 1px solid var(--border);">
-                                <strong style="color: var(--danger); display: block; margin-bottom: 8px;">400 Bad Request</strong>
-                                <p style="color: var(--text-secondary); font-size: 0.95rem; line-height: 1.5;">
-                                    Brak klucza licencyjnego lub nieprawidłowe parametry żądania.
-                                </p>
-                            </div>
-                            <div style="background: rgba(15, 23, 42, 0.6); border-radius: 12px; padding: 15px; border: 1px solid var(--border);">
-                                <strong style="color: var(--danger); display: block; margin-bottom: 8px;">401 Unauthorized</strong>
-                                <p style="color: var(--text-secondary); font-size: 0.95rem; line-height: 1.5;">
-                                    Nieprawidłowy klucz licencyjny, licencja wygasła lub jest zablokowana.
-                                </p>
-                            </div>
-                            <div style="background: rgba(15, 23, 42, 0.6); border-radius: 12px; padding: 15px; border: 1px solid var(--border);">
-                                <strong style="color: var(--danger); display: block; margin-bottom: 8px;">403 Forbidden</strong>
-                                <p style="color: var(--text-secondary); font-size: 0.95rem; line-height: 1.5;">
-                                    Klucz przypisany do innego adresu IP niż podany w żądaniu.
-                                </p>
-                            </div>
-                            <div style="background: rgba(15, 23, 42, 0.6); border-radius: 12px; padding: 15px; border: 1px solid var(--border);">
-                                <strong style="color: var(--danger); display: block; margin-bottom: 8px;">429 Too Many Requests</strong>
-                                <p style="color: var(--text-secondary); font-size: 0.95rem; line-height: 1.5;">
-                                    Przekroczono dzienny lub całkowity limit wyszukiwań dla danej licencji.
-                                </p>
-                            </div>
-                        </div>
+                    <div class="form-group" style="flex: 1; align-self: flex-end;">
+                        <button type="submit" class="btn" style="width: 100%;">
+                            <i class="fas fa-cloud-download-alt"></i> Importuj dane
+                        </button>
                     </div>
                 </div>
-            </div>
-            
-            <div class="footer">
-                <p>❄️ Cold Search Premium Admin Panel &copy; {{ now.year }} | Wersja 3.1.2</p>
-                <p style="margin-top: 6px; font-size: 0.85rem; color: var(--text-secondary);">
-                    Panel jest chroniony hasłem i dostępny wyłącznie dla upoważnionych administratorów
+            </form>
+            <div style="margin-top: 15px; padding: 12px; background: rgba(15, 23, 42, 0.7); border-radius: 12px; border: 1px solid var(--border);">
+                <p style="margin: 0; color: var(--text-secondary); line-height: 1.6;">
+                    <strong><i class="fas fa-file-archive" style="margin-right: 8px; color: var(--warning);"></i>Wymagania:</strong>
+                    Archiwum ZIP powinno zawierać pliki tekstowe (.txt, .csv, .log) z danymi wyciekowymi.
+                    Każda linia w pliku powinna zawierać pojedynczy rekord (email, login, etc.).
                 </p>
             </div>
         </div>
+        
+        <!-- Ostatnie dane wyciekowe -->
+        <div class="section">
+            <div class="section-title">
+                <i class="fas fa-history"></i> Ostatnie dane wyciekowe
+            </div>
+            {% for leak in recent_leaks %}
+                <div class="leak-item">
+                    <div class="leak-data">{{ leak.data | truncate(70) }}</div>
+                    <small>
+                        <span class="ip-badge">{{ leak.source }}</span>
+                        <span style="color: var(--text-secondary); margin-left: 10px;">• {{ format_datetime(leak.created_at) }}</span>
+                    </small>
+                </div>
+            {% else %}
+                <div style="text-align: center; padding: 20px; color: var(--text-secondary);">
+                    Brak danych wyciekowych w bazie
+                </div>
+            {% endfor %}
+        </div>
+        
+        <!-- Informacje systemowe -->
+        <div class="section">
+            <div class="section-title">
+                <i class="fas fa-server"></i> Informacje systemowe
+            </div>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px;">
+                <div style="background: rgba(15, 23, 42, 0.6); border-radius: 12px; padding: 15px; border: 1px solid var(--border);">
+                    <h4 style="font-size: 1rem; font-weight: 600; margin-bottom: 12px; color: var(--text); display: flex; align-items: center; gap: 10px;">
+                        <i class="fas fa-clock" style="color: var(--primary);"></i> Sesja administratora
+                    </h4>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                        <div style="padding: 8px;">
+                            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Czas trwania</div>
+                            <div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ session_duration }}</div>
+                        </div>
+                        <div style="padding: 8px;">
+                            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Twój adres IP</div>
+                            <div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">
+                                <span class="ip-badge">{{ client_ip }}</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div style="background: rgba(15, 23, 42, 0.6); border-radius: 12px; padding: 15px; border: 1px solid var(--border);">
+                    <h4 style="font-size: 1rem; font-weight: 600; margin-bottom: 12px; color: var(--text); display: flex; align-items: center; gap: 10px;">
+                        <i class="fas fa-database" style="color: var(--primary);"></i> Baza danych leaków
+                    </h4>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                        <div style="padding: 8px;">
+                            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Status</div>
+                            <div style="font-weight: 600; font-size: 0.95rem; color: var(--success);">
+                                <i class="fas fa-circle" style="font-size: 0.6rem; margin-right: 6px;"></i> Online
+                            </div>
+                        </div>
+                        <div style="padding: 8px;">
+                            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Liczba rekordów</div>
+                            <div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ total_leaks_formatted }} rekordów</div>
+                        </div>
+                        <div style="padding: 8px; grid-column: span 2;">
+                            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Ostatnia aktualizacja</div>
+                            <div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ format_datetime(now) }}</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div style="background: rgba(15, 23, 42, 0.6); border-radius: 12px; padding: 15px; border: 1px solid var(--border);">
+                    <h4 style="font-size: 1rem; font-weight: 600; margin-bottom: 12px; color: var(--text); display: flex; align-items: center; gap: 10px;">
+                        <i class="fas fa-cloud" style="color: var(--primary);"></i> Supabase API
+                    </h4>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                        <div style="padding: 8px;">
+                            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Status</div>
+                            <div style="font-weight: 600; font-size: 0.95rem; color: var(--success);">
+                                <i class="fas fa-circle" style="font-size: 0.6rem; margin-right: 6px;"></i> Online
+                            </div>
+                        </div>
+                        <div style="padding: 8px;">
+                            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Aktywne licencje</div>
+                            <div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ active_licenses }}</div>
+                        </div>
+                        <div style="padding: 8px;">
+                            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Zbanowane IP</div>
+                            <div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ "{:,}".format(banned_ips|length).replace(",", " ") }}</div>
+                        </div>
+                        <div style="padding: 8px;">
+                            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Wszystkie wyszukiwania</div>
+                            <div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ "{:,}".format(total_searches).replace(",", " ") }}</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="footer">
+            <p>❄️ Cold Search Premium Admin Panel &copy; {{ now.year }} | Wersja 3.1.3</p>
+            <p style="margin-top: 6px; font-size: 0.85rem; color: var(--text-secondary);">
+                Panel jest chroniony hasłem i dostępny wyłącznie dla upoważnionych administratorów
+            </p>
+        </div>
     </div>
     
-    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
-    <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
-    <script src="https://cdn.datatables.net/1.13.6/js/dataTables.bootstrap5.min.js"></script>
     <script>
-        $(document).ready(function() {
-            $('table').DataTable({
-                "language": {
-                    "url": "//cdn.datatables.net/plug-ins/1.13.6/i18n/pl.json"
-                },
-                "pageLength": 10
-            });
-            
+        document.addEventListener('DOMContentLoaded', function() {
             // Formatowanie liczb
-            document.addEventListener('DOMContentLoaded', function() {
-                const statValues = document.querySelectorAll('.stat-value');
-                statValues.forEach(el => {
-                    const numStr = el.textContent.replace(/\\s/g, '').replace(/\s/g, '');
-                    const num = parseInt(numStr.replace(/[^0-9]/g, ''));
-                    if (!isNaN(num)) {
-                        el.textContent = num.toLocaleString('pl-PL');
-                    }
-                });
-            });
-            
-            // Automatyczne odświeżanie co 30 sekund (tylko dla dashboardu)
-            let autoRefresh = true;
-            setTimeout(function refreshData() {
-                if (autoRefresh && window.location.search.includes('tab=dashboard')) {
-                    location.reload();
+            const statValues = document.querySelectorAll('.stat-value');
+            statValues.forEach(el => {
+                const numStr = el.textContent.replace(/\\s/g, '').replace(/\s/g, '');
+                const num = parseInt(numStr.replace(/[^0-9]/g, ''));
+                if (!isNaN(num)) {
+                    el.textContent = num.toLocaleString('pl-PL');
                 }
-                setTimeout(refreshData, 30000);
-            }, 30000);
+            });
         });
     </script>
 </body>
@@ -2311,4 +1626,3 @@ if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10000))
     debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
     app.run(host='0.0.0.0', port=port, debug=debug_mode)
-
