@@ -384,15 +384,14 @@ def admin_panel():
             active_users_24h = 0
             try:
                 # Naprawione zapytania do Supabase - poprawna składnia dla count
-                logs = sb_query("search_logs", "select=count")  # Zamiast count(*)
+                logs = sb_query("search_logs", "select=count()")
                 if logs and logs[0] and 'count' in logs[0]:
                     total_searches = logs[0]['count']
                 
                 yesterday = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-                # Naprawione zapytanie - poprawna składnia dla zliczania unikalnych IP
-                active_users = sb_query("search_logs", f"timestamp=gte.{yesterday}&select=count_distinct_ip::int")  # Zamiast count(distinct ip)
-                if active_users and active_users[0] and 'count_distinct_ip' in active_users[0]:
-                    active_users_24h = active_users[0]['count_distinct_ip']
+                # Poprawione zapytanie do Supabase - pobieramy unikalne IP z ostatnich 24h
+                active_ips = sb_query("search_logs", f"timestamp=gte.{yesterday}&select=ip&group=ip")
+                active_users_24h = len(active_ips) if active_ips else 0
             except Exception as e:
                 logger.error(f"❌ Błąd pobierania statystyk: {e}")
             
@@ -593,7 +592,6 @@ def api_search():
             try:
                 with get_db() as conn:
                     cursor = conn.cursor(dictionary=True)
-                    # Dodano bardziej wydajne zapytanie
                     cursor.execute("""
                         SELECT data, source, created_at as timestamp
                         FROM leaks
