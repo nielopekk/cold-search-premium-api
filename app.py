@@ -27,7 +27,7 @@ DB_CONFIG = {
     "pool_reset_session": True
 }
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://wcshypmsurncfufbojvp.supabase.co").strip()
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Indjc2h5cG1zdXJuY2Z1ZmJvanZwIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2OTAzMjQ2OCwiZXhwIjoyMDg0NjA4NDY4fQ.Dqy9y1w7j1u8q5m7Y2lK9V0HfZ1x8N5j9mF6Y9v2Y7I").strip()
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "sb_secret_Ci0yyib3FCJW3GMivhX3XA_D2vHmhpP").strip()
 SUPABASE_HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -38,7 +38,7 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "wyciek12")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "cold_search_ultra_2026_fixed_secret_random_key_here")
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "cold_search_ultra_secure_2026")
 
 # === AUTOMATYCZNA INICJALIZACJA TABEL ===
 def initialize_tables():
@@ -48,41 +48,25 @@ def initialize_tables():
         conn = mysql.connector.connect(**DB_CONFIG)
         cursor = conn.cursor()
         
-        # Tabela search_logs - naprawiony błąd składni SQL (słowo kluczowe key było zastrzeżone)
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS search_logs (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            query VARCHAR(255) NOT NULL,
-            ip VARCHAR(45) NOT NULL,
-            `key` VARCHAR(50) NOT NULL,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            INDEX idx_ip (ip),
-            INDEX idx_key (`key`),
-            INDEX idx_timestamp (timestamp),
-            INDEX idx_query (query),
-            INDEX idx_key_timestamp (`key`, timestamp)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-        """)
-        
-        # Tabela leaks z unikalnym kluczem
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS leaks (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            data VARCHAR(1000) NOT NULL,
-            source VARCHAR(255) NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            UNIQUE KEY unique_data_source (data(255), source),
-            FULLTEXT INDEX ft_data (data),
-            INDEX idx_source (source),
-            INDEX idx_created_at (created_at)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-        """)
-        
-        # Dodanie przykładowych danych jeśli tabela jest pusta
-        cursor.execute("SELECT COUNT(*) as count FROM leaks")
-        result = cursor.fetchone()
-        if result and result[0] == 0:
+        # Sprawdź czy tabela leaks istnieje
+        cursor.execute("SHOW TABLES LIKE 'leaks'")
+        if not cursor.fetchone():
+            # Tabela leaks z poprawną strukturą
+            cursor.execute("""
+            CREATE TABLE leaks (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                data VARCHAR(1000) NOT NULL,
+                source VARCHAR(255) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY unique_data_source (data(255), source),
+                FULLTEXT INDEX ft_data (data),
+                INDEX idx_source (source),
+                INDEX idx_created_at (created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """)
+            
+            # Dodanie przykładowych danych
             cursor.execute("""
             INSERT INTO leaks (data, source) VALUES
             ('test@example.com', 'test_data'),
@@ -90,7 +74,27 @@ def initialize_tables():
             ('user_2024', 'test_data')
             ON DUPLICATE KEY UPDATE updated_at = CURRENT_TIMESTAMP
             """)
-            logger.info("✅ Dodano przykładowe dane do tabeli 'leaks'")
+            logger.info("✅ Tabela 'leaks' została utworzona i wypełniona przykładowymi danymi")
+        
+        # Sprawdź czy tabela search_logs istnieje
+        cursor.execute("SHOW TABLES LIKE 'search_logs'")
+        if not cursor.fetchone():
+            # Tabela search_logs - naprawiony błąd składni SQL (słowo kluczowe key)
+            cursor.execute("""
+            CREATE TABLE search_logs (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                query VARCHAR(255) NOT NULL,
+                ip VARCHAR(45) NOT NULL,
+                `key` VARCHAR(50) NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_ip (ip),
+                INDEX idx_key (`key`),
+                INDEX idx_timestamp (timestamp),
+                INDEX idx_query (query),
+                INDEX idx_key_timestamp (`key`, timestamp)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """)
+            logger.info("✅ Tabela 'search_logs' została utworzona")
         
         conn.commit()
         logger.info("✅ Tabele w MariaDB zostały pomyślnie zainicjalizowane")
@@ -98,17 +102,7 @@ def initialize_tables():
         conn.close()
     except Exception as e:
         logger.error(f"❌ Błąd podczas inicjalizacji tabel w MariaDB: {e}")
-    
-    # Inicjalizacja tabel w Supabase
-    try:
-        # Sprawdzenie czy tabela licenses istnieje
-        r = requests.get(f"{SUPABASE_URL}/rest/v1/licenses?limit=1", headers=SUPABASE_HEADERS, timeout=10)
-        if r.status_code == 404:
-            logger.info("🔧 Tworzenie tabel w Supabase...")
-            # Tabele są tworzone przez skrypt SQL powyżej
-            logger.info("✅ Tabele w Supabase wymagają ręcznej inicjalizacji przez SQL Editor")
-    except Exception as e:
-        logger.error(f"❌ Błąd podczas inicjalizacji tabel w Supabase: {e}")
+        raise
 
 # === POOL POŁĄCZEŃ MARIADB ===
 db_pool = None
@@ -131,7 +125,7 @@ def initialize_db_pool():
             if attempt < max_attempts:
                 time.sleep(2 * attempt)
     logger.error("❌ Krytyczny błąd: nie udało się połączyć z MariaDB po wielu próbach")
-    raise SystemExit("Nie można kontynuować bez połączenia z bazą danych leaków")
+    raise SystemExit("Nie można kontynuować bez połączenia z bazą danych")
 
 @contextlib.contextmanager
 def get_db():
@@ -257,7 +251,7 @@ def import_worker(url):
 # === GŁÓWNY ENDPOINT: / (panel admina) ===
 @app.route("/", methods=["GET", "POST"])
 def admin_panel():
-    """Główny panel administracyjny"""
+    """Główny panel administracyjny - cała aplikacja w jednej stronie"""
     if request.method == "POST" and not session.get('is_admin'):
         if request.form.get("password") == ADMIN_PASSWORD:
             session['is_admin'] = True
@@ -784,22 +778,21 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
     <title>Cold Search Premium — Panel Admina</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
             --primary: #6366f1;
             --primary-dark: #4f46e5;
             --secondary: #8b5cf6;
             --secondary-dark: #7c3aed;
-            --bg: #0f172a;
-            --card-bg: #1e293b;
-            --border: #334155;
-            --text: #f1f5f9;
-            --text-secondary: #94a3b8;
-            --success: #10b981;
-            --danger: #ef4444;
-            --warning: #f59e0b;
-            --info: #3b82f6;
+            --bg: #0F0F18;
+            --card-bg: #151522;
+            --border: #2d2d44;
+            --text: #FFFFFF;
+            --text-secondary: #A9A9C6;
+            --success: #00CC99;
+            --danger: #FF416C;
+            --warning: #FFD369;
+            --info: #3B82F6;
             --gradient-start: #8b5cf6;
             --gradient-end: #ec4899;
         }
@@ -827,101 +820,133 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
         .logo {
             display: flex;
             align-items: center;
-            gap: 12px;
+            gap: 15px;
+        }
+        .logo-icon {
+            font-size: 2.2rem;
+            background: linear-gradient(90deg, var(--gradient-start), var(--gradient-end));
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
         }
         .logo-text {
             font-size: 1.8rem;
             font-weight: 800;
             background: linear-gradient(90deg, var(--gradient-start), var(--gradient-end));
             -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
             background-clip: text;
+            -webkit-text-fill-color: transparent;
         }
         .logout-btn {
-            background: rgba(239, 68, 68, 0.15);
+            background: rgba(255, 65, 108, 0.15);
             color: var(--danger);
             border: 1px solid var(--danger);
-            padding: 8px 16px;
-            border-radius: 10px;
+            padding: 10px 20px;
+            border-radius: 12px;
             text-decoration: none;
             font-weight: 600;
             display: inline-flex;
             align-items: center;
             gap: 8px;
             transition: all 0.2s;
+            font-size: 0.95rem;
         }
         .logout-btn:hover {
-            background: rgba(239, 68, 68, 0.25);
+            background: rgba(255, 65, 108, 0.25);
             transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(255, 65, 108, 0.2);
         }
         .stats-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
+            gap: 25px;
+            margin-bottom: 40px;
         }
         .stat-card {
             background: var(--card-bg);
-            border-radius: 16px;
-            padding: 20px;
+            border-radius: 20px;
+            padding: 25px;
             border: 1px solid var(--border);
             text-align: center;
             transition: all 0.3s ease;
+            box-shadow: 0 6px 15px rgba(0, 0, 0, 0.15);
+            position: relative;
+            overflow: hidden;
+        }
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: linear-gradient(45deg, transparent, rgba(99, 102, 241, 0.1), transparent);
+            transform: rotate(45deg);
+            transition: all 0.8s;
+        }
+        .stat-card:hover::before {
+            transform: rotate(45deg) translateX(100%);
         }
         .stat-card:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2);
+            transform: translateY(-8px);
+            box-shadow: 0 12px 25px rgba(0, 0, 0, 0.25);
             border-color: rgba(99, 102, 241, 0.5);
         }
-        .stat-card:nth-child(1) { background: linear-gradient(135deg, #6366f1, #8b5cf6); }
-        .stat-card:nth-child(2) { background: linear-gradient(135deg, #10b981, #0ea5e9); }
-        .stat-card:nth-child(3) { background: linear-gradient(135deg, #f59e0b, #ef4444); }
-        .stat-card:nth-child(4) { background: linear-gradient(135deg, #3b82f6, #8b5cf6); }
         .stat-icon {
-            font-size: 2rem;
-            margin-bottom: 10px;
-            opacity: 0.9;
+            font-size: 2.8rem;
+            margin-bottom: 15px;
+            background: linear-gradient(90deg, var(--gradient-start), var(--gradient-end));
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
         }
         .stat-value {
-            font-size: 1.8rem;
+            font-size: 2.2rem;
             font-weight: 800;
-            color: white;
+            margin: 10px 0;
+            background: linear-gradient(90deg, #FFFFFF, #A9A9C6);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
             font-family: 'JetBrains Mono', monospace;
-            margin: 8px 0;
-            text-shadow: 0 2px 4px rgba(0,0,0,0.2);
         }
         .stat-label {
-            font-size: 0.9rem;
-            color: rgba(255,255,255,0.9);
+            font-size: 1.1rem;
+            color: var(--text-secondary);
             font-weight: 500;
         }
         .section {
             background: var(--card-bg);
-            border-radius: 16px;
-            padding: 25px;
-            margin-bottom: 25px;
+            border-radius: 20px;
+            padding: 30px;
+            margin-bottom: 30px;
             border: 1px solid var(--border);
             transition: all 0.3s ease;
+            box-shadow: 0 6px 15px rgba(0, 0, 0, 0.1);
         }
         .section-title {
             display: flex;
             align-items: center;
-            gap: 12px;
-            margin-bottom: 20px;
-            font-size: 1.4rem;
+            gap: 15px;
+            margin-bottom: 25px;
+            font-size: 1.6rem;
             font-weight: 700;
-            color: white;
-            padding-bottom: 10px;
+            color: var(--text);
+            padding-bottom: 12px;
             border-bottom: 2px solid rgba(99, 102, 241, 0.3);
         }
         .section-title i {
             color: var(--primary);
-            font-size: 1.3rem;
+            font-size: 1.5rem;
+            background: linear-gradient(90deg, var(--gradient-start), var(--gradient-end));
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
         }
         .form-row {
             display: flex;
-            gap: 20px;
-            margin-bottom: 20px;
+            gap: 25px;
+            margin-bottom: 25px;
             flex-wrap: wrap;
             align-items: flex-end;
         }
@@ -931,61 +956,62 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
         }
         .form-label {
             display: block;
-            margin-bottom: 8px;
-            font-size: 0.95rem;
+            margin-bottom: 10px;
+            font-size: 1rem;
             color: var(--text);
             font-weight: 500;
         }
         .form-input, .form-select {
             width: 100%;
-            padding: 12px;
-            background: rgba(15, 23, 42, 0.7);
+            padding: 14px;
+            background: rgba(21, 21, 34, 0.7);
             border: 1px solid var(--border);
-            border-radius: 10px;
+            border-radius: 14px;
             color: white;
             font-family: 'Inter', sans-serif;
-            font-size: 0.95rem;
+            font-size: 1rem;
             transition: all 0.3s;
         }
         .form-input:focus, .form-select:focus {
             outline: none;
             border-color: var(--primary);
-            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.3);
         }
         .btn {
-            padding: 12px 24px;
-            background: linear-gradient(90deg, #6366f1, #8b5cf6);
+            padding: 14px 28px;
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
             color: white;
             border: none;
-            border-radius: 10px;
+            border-radius: 14px;
             font-weight: 600;
             cursor: pointer;
-            font-size: 0.95rem;
+            font-size: 1rem;
             transition: all 0.2s;
             display: inline-flex;
             align-items: center;
-            gap: 8px;
-            box-shadow: 0 3px 5px rgba(0, 0, 0, 0.2);
+            gap: 10px;
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
             font-family: 'Inter', sans-serif;
         }
         .btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 10px rgba(99, 102, 241, 0.3);
+            transform: translateY(-3px);
+            box-shadow: 0 6px 16px rgba(99, 102, 241, 0.4);
         }
         .btn:active {
             transform: translateY(0);
         }
         .btn-danger {
-            background: linear-gradient(90deg, #ef4444, #f97316);
+            background: linear-gradient(90deg, var(--danger), #f97316);
         }
         .btn-danger:hover {
-            box-shadow: 0 5px 10px rgba(239, 68, 68, 0.3);
+            box-shadow: 0 6px 16px rgba(255, 65, 108, 0.4);
         }
         .table-container {
             overflow-x: auto;
             margin-top: 15px;
-            border-radius: 12px;
+            border-radius: 16px;
             border: 1px solid var(--border);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
         }
         .table {
             width: 100%;
@@ -993,81 +1019,87 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
             min-width: 800px;
         }
         .table th, .table td {
-            padding: 12px 15px;
+            padding: 16px 20px;
             text-align: left;
             border-bottom: 1px solid var(--border);
         }
         .table th {
             font-weight: 700;
-            background: rgba(0,0,0,0.2);
+            background: rgba(21, 21, 34, 0.8);
             color: var(--text);
-            font-size: 0.95rem;
+            font-size: 1rem;
             white-space: nowrap;
         }
         .table td {
-            font-size: 0.95rem;
+            font-size: 0.98rem;
             color: var(--text);
+            transition: background-color 0.2s;
         }
         .table tr:last-child td { border-bottom: none; }
         .table tr:hover {
-            background: rgba(99, 102, 241, 0.08);
+            background: rgba(99, 102, 241, 0.1);
         }
         .key {
             font-family: 'JetBrains Mono', monospace;
             color: var(--primary);
             font-weight: 600;
             letter-spacing: 0.5px;
-            font-size: 0.9rem;
+            font-size: 1rem;
         }
         .status-active {
             color: var(--success);
             font-weight: 600;
             display: inline-flex;
             align-items: center;
-            gap: 6px;
+            gap: 8px;
+            font-size: 0.95rem;
         }
         .status-active::before {
             content: '';
             display: inline-block;
-            width: 8px;
-            height: 8px;
+            width: 10px;
+            height: 10px;
             background: var(--success);
             border-radius: 50%;
+            box-shadow: 0 0 5px rgba(0, 204, 153, 0.5);
         }
         .status-inactive {
             color: var(--danger);
             font-weight: 600;
             display: inline-flex;
             align-items: center;
-            gap: 6px;
+            gap: 8px;
+            font-size: 0.95rem;
         }
         .status-inactive::before {
             content: '';
             display: inline-block;
-            width: 8px;
-            height: 8px;
+            width: 10px;
+            height: 10px;
             background: var(--danger);
             border-radius: 50%;
+            box-shadow: 0 0 5px rgba(255, 65, 108, 0.5);
         }
         .alert {
-            padding: 16px;
-            margin-bottom: 20px;
-            border-radius: 12px;
+            padding: 18px;
+            margin-bottom: 25px;
+            border-radius: 16px;
             font-weight: 500;
             display: flex;
             align-items: center;
-            gap: 12px;
+            gap: 15px;
             border-left: 4px solid;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
         }
         .alert-info {
             background: rgba(59, 130, 246, 0.15);
             border-left-color: var(--info);
-            color: #bfdbfe;
+            color: #c3dcff;
         }
         .alert-error {
             background: rgba(239, 68, 68, 0.15);
             border-left-color: var(--danger);
-            color: #fecaca;
+            color: #ffcbd1;
         }
         .alert-success {
             background: rgba(16, 185, 129, 0.15);
@@ -1075,116 +1107,87 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
             color: #bbf7d0;
         }
         .leak-item {
-            padding: 12px 0;
-            border-bottom: 1px dashed var(--border);
+            padding: 18px 0;
+            border-bottom: 1px solid var(--border);
+            transition: all 0.2s;
         }
         .leak-item:last-child { border-bottom: none; }
+        .leak-item:hover {
+            background: rgba(99, 102, 241, 0.08);
+            transform: translateX(5px);
+        }
         .leak-data {
             font-family: 'JetBrains Mono', monospace;
-            font-size: 0.95rem;
+            font-size: 1.05rem;
             word-break: break-all;
             color: var(--text);
+            font-weight: 500;
+            margin-bottom: 8px;
         }
         .ip-badge {
             display: inline-block;
-            background: rgba(139, 92, 246, 0.2);
-            border: 1px solid rgba(139, 92, 246, 0.4);
-            padding: 4px 10px;
-            border-radius: 20px;
-            font-size: 0.85rem;
+            background: rgba(139, 92, 246, 0.25);
+            border: 1px solid rgba(139, 92, 246, 0.5);
+            padding: 6px 14px;
+            border-radius: 24px;
+            font-size: 0.9rem;
             font-family: 'JetBrains Mono', monospace;
-        }
-        .limit-badge {
-            display: inline-block;
-            padding: 4px 12px;
-            border-radius: 20px;
-            font-size: 0.85rem;
-            font-weight: 600;
-            margin-right: 8px;
-            margin-bottom: 4px;
-        }
-        .limit-daily {
-            background: rgba(245, 158, 11, 0.2);
-            color: #fcd34d;
-            border: 1px solid rgba(245, 158, 11, 0.3);
-        }
-        .limit-total {
-            background: rgba(239, 68, 68, 0.2);
-            color: #fca5a5;
-            border: 1px solid rgba(239, 68, 68, 0.3);
-        }
-        .usage-bar {
-            height: 8px;
-            background: rgba(56, 189, 248, 0.1);
-            border-radius: 4px;
-            margin-top: 6px;
-            overflow: hidden;
-        }
-        .usage-fill {
-            height: 100%;
-            border-radius: 4px;
-        }
-        .usage-low { background: var(--success); }
-        .usage-medium { background: var(--warning); }
-        .usage-high { background: var(--danger); }
-        .usage-critical {
-            background: var(--danger);
-            animation: pulse 1.5s infinite;
-        }
-        @keyframes pulse {
-            0% { opacity: 1; }
-            50% { opacity: 0.7; }
-            100% { opacity: 1; }
-        }
-        .usage-text {
-            font-size: 0.85rem;
-            color: var(--text-secondary);
-            margin-top: 4px;
             font-weight: 500;
+            transition: all 0.2s;
         }
-        .chart-container {
-            height: 200px;
-            margin-top: 20px;
-            position: relative;
+        .ip-badge:hover {
+            background: rgba(139, 92, 246, 0.35);
+            transform: scale(1.05);
         }
         .source-bar {
-            height: 8px;
+            height: 10px;
             background: rgba(56, 189, 248, 0.1);
-            border-radius: 4px;
-            margin-top: 4px;
+            border-radius: 6px;
+            margin-top: 10px;
             overflow: hidden;
         }
         .source-fill {
             height: 100%;
-            border-radius: 4px;
-            background: var(--primary);
+            border-radius: 6px;
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
+            transition: width 0.5s ease;
         }
         .license-type {
             display: inline-block;
-            padding: 2px 8px;
-            border-radius: 4px;
-            font-size: 0.8rem;
+            padding: 5px 14px;
+            border-radius: 24px;
+            font-size: 0.9rem;
             font-weight: 600;
+            margin-right: 10px;
+            margin-bottom: 8px;
+            transition: all 0.2s;
         }
         .type-standard {
-            background: rgba(59, 130, 246, 0.2);
+            background: rgba(59, 130, 246, 0.25);
             color: #93c5fd;
+            border: 1px solid rgba(59, 130, 246, 0.4);
         }
         .type-premium {
-            background: rgba(168, 85, 247, 0.2);
+            background: rgba(168, 85, 247, 0.25);
             color: #c4b5fd;
+            border: 1px solid rgba(168, 85, 247, 0.4);
         }
         .type-enterprise {
-            background: rgba(239, 68, 68, 0.2);
+            background: rgba(239, 68, 68, 0.25);
             color: #fca5a5;
+            border: 1px solid rgba(239, 68, 68, 0.4);
+        }
+        .action-buttons {
+            display: flex;
+            gap: 12px;
         }
         .footer {
             text-align: center;
-            margin-top: 30px;
-            padding-top: 20px;
+            margin-top: 40px;
+            padding-top: 25px;
             border-top: 1px solid var(--border);
             color: var(--text-secondary);
-            font-size: 0.9rem;
+            font-size: 1rem;
             padding-bottom: 20px;
         }
         @media (max-width: 768px) {
@@ -1195,8 +1198,48 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
                 grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
             }
             .section {
-                padding: 15px;
+                padding: 20px;
             }
+            .section-title {
+                font-size: 1.4rem;
+            }
+        }
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        .section-actions {
+            display: flex;
+            gap: 15px;
+        }
+        .back-to-top {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
+            color: white;
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2rem;
+            cursor: pointer;
+            box-shadow: 0 4px 15px rgba(99, 102, 241, 0.4);
+            opacity: 0;
+            transition: all 0.3s ease;
+            z-index: 1000;
+        }
+        .back-to-top.visible {
+            opacity: 1;
+            transform: translateY(0);
+        }
+        .back-to-top:hover {
+            transform: translateY(-3px) scale(1.1);
+            box-shadow: 0 6px 20px rgba(99, 102, 241, 0.6);
         }
     </style>
 </head>
@@ -1204,11 +1247,11 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
     <div class="container">
         <div class="header">
             <div class="logo">
-                <i class="fas fa-snowflake" style="font-size: 1.8rem; color: var(--primary);"></i>
-                <div class="logo-text">COLD SEARCH ADMIN</div>
+                <i class="fas fa-snowflake logo-icon"></i>
+                <div class="logo-text">COLD SEARCH PREMIUM</div>
             </div>
             <a href="{{ url_for('admin_logout') }}" class="logout-btn">
-                <i class="fas fa-sign-out-alt"></i> Wyloguj
+                <i class="fas fa-sign-out-alt"></i> Wyloguj się
             </a>
         </div>
         
@@ -1216,21 +1259,25 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
             {% for cat, msg in messages %}
                 <div class="alert alert-{{ 'success' if cat == 'success' else 'error' if cat == 'error' else 'info' }}">
                     {% if cat == 'success' %}
-                        <i class="fas fa-check-circle" style="color: var(--success); font-size: 1.2rem;"></i>
+                        <i class="fas fa-check-circle" style="font-size: 1.5rem; color: var(--success);"></i>
                     {% elif cat == 'error' %}
-                        <i class="fas fa-exclamation-triangle" style="color: var(--danger); font-size: 1.2rem;"></i>
+                        <i class="fas fa-exclamation-triangle" style="font-size: 1.5rem; color: var(--danger);"></i>
                     {% else %}
-                        <i class="fas fa-info-circle" style="color: var(--info); font-size: 1.2rem;"></i>
+                        <i class="fas fa-info-circle" style="font-size: 1.5rem; color: var(--info);"></i>
                     {% endif %}
                     <div style="flex: 1;">
-                        <strong style="display: block; margin-bottom: 4px;">{% if cat == 'success' %}Sukces{% elif cat == 'error' %}Błąd{% else %}Informacja{% endif %}</strong>
-                        <span>{{ msg }}</span>
+                        <strong style="display: block; margin-bottom: 6px; font-size: 1.1rem;">
+                            {% if cat == 'success' %}Sukces{% elif cat == 'error' %}Błąd{% else %}Informacja{% endif %}
+                        </strong>
+                        <span style="font-size: 0.95rem;">{{ msg }}</span>
                     </div>
                 </div>
             {% endfor %}
         {% endwith %}
         
-        <!-- Statystyki -->
+        <div id="top"></div>
+        
+        <!-- Statystyki na górze strony -->
         <div class="stats-grid">
             <div class="stat-card">
                 <div class="stat-icon">
@@ -1261,36 +1308,135 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
                 <div class="stat-label">Aktywni użytkownicy (24h)</div>
             </div>
         </div>
-        
+
         <!-- Najczęstsze źródła -->
-        <div class="section">
+        <div class="section" id="sources-section">
             <div class="section-title">
                 <i class="fas fa-layer-group"></i> Najczęstsze źródła danych
             </div>
             {% for source in top_sources %}
-                <div style="margin-bottom: 15px;">
-                    <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
-                        <span style="font-weight: 500;">{{ source.source }}</span>
-                        <span style="color: var(--text-secondary);">{{ source.count }}</span>
+                <div style="margin-bottom: 20px;">
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                        <span style="font-weight: 600; font-size: 1.1rem;">{{ source.source }}</span>
+                        <span style="color: var(--text-secondary); font-size: 1.05rem;">{{ source.count }}</span>
                     </div>
                     <div class="source-bar">
                         <div class="source-fill" style="width: {{ (source.count / (total_leaks or 1) * 100) | int }}%;"></div>
                     </div>
                 </div>
             {% else %}
-                <div style="text-align: center; padding: 20px; color: var(--text-secondary);">
-                    Brak źródeł danych w bazie
+                <div style="text-align: center; padding: 30px; color: var(--text-secondary);">
+                    <i class="fas fa-database" style="font-size: 3rem; margin-bottom: 15px; opacity: 0.5;"></i>
+                    <div style="font-size: 1.2rem; margin-bottom: 10px;">Brak źródeł danych w bazie</div>
+                    <div style="font-size: 1rem;">Uruchom import danych, aby zobaczyć statystyki</div>
                 </div>
             {% endfor %}
         </div>
         
         <!-- Zarządzanie licencjami -->
-        <div class="section">
+        <div class="section" id="licenses-section">
             <div class="section-title">
-                <i class="fas fa-key"></i> Zarządzanie licencjami ({{ licenses|length }})
+                <i class="fas fa-key"></i> Zarządzanie licencjami
             </div>
             
-            <form method="post" style="margin-bottom:25px;">
+            <div class="section-header">
+                <div>
+                    <h3 style="font-size: 1.2rem; color: var(--text-secondary); margin-bottom: 5px;">Ilość: {{ licenses|length }}</h3>
+                </div>
+                <div class="section-actions">
+                    <button class="btn" onclick="document.getElementById('generate-license-form').scrollIntoView({behavior: 'smooth'})">
+                        <i class="fas fa-plus"></i> Generuj licencję
+                    </button>
+                </div>
+            </div>
+            
+            <div class="table-container">
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th>Klucz dostępu</th>
+                            <th>Ważność</th>
+                            <th>IP</th>
+                            <th>Typ</th>
+                            <th>Limit</th>
+                            <th>Status</th>
+                            <th>Data utworzenia</th>
+                            <th>Akcje</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for lic in licenses %}
+                        <tr>
+                            <td>
+                                <span class="key">{{ lic.key }}</span>
+                                <div style="font-size: 0.92rem; color: var(--text-secondary); margin-top: 6px;">
+                                    {% if lic.ip and lic.ip.strip() != "" %}
+                                    <i class="fas fa-lock" style="margin-right: 6px;"></i>Przypisany do: {{ lic.ip }}
+                                    {% else %}
+                                    <i class="fas fa-unlock" style="margin-right: 6px; color: var(--warning);"></i>Bez ograniczeń IP
+                                    {% endif %}
+                                </div>
+                            </td>
+                            <td>{{ lic.expiry.split('T')[0] }}</td>
+                            <td>
+                                {% if lic.ip and lic.ip.strip() != "" %}
+                                <span class="ip-badge">{{ lic.ip }}</span>
+                                {% else %}
+                                <span style="color: var(--warning); font-weight: 500;">Brak ograniczeń</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                <span class="license-type type-{{ lic.license_type.lower() if lic.license_type else 'standard' }}">
+                                    {{ lic.license_type.capitalize() if lic.license_type else 'Standard' }}
+                                </span>
+                            </td>
+                            <td>{{ lic.daily_limit }}/{{ lic.total_limit }}</td>
+                            <td>
+                                <span class="{{ 'status-active' if lic.active else 'status-inactive' }}">
+                                    {{ 'Aktywna' if lic.active else 'Nieaktywna' }}
+                                </span>
+                            </td>
+                            <td>{{ format_datetime(lic.created_at) if lic.created_at else '—' }}</td>
+                            <td>
+                                <div class="action-buttons">
+                                    <form method="post" style="display:inline;" onsubmit="return confirm('Na pewno chcesz {{ '' if lic.active else 'w' }}yłączyć tę licencję?')">
+                                        <input type="hidden" name="action" value="toggle_license">
+                                        <input type="hidden" name="key" value="{{ lic.key }}">
+                                        <button type="submit" class="btn {% if lic.active %}btn-danger{% else %}btn{% endif %}" style="padding: 6px 12px; font-size: 0.9rem;">
+                                            {% if lic.active %}<i class="fas fa-power-off"></i> Wyłącz{% else %}<i class="fas fa-power-off"></i> Włącz{% endif %}
+                                        </button>
+                                    </form>
+                                    <form method="post" style="display:inline;" onsubmit="return confirm('Na pewno usunąć tę licencję?')">
+                                        <input type="hidden" name="action" value="del_license">
+                                        <input type="hidden" name="key" value="{{ lic.key }}">
+                                        <button type="submit" class="btn btn-danger" style="padding: 6px 12px; font-size: 0.9rem;">
+                                            <i class="fas fa-trash"></i> Usuń
+                                        </button>
+                                    </form>
+                                </div>
+                            </td>
+                        </tr>
+                        {% else %}
+                        <tr>
+                            <td colspan="8" style="text-align: center; padding: 40px; color: var(--text-secondary);">
+                                <i class="fas fa-key" style="font-size: 3rem; margin-bottom: 15px; opacity: 0.5;"></i>
+                                <div style="font-size: 1.3rem; margin-bottom: 12px;">Brak licencji w systemie</div>
+                                <div style="font-size: 1.05rem;">Wygeneruj pierwszą licencję za pomocą formularza poniżej</div>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        
+        <!-- Formularz generowania licencji -->
+        <div class="section" id="generate-license-form">
+            <div class="section-title">
+                <i class="fas fa-magic"></i> Generuj nową licencję
+            </div>
+            
+            <form method="post">
                 <input type="hidden" name="action" value="add_license">
                 <div class="form-row">
                     <div class="form-group">
@@ -1315,115 +1461,29 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
                     </div>
                     <div class="form-group" style="align-self: flex-end;">
                         <button type="submit" class="btn">
-                            <i class="fas fa-plus"></i> Generuj licencję
+                            <i class="fas fa-plus-circle"></i> Generuj licencję
                         </button>
                     </div>
                 </div>
             </form>
-            
-            <div class="table-container">
-                <table class="table">
-                    <thead>
-                        <tr>
-                            <th>Klucz dostępu</th>
-                            <th>Ważność</th>
-                            <th>IP</th>
-                            <th>Typ</th>
-                            <th>Limit dzienny</th>
-                            <th>Status</th>
-                            <th>Data utworzenia</th>
-                            <th>Akcje</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for lic in licenses %}
-                        <tr>
-                            <td>
-                                <span class="key">{{ lic.key }}</span>
-                                <div style="font-size: 0.8rem; color: var(--text-secondary); margin-top: 4px;">
-                                    {% if lic.ip and lic.ip.strip() != "" %}
-                                    <i class="fas fa-lock" style="margin-right: 4px;"></i>Przypisany do: {{ lic.ip }}
-                                    {% else %}
-                                    <i class="fas fa-unlock" style="margin-right: 4px; color: var(--warning);"></i>Bez ograniczeń IP
-                                    {% endif %}
-                                </div>
-                            </td>
-                            <td>{{ lic.expiry.split('T')[0] }}</td>
-                            <td>
-                                {% if lic.ip and lic.ip.strip() != "" %}
-                                <span class="ip-badge">{{ lic.ip }}</span>
-                                {% else %}
-                                <span style="color: var(--warning);">Brak ograniczeń</span>
-                                {% endif %}
-                            </td>
-                            <td>
-                                <span class="license-type type-{{ lic.license_type.lower() if lic.license_type else 'standard' }}">
-                                    {{ lic.license_type.capitalize() if lic.license_type else 'Standard' }}
-                                </span>
-                            </td>
-                            <td>{{ lic.daily_limit }}/{{ lic.total_limit }}</td>
-                            <td>
-                                <span class="{{ 'status-active' if lic.active else 'status-inactive' }}">
-                                    {{ 'Aktywna' if lic.active else 'Nieaktywna' }}
-                                </span>
-                            </td>
-                            <td>{{ format_datetime(lic.created_at) if lic.created_at else '—' }}</td>
-                            <td>
-                                <div style="display: flex; gap: 8px;">
-                                    <form method="post" style="display:inline;" onsubmit="return confirm('Na pewno chcesz {{ '' if lic.active else 'w' }}yłączyć tę licencję?')">
-                                        <input type="hidden" name="action" value="toggle_license">
-                                        <input type="hidden" name="key" value="{{ lic.key }}">
-                                        <button type="submit" class="btn {% if lic.active %}btn-danger{% else %}btn{% endif %}" style="padding: 6px 12px; font-size: 0.85rem;">
-                                            {% if lic.active %}<i class="fas fa-power-off"></i> Wyłącz{% else %}<i class="fas fa-power-off"></i> Włącz{% endif %}
-                                        </button>
-                                    </form>
-                                    <form method="post" style="display:inline;" onsubmit="return confirm('Na pewno usunąć tę licencję?')">
-                                        <input type="hidden" name="action" value="del_license">
-                                        <input type="hidden" name="key" value="{{ lic.key }}">
-                                        <button type="submit" class="btn btn-danger" style="padding: 6px 12px; font-size: 0.85rem;">
-                                            <i class="fas fa-trash"></i> Usuń
-                                        </button>
-                                    </form>
-                                </div>
-                            </td>
-                        </tr>
-                        {% else %}
-                        <tr>
-                            <td colspan="8" style="text-align: center; padding: 30px; color: var(--text-secondary);">
-                                <i class="fas fa-database" style="font-size: 2rem; margin-bottom: 10px; opacity: 0.5;"></i>
-                                <div>Brak licencji w systemie</div>
-                                <div style="font-size: 0.9rem; margin-top: 8px;">Wygeneruj pierwszą licencję za pomocą formularza powyżej</div>
-                            </td>
-                        </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-            </div>
         </div>
         
         <!-- Zbanowane adresy IP -->
-        <div class="section">
+        <div class="section" id="bans-section">
             <div class="section-title">
-                <i class="fas fa-ban"></i> Zbanowane adresy IP ({{ banned_ips|length }})
+                <i class="fas fa-ban"></i> Zbanowane adresy IP
             </div>
-            <form method="post" style="margin-bottom:25px;">
-                <input type="hidden" name="action" value="add_ban">
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>Adres IP do zbanowania</label>
-                        <input type="text" name="ip" placeholder="np. 192.168.1.1" class="form-input" required>
-                    </div>
-                    <div class="form-group">
-                        <label>Powód bana (opcjonalnie)</label>
-                        <input type="text" name="reason" placeholder="Naruszenie regulaminu" class="form-input">
-                    </div>
-                    <div class="form-group" style="align-self: flex-end;">
-                        <button type="submit" class="btn">
-                            <i class="fas fa-ban"></i> Zbanuj adres IP
-                        </button>
-                    </div>
+            
+            <div class="section-header">
+                <div>
+                    <h3 style="font-size: 1.2rem; color: var(--text-secondary); margin-bottom: 5px;">Ilość: {{ banned_ips|length }}</h3>
                 </div>
-            </form>
+                <div class="section-actions">
+                    <button class="btn" onclick="document.getElementById('ban-ip-form').scrollIntoView({behavior: 'smooth'})">
+                        <i class="fas fa-plus"></i> Zbanuj IP
+                    </button>
+                </div>
+            </div>
             
             <div class="table-container">
                 <table class="table">
@@ -1447,7 +1507,7 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
                                 <form method="post" style="display:inline;" onsubmit="return confirm('Na pewno chcesz odbanować ten adres?')">
                                     <input type="hidden" name="action" value="del_ban">
                                     <input type="hidden" name="ip" value="{{ ban.ip }}">
-                                    <button type="submit" class="btn btn-danger" style="padding: 6px 12px; font-size: 0.85rem;">
+                                    <button type="submit" class="btn btn-danger" style="padding: 8px 15px; font-size: 0.95rem;">
                                         <i class="fas fa-user-check"></i> Odbanuj
                                     </button>
                                 </form>
@@ -1455,10 +1515,10 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
                         </tr>
                         {% else %}
                         <tr>
-                            <td colspan="5" style="text-align: center; padding: 30px; color: var(--text-secondary);">
-                                <i class="fas fa-user-slash" style="font-size: 2rem; margin-bottom: 10px; opacity: 0.5;"></i>
-                                <div>Brak zbanowanych adresów IP</div>
-                                <div style="font-size: 0.9rem; margin-top: 8px;">Dodaj pierwszy zbanowany adres IP za pomocą formularza powyżej</div>
+                            <td colspan="5" style="text-align: center; padding: 40px; color: var(--text-secondary);">
+                                <i class="fas fa-user-slash" style="font-size: 3rem; margin-bottom: 15px; opacity: 0.5;"></i>
+                                <div style="font-size: 1.3rem; margin-bottom: 12px;">Brak zbanowanych adresów IP</div>
+                                <div style="font-size: 1.05rem;">Dodaj pierwszy zbanowany adres IP za pomocą formularza poniżej</div>
                             </td>
                         </tr>
                         {% endfor %}
@@ -1467,14 +1527,40 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
             </div>
         </div>
         
+        <!-- Formularz banowania IP -->
+        <div class="section" id="ban-ip-form">
+            <div class="section-title">
+                <i class="fas fa-user-slash"></i> Zbanuj nowy adres IP
+            </div>
+            
+            <form method="post">
+                <input type="hidden" name="action" value="add_ban">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Adres IP do zbanowania</label>
+                        <input type="text" name="ip" placeholder="np. 192.168.1.1" class="form-input" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Powód bana (opcjonalnie)</label>
+                        <input type="text" name="reason" placeholder="Naruszenie regulaminu" class="form-input">
+                    </div>
+                    <div class="form-group" style="align-self: flex-end;">
+                        <button type="submit" class="btn">
+                            <i class="fas fa-ban"></i> Zbanuj adres IP
+                        </button>
+                    </div>
+                </div>
+            </form>
+        </div>
+        
         <!-- Import danych -->
-        <div class="section">
+        <div class="section" id="import-section">
             <div class="section-title">
                 <i class="fas fa-file-import"></i> Import bazy danych
             </div>
-            <div style="background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.3); border-radius: 12px; padding: 15px; margin-bottom: 20px;">
-                <p style="margin: 0; color: #bae6fd; line-height: 1.6;">
-                    <strong><i class="fas fa-info-circle" style="margin-right: 8px;"></i>Uwaga:</strong> Import danych może zająć kilka minut w zależności od rozmiaru archiwum ZIP.
+            <div style="background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.3); border-radius: 16px; padding: 20px; margin-bottom: 25px;">
+                <p style="margin: 0; color: #bae6fd; line-height: 1.7; font-size: 1.05rem;">
+                    <strong><i class="fas fa-info-circle" style="margin-right: 10px;"></i>Uwaga:</strong> Import danych może zająć kilka minut w zależności od rozmiaru archiwum ZIP.
                     Proces odbywa się w tle - możesz kontynuować pracę w panelu.
                 </p>
             </div>
@@ -1492,9 +1578,9 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
                     </div>
                 </div>
             </form>
-            <div style="margin-top: 15px; padding: 12px; background: rgba(15, 23, 42, 0.7); border-radius: 12px; border: 1px solid var(--border);">
-                <p style="margin: 0; color: var(--text-secondary); line-height: 1.6;">
-                    <strong><i class="fas fa-file-archive" style="margin-right: 8px; color: var(--warning);"></i>Wymagania:</strong>
+            <div style="margin-top: 20px; padding: 16px; background: rgba(21, 21, 34, 0.6); border-radius: 16px; border: 1px solid var(--border);">
+                <p style="margin: 0; color: var(--text-secondary); line-height: 1.7; font-size: 1.05rem;">
+                    <strong><i class="fas fa-file-archive" style="margin-right: 10px; color: var(--warning);"></i>Wymagania:</strong>
                     Archiwum ZIP powinno zawierać pliki tekstowe (.txt, .csv, .log) z danymi wyciekowymi.
                     Każda linia w pliku powinna zawierać pojedynczy rekord (email, login, etc.).
                 </p>
@@ -1502,93 +1588,95 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
         </div>
         
         <!-- Ostatnie dane wyciekowe -->
-        <div class="section">
+        <div class="section" id="recent-leaks-section">
             <div class="section-title">
                 <i class="fas fa-history"></i> Ostatnie dane wyciekowe
             </div>
             {% for leak in recent_leaks %}
                 <div class="leak-item">
-                    <div class="leak-data">{{ leak.data | truncate(70) }}</div>
-                    <small>
+                    <div class="leak-data">{{ leak.data | truncate(80) }}</div>
+                    <small style="display: flex; align-items: center; gap: 15px; color: var(--text-secondary);">
                         <span class="ip-badge">{{ leak.source }}</span>
-                        <span style="color: var(--text-secondary); margin-left: 10px;">• {{ format_datetime(leak.created_at) }}</span>
+                        <span>• {{ format_datetime(leak.created_at) }}</span>
                     </small>
                 </div>
             {% else %}
-                <div style="text-align: center; padding: 20px; color: var(--text-secondary);">
-                    Brak danych wyciekowych w bazie
+                <div style="text-align: center; padding: 30px; color: var(--text-secondary);">
+                    <i class="fas fa-database" style="font-size: 3rem; margin-bottom: 15px; opacity: 0.5;"></i>
+                    <div style="font-size: 1.2rem; margin-bottom: 10px;">Brak danych wyciekowych w bazie</div>
+                    <div style="font-size: 1rem;">Uruchom import danych, aby zobaczyć rekordy</div>
                 </div>
             {% endfor %}
         </div>
         
         <!-- Informacje systemowe -->
-        <div class="section">
+        <div class="section" id="system-info-section">
             <div class="section-title">
                 <i class="fas fa-server"></i> Informacje systemowe
             </div>
-            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px;">
-                <div style="background: rgba(15, 23, 42, 0.6); border-radius: 12px; padding: 15px; border: 1px solid var(--border);">
-                    <h4 style="font-size: 1rem; font-weight: 600; margin-bottom: 12px; color: var(--text); display: flex; align-items: center; gap: 10px;">
-                        <i class="fas fa-clock" style="color: var(--primary);"></i> Sesja administratora
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 25px;">
+                <div style="background: rgba(21, 21, 34, 0.7); border-radius: 16px; padding: 20px; border: 1px solid var(--border);">
+                    <h4 style="font-size: 1.2rem; font-weight: 600; margin-bottom: 15px; color: var(--text); display: flex; align-items: center; gap: 10px;">
+                        <i class="fas fa-clock" style="color: var(--primary); font-size: 1.1rem;"></i> Sesja administratora
                     </h4>
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
-                        <div style="padding: 8px;">
-                            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Czas trwania</div>
-                            <div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ session_duration }}</div>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                        <div style="padding: 10px;">
+                            <div style="font-size: 0.95rem; color: var(--text-secondary); margin-bottom: 8px;">Czas trwania</div>
+                            <div style="font-weight: 600; font-size: 1.05rem; color: var(--text);">{{ session_duration }}</div>
                         </div>
-                        <div style="padding: 8px;">
-                            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Twój adres IP</div>
-                            <div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">
+                        <div style="padding: 10px;">
+                            <div style="font-size: 0.95rem; color: var(--text-secondary); margin-bottom: 8px;">Twój adres IP</div>
+                            <div style="font-weight: 600; font-size: 1.05rem; color: var(--text);">
                                 <span class="ip-badge">{{ client_ip }}</span>
                             </div>
                         </div>
                     </div>
                 </div>
                 
-                <div style="background: rgba(15, 23, 42, 0.6); border-radius: 12px; padding: 15px; border: 1px solid var(--border);">
-                    <h4 style="font-size: 1rem; font-weight: 600; margin-bottom: 12px; color: var(--text); display: flex; align-items: center; gap: 10px;">
-                        <i class="fas fa-database" style="color: var(--primary);"></i> Baza danych leaków
+                <div style="background: rgba(21, 21, 34, 0.7); border-radius: 16px; padding: 20px; border: 1px solid var(--border);">
+                    <h4 style="font-size: 1.2rem; font-weight: 600; margin-bottom: 15px; color: var(--text); display: flex; align-items: center; gap: 10px;">
+                        <i class="fas fa-database" style="color: var(--primary); font-size: 1.1rem;"></i> Baza danych leaków
                     </h4>
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
-                        <div style="padding: 8px;">
-                            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Status</div>
-                            <div style="font-weight: 600; font-size: 0.95rem; color: var(--success);">
-                                <i class="fas fa-circle" style="font-size: 0.6rem; margin-right: 6px;"></i> Online
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                        <div style="padding: 10px;">
+                            <div style="font-size: 0.95rem; color: var(--text-secondary); margin-bottom: 8px;">Status</div>
+                            <div style="font-weight: 600; font-size: 1.05rem; color: var(--success);">
+                                <i class="fas fa-circle" style="font-size: 0.7rem; margin-right: 8px;"></i> Online
                             </div>
                         </div>
-                        <div style="padding: 8px;">
-                            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Liczba rekordów</div>
-                            <div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ total_leaks_formatted }} rekordów</div>
+                        <div style="padding: 10px;">
+                            <div style="font-size: 0.95rem; color: var(--text-secondary); margin-bottom: 8px;">Liczba rekordów</div>
+                            <div style="font-weight: 600; font-size: 1.05rem; color: var(--text);">{{ total_leaks_formatted }} rekordów</div>
                         </div>
-                        <div style="padding: 8px; grid-column: span 2;">
-                            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Ostatnia aktualizacja</div>
-                            <div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ format_datetime(now) }}</div>
+                        <div style="padding: 10px; grid-column: span 2;">
+                            <div style="font-size: 0.95rem; color: var(--text-secondary); margin-bottom: 8px;">Ostatnia aktualizacja</div>
+                            <div style="font-weight: 600; font-size: 1.05rem; color: var(--text);">{{ format_datetime(now) }}</div>
                         </div>
                     </div>
                 </div>
                 
-                <div style="background: rgba(15, 23, 42, 0.6); border-radius: 12px; padding: 15px; border: 1px solid var(--border);">
-                    <h4 style="font-size: 1rem; font-weight: 600; margin-bottom: 12px; color: var(--text); display: flex; align-items: center; gap: 10px;">
-                        <i class="fas fa-cloud" style="color: var(--primary);"></i> Supabase API
+                <div style="background: rgba(21, 21, 34, 0.7); border-radius: 16px; padding: 20px; border: 1px solid var(--border);">
+                    <h4 style="font-size: 1.2rem; font-weight: 600; margin-bottom: 15px; color: var(--text); display: flex; align-items: center; gap: 10px;">
+                        <i class="fas fa-cloud" style="color: var(--primary); font-size: 1.1rem;"></i> Supabase API
                     </h4>
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
-                        <div style="padding: 8px;">
-                            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Status</div>
-                            <div style="font-weight: 600; font-size: 0.95rem; color: var(--success);">
-                                <i class="fas fa-circle" style="font-size: 0.6rem; margin-right: 6px;"></i> Online
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                        <div style="padding: 10px;">
+                            <div style="font-size: 0.95rem; color: var(--text-secondary); margin-bottom: 8px;">Status</div>
+                            <div style="font-weight: 600; font-size: 1.05rem; color: var(--success);">
+                                <i class="fas fa-circle" style="font-size: 0.7rem; margin-right: 8px;"></i> Online
                             </div>
                         </div>
-                        <div style="padding: 8px;">
-                            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Aktywne licencje</div>
-                            <div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ active_licenses }}</div>
+                        <div style="padding: 10px;">
+                            <div style="font-size: 0.95rem; color: var(--text-secondary); margin-bottom: 8px;">Aktywne licencje</div>
+                            <div style="font-weight: 600; font-size: 1.05rem; color: var(--text);">{{ active_licenses }}</div>
                         </div>
-                        <div style="padding: 8px;">
-                            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Zbanowane IP</div>
-                            <div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ "{:,}".format(banned_ips|length).replace(",", " ") }}</div>
+                        <div style="padding: 10px;">
+                            <div style="font-size: 0.95rem; color: var(--text-secondary); margin-bottom: 8px;">Zbanowane IP</div>
+                            <div style="font-weight: 600; font-size: 1.05rem; color: var(--text);">{{ "{:,}".format(banned_ips|length).replace(",", " ") }}</div>
                         </div>
-                        <div style="padding: 8px;">
-                            <div style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 4px;">Wszystkie wyszukiwania</div>
-                            <div style="font-weight: 600; font-size: 0.95rem; color: var(--text);">{{ "{:,}".format(total_searches).replace(",", " ") }}</div>
+                        <div style="padding: 10px;">
+                            <div style="font-size: 0.95rem; color: var(--text-secondary); margin-bottom: 8px;">Wszystkie wyszukiwania</div>
+                            <div style="font-weight: 600; font-size: 1.05rem; color: var(--text);">{{ "{:,}".format(total_searches).replace(",", " ") }}</div>
                         </div>
                     </div>
                 </div>
@@ -1597,10 +1685,14 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
         
         <div class="footer">
             <p>❄️ Cold Search Premium Admin Panel &copy; {{ now.year }} | Wersja 3.1.3</p>
-            <p style="margin-top: 6px; font-size: 0.85rem; color: var(--text-secondary);">
+            <p style="margin-top: 8px; font-size: 0.95rem; color: var(--text-secondary);">
                 Panel jest chroniony hasłem i dostępny wyłącznie dla upoważnionych administratorów
             </p>
         </div>
+    </div>
+    
+    <div class="back-to-top" id="backToTop" onclick="scrollToTop()">
+        <i class="fas fa-arrow-up"></i>
     </div>
     
     <script>
@@ -1614,7 +1706,24 @@ ADMIN_TEMPLATE = '''<!DOCTYPE html>
                     el.textContent = num.toLocaleString('pl-PL');
                 }
             });
+            
+            // Back to top button
+            const backToTop = document.getElementById('backToTop');
+            window.addEventListener('scroll', function() {
+                if (window.pageYOffset > 300) {
+                    backToTop.classList.add('visible');
+                } else {
+                    backToTop.classList.remove('visible');
+                }
+            });
         });
+        
+        function scrollToTop() {
+            window.scrollTo({
+                top: 0,
+                behavior: 'smooth'
+            });
+        }
     </script>
 </body>
 </html>'''
@@ -1626,3 +1735,4 @@ if __name__ == "__main__":
     port = int(os.environ.get('PORT', 10000))
     debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
     app.run(host='0.0.0.0', port=port, debug=debug_mode)
+
